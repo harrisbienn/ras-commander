@@ -1,1 +1,1 @@
-"""Packaged JSON contracts for the RAS scenario-worker boundary."""
+"""Packaged JSON contracts for RAS Commander artifacts and workers."""

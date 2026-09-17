@@ -11,6 +11,7 @@ from various sources for use in HEC-RAS rain-on-grid 2D models:
 - AbmHyetographGrid - Per-pixel Alternating Block Method hyetograph grids (NetCDF for HEC-RAS rain-on-grid)
 - VortexCli - HEC-Vortex CLI wrapper for converting GRIB2/NetCDF to HEC-DSS
 - PrecipMrms - MRMS QPE catalog, download, HEC-Vortex DSS conversion, direct hyetograph/NetCDF, and MP4 animation helpers
+- PrecipitationApplicationArea - Authenticated RAS receiving-grid support
 - QPF (Quantitative Precipitation Forecast) - NWS forecasts (future)
 
 The primary workflow is:
@@ -204,6 +205,7 @@ Dependencies:
 from ..LoggingConfig import setup_logging as _setup_logging
 from .PrecipAorc import PrecipAorc
 from .PrecipHrrr import PrecipHrrr
+from .PrecipitationApplicationArea import PrecipitationApplicationArea
 from .PrecipMrms import PrecipMrms
 from .StormGenerator import StormGenerator
 from .Atlas14Grid import Atlas14Grid
@@ -235,6 +237,7 @@ __all__ = [
     'PrecipAorc',
     'PrecipHrrr',                  # HRRR real-time forecast download
     'PrecipMrms',                  # MRMS QPE catalog, download, DSS/direct processing, and animation
+    'PrecipitationApplicationArea',  # Authenticated RAS precipitation receiving area
     'StormGenerator',
     'VortexCli',                   # HEC-Vortex CLI wrapper for GRIB2/NetCDF → DSS conversion
     'Atlas14Grid',                 # Remote access to NOAA Atlas 14 CONUS grids
