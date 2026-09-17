@@ -396,6 +396,72 @@ RasDss.copy_grid_with_zero_tail(
     )
 
 
+def test_copy_grid_with_zero_tail_allows_translation_without_padding(tmp_path):
+    RasDss = _configure_dss_or_skip()
+
+    source = tmp_path / "source.dss"
+    output = tmp_path / "shifted.dss"
+    fixture_script = """
+from datetime import datetime
+from pathlib import Path
+import numpy as np
+from ras_commander import RasDss
+
+RasDss.write_grid_timeseries(
+    dss_file=Path(__import__("sys").argv[1]),
+    pathname="/SHG/TEST/PRECIPITATION///AORC-TRANSPOSED/",
+    data=np.array([[[1.0]], [[2.0]]], dtype=np.float32),
+    times=[
+        datetime(2020, 1, 1, 0),
+        datetime(2020, 1, 1, 1),
+        datetime(2020, 1, 1, 2),
+    ],
+    grid_info={
+        "cellsize": 1000,
+        "origin": (259000, 1024000),
+        "crs": "SHG",
+        "units": "MM",
+        "data_type": "PER-CUM",
+    },
+)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", fixture_script, str(source)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    copied = tmp_path / "copied.dss"
+    copy_result = RasDss.copy_grid_with_zero_tail(
+        source,
+        copied,
+        "/SHG/TEST/PRECIPITATION///AORC-TRANSPOSED/",
+        tail_intervals=0,
+    )
+    assert copied.stat().st_size == source.stat().st_size
+    assert copy_result["appended_record_count"] == 0
+    assert copy_result["shifted_pathnames"] == []
+    assert copy_result["padded_end"] == "2020-01-01T02:00:00"
+
+    result = RasDss.copy_grid_with_zero_tail(
+        source,
+        output,
+        "/SHG/TEST/PRECIPITATION///AORC-TRANSPOSED/",
+        tail_intervals=0,
+        time_shift_minutes=24 * 60,
+    )
+
+    assert result["source_record_count"] == 2
+    assert result["appended_record_count"] == 0
+    assert result["output_start"] == "2020-01-02T00:00:00"
+    assert result["padded_end"] == "2020-01-02T02:00:00"
+    assert len(result["shifted_pathnames"]) == 2
+    assert result["appended_pathnames"] == []
+    assert RasDss.get_catalog(output)["pathname"].tolist() == result["shifted_pathnames"]
+
+
 def test_copy_grid_with_zero_tail_translates_grid_without_resampling(tmp_path):
     RasDss = _configure_dss_or_skip()
 

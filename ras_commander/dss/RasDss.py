@@ -1526,7 +1526,9 @@ class RasDss:
             output_dss: New writable derivative DSS file.
             pathname: Six-part grid family selector with blank D and E parts,
                 such as ``/SHG/BASIN/PRECIPITATION///VERSION/``.
-            tail_intervals: Number of zero-valued intervals to append.
+            tail_intervals: Number of zero-valued intervals to append. Zero
+                performs only the requested time, pathname, or spatial
+                translation and appends no records.
             time_shift_minutes: Signed offset applied to all source grid
                 pathname windows. For example, ``-300`` expresses UTC source
                 records on an America/Chicago CDT model clock.
@@ -1552,8 +1554,12 @@ class RasDss:
             raise FileNotFoundError(f"DSS file not found: {source}")
         if source == output:
             raise ValueError("output_dss must differ from source_dss")
-        if not isinstance(tail_intervals, int) or tail_intervals <= 0:
-            raise ValueError("tail_intervals must be a positive integer")
+        if (
+            not isinstance(tail_intervals, int)
+            or isinstance(tail_intervals, bool)
+            or tail_intervals < 0
+        ):
+            raise ValueError("tail_intervals must be a nonnegative integer")
         if isinstance(time_shift_minutes, bool) or not isinstance(
             time_shift_minutes,
             int,
@@ -1690,7 +1696,10 @@ class RasDss:
             "false_northing": projection.get("false_northing", 0.0),
         }
         shifted_pathnames: List[str] = []
-        if not rewrite_source:
+        if not rewrite_source and tail_intervals == 0:
+            appended_pathnames = []
+            padded_end = output_source_end
+        elif not rewrite_source:
             tail_boundaries = [
                 output_source_end + index * interval
                 for index in range(tail_intervals + 1)
