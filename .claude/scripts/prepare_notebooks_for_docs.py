@@ -56,6 +56,7 @@ def convert_notebooks(examples_dir: Path, output_dir: Path) -> int:
     if result.returncode != 0:
         print(f"  Some errors during conversion:")
         print(f"  {result.stderr[:500]}")
+        result.check_returncode()
 
     # Show conversion output
     for line in result.stderr.split('\n'):

@@ -220,3 +220,43 @@ This project follows the [LLM Forward](https://clbengineering.com/llm-forward) p
 ---
 
 *ras-commander is maintained by [CLB Engineering Corporation](https://clbengineering.com/). Licensed under MIT.*
+
+
+## Documentation CI and fallback deployment
+
+`Validate Documentation` runs on every PR and main push, including source,
+dependency, and workflow changes. Both PR validation and the manual fallback call
+the same build workflow: notebook inventory checks, notebook conversion without
+execution, examples-index verification, cognitive-doc generation, and MkDocs.
+The existing non-strict production policy for notebook link warnings is retained;
+conversion/build exceptions fail the job. No HEC models are executed.
+
+Documentation tools are pinned in `docs/constraints-docs.txt`. Use it with both
+`python -m pip install -r docs/requirements-docs.txt -c docs/constraints-docs.txt`
+and `python -m pip install . -c docs/constraints-docs.txt`. Update constraints in
+a reviewed PR, rerun the workflow, and inspect its `docs-dependencies` artifact
+(the complete resolved environment). These tool constraints do not constitute a
+full runtime/transitive lock or a native dependency security audit. Dependabot
+proposes package and commit-pinned Action updates.
+
+The build job uses a read-only token, does not persist checkout credentials, and
+receives no deployment secrets. The Pages fallback is manual, accepts only `main`,
+and defaults its `deploy` input to false for a build-only rehearsal. After build
+success, the separate `github-pages` environment job deploys that run's artifact.
+Only this job receives `pages: write` and `id-token: write`; it has no checkout,
+package installation, or notebook build step. No job needs `contents: write`.
+PR events cannot deploy or run on the primary self-hosted worker.
+
+Before using the fallback, an administrator must select **GitHub Actions** as the
+Pages source (replacing the old gh-pages branch deployment), restrict the
+`github-pages` environment to `main` with required reviewers, and make
+`Documentation build` required on protected main. Run the manual workflow with
+`deploy=false` first. These repository/environment settings are not enforced by
+committing YAML; main was unprotected at the 2026-09-21 review. No live deployment
+was performed during this change.
+
+The primary rascommander.info webhook/builder is independently administered.
+Its `CLB-Engineering-Corporation/ras-commander-docs` source returned 404 for the
+reviewer's account, so its credential isolation, allowed refs, and required-check
+handling remain unverified. Issue #8 remains the owner-facing follow-up; these
+fallback safeguards do not establish the security of that separate service.

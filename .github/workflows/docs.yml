@@ -1,71 +1,37 @@
-name: Deploy Documentation (GitHub Pages — fallback)
+name: Deploy Documentation (GitHub Pages fallback)
 
-# Primary hosting is the self-hosted site at rascommander.info (CT 210), rebuilt by a
-# GitHub webhook on push to main. This GitHub Pages deploy is kept as a manual fallback
-# only — the automatic push trigger is disabled to avoid double-publishing. Run it from the
-# Actions tab (workflow_dispatch) if the self-hosted site is ever unavailable.
+# Primary rascommander.info hosting remains independently administered.
 on:
-  # push:            # DISABLED at rascommander.info cutover (2026-06-10). Re-enable to
-  #   branches:      # restore GitHub Pages as an auto-deploy target.
-  #     - main
-  #   paths:
-  #     - 'docs/**'
-  #     - 'examples/**'
-  #     - 'ras_commander/**'
-  #     - '.claude/**'
-  #     - 'mkdocs.yml'
-  #     - '.github/workflows/docs.yml'
-  workflow_dispatch:  # Manual trigger only
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy the validated main revision to the fallback Pages site
+        type: boolean
+        default: false
 
 permissions:
-  contents: write  # Needed for gh-pages deployment
-  pages: write
-  id-token: write
+  contents: read
 
 concurrency:
-  group: "pages"
+  group: pages
   cancel-in-progress: false
 
 jobs:
-  build-and-deploy:
+  build:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/docs-validate.yml
+  deploy:
+    if: github.ref == 'refs/heads/main' && inputs.deploy
+    needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # For git-revision-date-localized plugin
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-docs-${{ hashFiles('docs/requirements-docs.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-docs-
-
-      - name: Install documentation dependencies
-        run: |
-          pip install --upgrade pip
-          pip install -r docs/requirements-docs.txt
-          pip install -e .
-
-      - name: Prepare notebooks for docs
-        run: |
-          # Pre-convert notebooks to markdown (30x faster than mkdocs-jupyter)
-          python .claude/scripts/prepare_notebooks_for_docs.py
-          # Copy supporting files
-          cp examples/README.md docs/notebooks/ || true
-          cp examples/AGENTS.md docs/notebooks/ || true
-
-      - name: Generate cognitive infrastructure docs
-        run: |
-          python .claude/scripts/generate_cognitive_docs.py
-
-      - name: Build and deploy documentation
-        run: |
-          mkdocs gh-deploy --force
+      - name: Deploy the validated artifact (no checkout or package installation)
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -1,79 +1,68 @@
 name: Validate Documentation
 
-# Catches build-breaking docs errors (bad nav entries, missing pages, mkdocstrings
-# failures) on PRs BEFORE they merge to main and trigger the self-hosted CT 210 rebuild
-# (rascommander.info). Build-only; does not deploy. Non-strict to match production.
-
 on:
   pull_request:
-    paths:
-      - 'docs/**'
-      - 'examples/**'
-      - 'ras_commander/**'
-      - '.claude/**'
-      - 'mkdocs.yml'
-      - '.github/workflows/docs-validate.yml'
+  push:
+    branches: [main]
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: docs-validate-${{ github.ref }}
+  group: docs-validate-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   validate:
+    name: Documentation build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CI: 'true'
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0  # git-revision-date-localized plugin needs history
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-docs-${{ hashFiles('docs/requirements-docs.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-docs-
-
       - name: Install documentation dependencies
         run: |
-          pip install --upgrade pip
-          pip install -r docs/requirements-docs.txt
-          pip install -e .
-
+          python -m pip install pip==26.2.1
+          python -m pip install -r docs/requirements-docs.txt -c docs/constraints-docs.txt
+          python -m pip install . -c docs/constraints-docs.txt
+          python -m pip check
+          python -m pip freeze --all > docs-dependencies.txt
       - name: Validate notebook inventory
         run: |
           python .claude/scripts/generate_notebooks_metadata.py --check
           python .claude/scripts/validate_notebooks_yml.py
-
-      - name: Prepare notebooks for docs
+      - name: Check failed conversion cannot reuse stale output
+        run: python -m unittest discover -s tests -p test_docs_conversion.py
+      - name: Prepare notebooks for docs (no execution)
         run: |
           python .claude/scripts/prepare_notebooks_for_docs.py
-          cp examples/README.md docs/notebooks/ || true
-          cp examples/AGENTS.md docs/notebooks/ || true
-
-      - name: Generate examples index table
+          cp examples/README.md docs/notebooks/
+          cp examples/AGENTS.md docs/notebooks/
+      - name: Verify generated examples index
         run: |
           python .claude/scripts/generate_examples_index.py
           git diff --exit-code -- docs/examples/index.md
-
       - name: Generate cognitive infrastructure docs
-        run: |
-          python .claude/scripts/generate_cognitive_docs.py
-
-      - name: Build — no deploy
-        run: |
-          # Non-strict to match production (`mkdocs gh-deploy`) and the CT 210 rebuild.
-          # The docs currently carry ~26 benign link warnings (examples/README.md +
-          # AGENTS.md copied into notebooks/). Re-add --strict once that link debt is
-          # cleaned up, here and in the ras-commander-docs build.sh, together.
-          mkdocs build
+        run: python .claude/scripts/generate_cognitive_docs.py
+      - name: Build without deployment credentials
+        # Preserve the existing production policy for notebook link warnings.
+        # Build exceptions still fail; strict-mode cleanup is separate work.
+        run: python -m mkdocs build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docs-dependencies
+          path: docs-dependencies.txt
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site/
