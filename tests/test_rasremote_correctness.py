@@ -1,5 +1,6 @@
 import importlib
 import logging
+import subprocess
 import threading
 import time
 from collections import defaultdict
@@ -58,6 +59,8 @@ def _run_psexec(
     *,
     system_account=False,
     copy_geometry_outputs=True,
+    credentials=None,
+    process_outcome=None,
 ):
     ras_obj, source_plan = _seed_project(tmp_path / "project")
     share_path = tmp_path / "share"
@@ -72,9 +75,11 @@ def _run_psexec(
         psexec_path="PsExec.exe",
         session_id=7,
         system_account=system_account,
+        credentials=credentials or {},
     )
     captured = {}
     geometry_copy_calls = []
+    monkeypatch.setattr(psexec_module, "authenticate_network_share", lambda *args: True)
 
     monkeypatch.setattr(
         psexec_module.RasCurrency,
@@ -121,6 +126,8 @@ def _run_psexec(
         staged_plan = next(share_path.rglob("TestProject.p01"))
         captured["command"] = command
         captured["staged_plan_text"] = staged_plan.read_text(encoding="utf-8")
+        if process_outcome is not None:
+            return process_outcome(command)
         staged_plan.with_suffix(".p01.hdf").write_text("result\n", encoding="utf-8")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -137,6 +144,70 @@ def _run_psexec(
         copy_geometry_outputs=copy_geometry_outputs,
     )
     return success, ras_obj, source_plan, captured, geometry_copy_calls
+
+
+@pytest.mark.parametrize("failure", ["timeout", "nonzero", "launch", "called_process", "missing_hdf"])
+@pytest.mark.parametrize("password", ["review-password-sentinel", "sentinel'\"\\\n\u00e9"])
+def test_psexec_errors_do_not_disclose_credentials(monkeypatch, tmp_path, caplog, failure, password):
+    def outcome(command):
+        assert command[command.index("-p") + 1] == password
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(command, 60, output=password, stderr=password)
+        if failure == "launch":
+            raise OSError("synthetic launch failure " + repr(command))
+        if failure == "called_process":
+            raise subprocess.CalledProcessError(1, command, output=password, stderr=password)
+        return SimpleNamespace(returncode=0 if failure == "missing_hdf" else 1, stdout=password, stderr=repr(command))
+
+    monkeypatch.setattr(psexec_module.time, "sleep", lambda seconds: None)
+    with caplog.at_level(logging.DEBUG):
+        success, _, _, _, _ = _run_psexec(
+            monkeypatch, tmp_path, credentials={"username": "review-user", "password": password},
+            process_outcome=outcome,
+        )
+    assert not success
+    for representation in (password, repr(password)[1:-1]):
+        assert representation not in caplog.text
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                assert representation not in path.read_text(encoding="utf-8")
+    assert "PsExec" in caplog.text
+    if failure == "nonzero":
+        assert "return code 1" in caplog.text
+    elif failure == "missing_hdf":
+        assert "HDF file not created" in caplog.text
+    else:
+        assert "Error in PsExec execution" in caplog.text
+
+
+def test_psexec_worker_repr_omits_credentials():
+    worker = psexec_module.PsexecWorker(
+        worker_type="psexec", hostname="review-host", share_path=r"\\review-host\share",
+        credentials={"username": "review-user", "password": "review-password-sentinel"},
+    )
+    assert "review-password-sentinel" not in repr(worker)
+
+
+def test_psexec_explicit_credentials_preserve_success(monkeypatch, tmp_path, caplog):
+    with caplog.at_level(logging.DEBUG):
+        success, _, _, captured, _ = _run_psexec(
+            monkeypatch, tmp_path,
+            credentials={"username": "review-user", "password": "review-password-sentinel"},
+        )
+    assert success
+    assert "-p" in captured["command"]
+    assert "review-password-sentinel" not in caplog.text
+
+
+def test_psexec_integrated_auth_retains_tool_diagnostics(monkeypatch, tmp_path, caplog):
+    with caplog.at_level(logging.DEBUG):
+        success, _, _, captured, _ = _run_psexec(
+            monkeypatch, tmp_path,
+            process_outcome=lambda command: SimpleNamespace(returncode=1, stdout="tool context", stderr="tool error"),
+        )
+    assert not success
+    assert "-p" not in captured["command"]
+    assert "tool context" in caplog.text and "tool error" in caplog.text
 
 
 def _fake_ras():
