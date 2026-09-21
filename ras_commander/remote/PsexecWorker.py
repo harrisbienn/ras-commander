@@ -61,6 +61,10 @@ class PsexecWorker(RasWorker):
                     When credentials ARE provided, the specified user must be the same
                     user logged into the remote desktop session, or have
                     "Replace a process level token" (SeAssignPrimaryTokenPrivilege) right.
+                    Explicit passwords are passed to PsExec/net use as process arguments
+                    and remain visible to sufficiently privileged local inspection.
+                    Raw subprocess output is omitted from diagnostics in this mode
+                    because it may echo credentials; use Windows authentication when possible.
         session_id: Session ID to run in (default 2 - typical for single-user workstations)
         process_priority: OS process priority for HEC-RAS execution on remote machine.
                          Valid values: "low" (default), "below normal", "normal".
@@ -117,7 +121,7 @@ class PsexecWorker(RasWorker):
     """
     share_path: str = None
     worker_folder: str = None
-    credentials: Dict[str, str] = field(default_factory=dict)
+    credentials: Dict[str, str] = field(default_factory=dict, repr=False)
     session_id: int = 2
     process_priority: str = "low"
     queue_priority: int = 0
@@ -362,6 +366,15 @@ def init_psexec_worker(**kwargs) -> PsexecWorker:
     return worker
 
 
+def _log_psexec_output(worker: PsexecWorker, result: subprocess.CompletedProcess) -> None:
+    """Avoid publishing tool output that may echo explicit authentication argv."""
+    if worker.credentials:
+        logger.error("PsExec output omitted to protect explicit authentication credentials")
+    else:
+        logger.error("PsExec stdout: %s", result.stdout)
+        logger.error("PsExec stderr: %s", result.stderr)
+
+
 def execute_psexec_plan(
     worker: PsexecWorker,
     plan_number: str,
@@ -598,8 +611,7 @@ def execute_psexec_plan(
 
         if result.returncode != 0:
             logger.error(f"PsExec failed with return code {result.returncode}")
-            logger.error(f"PsExec stdout: {result.stdout}")
-            logger.error(f"PsExec stderr: {result.stderr}")
+            _log_psexec_output(worker, result)
             return False
 
         # Step 6: Check for HDF file
@@ -614,8 +626,7 @@ def execute_psexec_plan(
 
         if not hdf_file.exists():
             logger.error(f"HDF file not created: {hdf_file}")
-            logger.error(f"PsExec stdout: {result.stdout}")
-            logger.error(f"PsExec stderr: {result.stderr}")
+            _log_psexec_output(worker, result)
             logger.error(
                 "Ensure session_id is set correctly (typically 2) and remote machine is configured. "
                 "See: https://rascommander.info/ras/user-guide/remote-execution/"
@@ -664,12 +675,19 @@ def execute_psexec_plan(
         return True
 
     except Exception as e:
-        logger.error(f"Error in PsExec execution: {e}")
+        # Exception messages (including TimeoutExpired/OSError) can embed argv.
+        # Keep useful context without formatting the exception or its traceback.
+        logger.error(
+            "Error in PsExec execution on %s, plan %s: %s",
+            worker.hostname, plan_number, type(e).__name__,
+        )
+        if isinstance(e, subprocess.TimeoutExpired):
+            logger.error("PsExec exceeded the configured timeout of %s minutes", worker.max_runtime_minutes)
         if autoclean:
             try:
                 if worker_temp_folder.exists():
                     shutil.rmtree(worker_temp_folder, ignore_errors=True)
-            except:
+            except OSError:
                 pass
         else:
             logger.info(

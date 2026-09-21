@@ -231,6 +231,9 @@ def authenticate_network_share(share_path: str, username: str, password: str) ->
 
     This establishes a connection to the remote share using the provided credentials,
     allowing subsequent file operations (copy, mkdir) to succeed.
+    Prefer an existing Windows-authenticated connection where possible. Explicit
+    passwords remain process arguments; diagnostics deliberately omit raw tool
+    output and exception messages because either can echo those arguments.
 
     Args:
         share_path: UNC path to share (e.g., \\\\hostname\\ShareName)
@@ -274,12 +277,16 @@ def authenticate_network_share(share_path: str, username: str, password: str) ->
             if "1219" in result.stderr or "already" in result.stderr.lower():
                 logger.debug(f"Share {base_share} already connected")
                 return True
-            logger.error(f"Failed to authenticate to {base_share}: {result.stderr}")
+            logger.error(
+                "Failed to authenticate to %s (net use return code %s); "
+                "output omitted to protect credentials",
+                base_share, result.returncode,
+            )
             return False
 
     except subprocess.TimeoutExpired:
         logger.error(f"Timeout authenticating to {base_share}")
         return False
     except Exception as e:
-        logger.error(f"Error authenticating to {base_share}: {e}")
+        logger.error("Error authenticating to %s: %s", base_share, type(e).__name__)
         return False
