@@ -344,13 +344,13 @@ class HdfUtils:
         Returns:
             pd.DatetimeIndex: DatetimeIndex of converted and rounded datetimes.
         """
-        if time_unit == "days":
-            datetimes = start_time + pd.to_timedelta(timesteps, unit='D')
-        elif time_unit == "hours":
-            datetimes = start_time + pd.to_timedelta(timesteps, unit='H')
-        else:
+        units = {"days": "D", "hours": "h"}
+        if time_unit not in units:
             raise ValueError(f"Unsupported time unit: {time_unit}")
-
+        # Nanosecond arithmetic cannot represent synthetic Year-3000 runs.
+        # Microseconds preserve the subsecond timing used by RAS summaries.
+        offsets = pd.to_timedelta(timesteps, unit=units[time_unit]).as_unit("us")
+        datetimes = pd.Timestamp(start_time).as_unit("us") + offsets
         return pd.DatetimeIndex(datetimes).round(round_to)
     
 # rename to convert_hdf5_attrs_to_dict and make public

@@ -684,14 +684,11 @@ class RasScenario:
                 raise ValueError(f"Boundary mapping {link.mapping_id!r} did not match")
 
         if excess_file is not None:
-            RasUnsteady.set_met_precipitation_mode(
+            RasUnsteady.configure_gridded_dss_precipitation(
                 unsteady_file,
-                "Gridded",
-                source="DSS",
-                dss_filename=excess_file,
+                dss_filename=str(excess_file),
                 dss_pathname=forcing_excess_pathname,
                 interpolation=forcing_excess_interpolation,
-                ras_object=project,
             )
 
         plan_file = RasPlan.get_plan_path(plan_number, ras_object=project)
@@ -992,6 +989,18 @@ class RasScenario:
                 or (
                     workspace.forcing_excess_file is not None
                     and workspace.forcing_excess_file.is_file()
+                )
+            ),
+            "forcing_excess_hdf_link_matches": (
+                not forcing_expected
+                or (
+                    forcing_config["hdf_attributes"].get("DSS Filename")
+                    == forcing_config["dss_filename"]
+                    and forcing_config["hdf_attributes"].get("DSS Pathname")
+                    == workspace.forcing_excess_pathname
+                    and forcing_config["hdf_attributes"].get("Mode") == "Gridded"
+                    and forcing_config["hdf_attributes"].get("Source") == "DSS"
+                    and forcing_config["hdf_attributes"].get("Enabled") == 1
                 )
             ),
             "forcing_excess_link_matches": (

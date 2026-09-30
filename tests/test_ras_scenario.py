@@ -221,6 +221,11 @@ def test_prepare_workspace_stages_and_validates_forcing_excess(tmp_path):
     checks = RasScenario.validate_workspace(prepared, [link])
     evidence = RasScenario.inspect_workspace_evidence(prepared, [link])
     assert checks["forcing_excess_link_matches"] is True
+    assert checks["forcing_excess_hdf_link_matches"] is True
+    with h5py.File(str(prepared.unsteady_file) + ".hdf", "a") as handle:
+        handle["Event Conditions/Meteorology/Precipitation"].attrs["DSS Pathname"] = b"/STALE/"
+    with pytest.raises(ValueError, match="forcing_excess_hdf_link_matches"):
+        RasScenario.validate_workspace(prepared, [link])
     assert checks["one_newline_convention"] is True
     assert evidence["forcing_excess"]["dss_pathname"] == (
         "/SHG/BASIN/PRECIPITATION///EXCESS/"
