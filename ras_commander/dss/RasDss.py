@@ -49,6 +49,7 @@ import sys
 import os
 import shutil
 import tempfile
+from datetime import timedelta
 from numbers import Real
 from pathlib import Path
 from typing import Any, List, Dict, Optional, Tuple, Union
@@ -1426,7 +1427,7 @@ class RasDss:
 
             for index, (start_time, end_time) in enumerate(time_windows):
                 d_part = RasDss._format_grid_dss_datetime(start_time)
-                e_part = RasDss._format_grid_dss_datetime(end_time)
+                e_part = RasDss._format_grid_dss_datetime(end_time, interval_end=True)
                 record_parts = list(path_parts)
                 record_parts[3] = d_part
                 record_parts[4] = e_part
@@ -2145,9 +2146,13 @@ class RasDss:
         return f"/{'/'.join(parts)}/"
 
     @staticmethod
-    def _format_grid_dss_datetime(value: pd.Timestamp) -> str:
-        """Format datetime for DSS grid D/E pathname parts."""
-        return pd.Timestamp(value).strftime("%d%b%Y:%H%M").upper()
+    def _format_grid_dss_datetime(value: pd.Timestamp, *, interval_end: bool = False) -> str:
+        """Match native grid pathname normalization at midnight interval ends."""
+        timestamp = pd.Timestamp(value)
+        if interval_end and timestamp.hour == 0 and timestamp.minute == 0:
+            previous = timestamp.to_pydatetime() - timedelta(days=1)
+            return previous.strftime("%d%b%Y:2400").upper()
+        return timestamp.strftime("%d%b%Y:%H%M").upper()
 
     @staticmethod
     def _parse_grid_dss_datetime(value: str) -> Optional[pd.Timestamp]:

@@ -573,3 +573,24 @@ def test_copy_grid_with_zero_tail_refuses_unsafe_targets(tmp_path):
             1,
         )
     assert existing.read_bytes() == b"do not replace"
+
+
+@pytest.mark.parametrize("year", [2016, 3000])
+def test_midnight_grid_paths_match_native_catalog(tmp_path, year):
+    RasDss = _configure_dss_or_skip()
+    start = datetime(year, 1, 2, 23, 55)
+    times = [start + timedelta(minutes=5 * index) for index in range(3)]
+    path = tmp_path / "midnight.dss"
+    values = np.asarray([[[1.0]], [[2.0]]], dtype=np.float32)
+    written = RasDss.write_grid_timeseries(
+        path, "/SHG/MIDNIGHT/PRECIPITATION///TEST/", values, times,
+        {"crs": "EPSG:5070", "cell_size": 500.0, "origin": [0.0, 0.0],
+         "units": "IN", "data_type": "PER-CUM", "compression": "ZLIB"},
+    )
+    assert set(written) == set(RasDss.get_catalog(path).pathname)
+    assert f"/02JAN{year}:2400/" in written[0]
+    for index, pathname in enumerate(written):
+        grid = RasDss.read_grid(path, pathname)
+        assert grid["start_time"].to_pydatetime() == times[index]
+        assert grid["end_time"].to_pydatetime() == times[index + 1]
+        np.testing.assert_array_equal(grid["data"], values[index])
