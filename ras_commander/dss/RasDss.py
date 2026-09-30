@@ -1671,9 +1671,12 @@ class RasDss:
             tail_intervals,
             axis=0,
         )
-        shift = pd.Timedelta(minutes=time_shift_minutes)
-        output_start = records[0][0] + shift
-        output_source_end = records[-1][1] + shift
+        # Calendar offsets to synthetic years can exceed pandas' timedelta range.
+        from datetime import timedelta
+
+        shift = timedelta(minutes=time_shift_minutes)
+        output_start = pd.Timestamp(records[0][0].to_pydatetime() + shift)
+        output_source_end = pd.Timestamp(records[-1][1].to_pydatetime() + shift)
         grid_info = {
             "cell_size": cell_size,
             "lower_left_cell_x": output_lower_left[0],
@@ -1730,7 +1733,8 @@ class RasDss:
                 end for _, end, _ in records
             ]
             output_boundaries = [
-                boundary + shift for boundary in source_boundaries
+                pd.Timestamp(boundary.to_pydatetime() + shift)
+                for boundary in source_boundaries
             ]
             output_boundaries.extend(
                 output_source_end + index * interval

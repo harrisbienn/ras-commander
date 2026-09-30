@@ -1,6 +1,6 @@
 """Integration tests for HEC-DSS grid writing through RasDss."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 from pathlib import Path
 import subprocess
@@ -311,7 +311,8 @@ RasDss.write_grid_timeseries(
     assert first_tail["cell_size"] == 1000.0
 
 
-def test_copy_grid_with_zero_tail_shifts_pathname_windows(tmp_path):
+@pytest.mark.parametrize("target_start", [datetime(2019, 12, 31, 19), datetime(3000, 1, 2)])
+def test_copy_grid_with_zero_tail_shifts_pathname_windows(tmp_path, target_start):
     RasDss = _configure_dss_or_skip()
 
     source = tmp_path / "source.dss"
@@ -364,11 +365,12 @@ RasDss.copy_grid_with_zero_tail(
     Path(__import__("sys").argv[2]),
     "/SHG/TEST/PRECIPITATION///AORC-TRANSPOSED/",
     tail_intervals=1,
-    time_shift_minutes=-300,
+    time_shift_minutes=int(__import__("sys").argv[3]),
 )
 """
     completed = subprocess.run(
-        [sys.executable, "-c", transform_script, str(source), str(output)],
+        [sys.executable, "-c", transform_script, str(source), str(output),
+         str(int((target_start - datetime(2020, 1, 1)).total_seconds() // 60))],
         check=False,
         capture_output=True,
         text=True,
@@ -377,10 +379,10 @@ RasDss.copy_grid_with_zero_tail(
     assert hashlib.sha256(source.read_bytes()).hexdigest() == source_sha256
 
     output_paths = sorted(RasDss.get_catalog(output)["pathname"].tolist())
+    expected_windows = [target_start + timedelta(hours=index) for index in range(4)]
     assert output_paths == [
-        "/SHG/TEST/PRECIPITATION/31DEC2019:1900/31DEC2019:2000/AORC-TRANSPOSED/",
-        "/SHG/TEST/PRECIPITATION/31DEC2019:2000/31DEC2019:2100/AORC-TRANSPOSED/",
-        "/SHG/TEST/PRECIPITATION/31DEC2019:2100/31DEC2019:2200/AORC-TRANSPOSED/",
+        f"/SHG/TEST/PRECIPITATION/{start:%d%b%Y:%H%M}/{end:%d%b%Y:%H%M}/AORC-TRANSPOSED/".upper()
+        for start, end in zip(expected_windows, expected_windows[1:])
     ]
     shifted_first = RasDss.read_grid(output, output_paths[0])
     shifted_tail = RasDss.read_grid(output, output_paths[-1])
