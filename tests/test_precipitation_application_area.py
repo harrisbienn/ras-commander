@@ -56,6 +56,60 @@ def _compile(*, plan_id: str = "p01") -> dict[str, object]:
     )
 
 
+def test_center_selection_excludes_edges_and_counts_full_partial_cells() -> None:
+    mesh = _mesh_cells()
+    # The last bottom-row center (25, 5) is strictly inside a partial cell.
+    mesh.loc[0, "geometry"] = box(0.0, 0.0, 26.0, 10.0)
+    artifact = PrecipitationApplicationArea.compile_from_mesh_cells(
+        mesh,
+        "Receiving Area",
+        _grid(),
+        project_id="fixture-project",
+        plan_id="p01",
+        geometry_id="g01",
+        source_geometry_hdf={
+            "name": "fixture.g01.hdf",
+            "size_bytes": 123,
+            "sha256": "a" * 64,
+        },
+        method=PrecipitationApplicationArea.CENTER_METHOD,
+    )
+    assert artifact["schema"] == PrecipitationApplicationArea.CENTER_SCHEMA
+    assert [c["effective_area_square_meters"] for c in artifact["cells"]] == [
+        100,
+        100,
+        100,
+        0,
+        100,
+        0,
+    ]
+    assert artifact["cells"][2]["mesh_intersection_area_square_meters"] == 60
+    assert artifact["metrics"]["receiving_area_square_meters"] == 400
+    assert artifact["metrics"]["selected_mesh_intersection_area_square_meters"] == 360
+    mesh.loc[0, "geometry"] = box(0.0, 0.0, 25.0, 10.0)
+    boundary = PrecipitationApplicationArea.compile_from_mesh_cells(
+        mesh,
+        "Receiving Area",
+        _grid(),
+        project_id="fixture-project",
+        plan_id="p01",
+        geometry_id="g01",
+        source_geometry_hdf={
+            "name": "fixture.g01.hdf",
+            "size_bytes": 123,
+            "sha256": "a" * 64,
+        },
+        method=PrecipitationApplicationArea.CENTER_METHOD,
+    )
+    assert boundary["cells"][2]["effective_area_square_meters"] == 0
+    schema = json.loads(
+        files("ras_commander")
+        .joinpath("contracts/precipitation-application-area-v2.0.schema.json")
+        .read_text()
+    )
+    pytest.importorskip("jsonschema").validate(artifact, schema)
+
+
 def test_compile_preserves_grid_order_and_effective_area() -> None:
     artifact = _compile()
 

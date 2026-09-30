@@ -168,6 +168,9 @@ class PrecipitationApplicationArea:
     SCHEMA = "ras-commander/precipitation-application-area/1.0"
     METHOD = "ras-mesh-effective-area"
     ALGORITHM = "target-cell-intersection-with-mesh-union-v1"
+    CENTER_SCHEMA = "ras-commander/precipitation-application-area/2.0"
+    CENTER_METHOD = "ras-mesh-center-selected-full-cell-area"
+    CENTER_ALGORITHM = "target-center-within-mesh-cell-full-area-v1"
     AREA_PRECISION_DECIMAL_PLACES = 9
 
     @staticmethod
@@ -181,6 +184,7 @@ class PrecipitationApplicationArea:
         project_id: str,
         plan_id: str,
         geometry_id: str,
+        method: str = "ras-mesh-effective-area",
         ras_object=None,
     ) -> dict[str, Any]:
         """Build an application-area artifact from a RAS geometry HDF.
@@ -193,6 +197,9 @@ class PrecipitationApplicationArea:
             project_id: Portable project identifier selected by the caller.
             plan_id: Portable plan identifier selected by the caller.
             geometry_id: Portable geometry identifier selected by the caller.
+            method: Receiving-area rule. The default preserves clipped areas;
+                ``ras-mesh-center-selected-full-cell-area`` selects centers
+                strictly within a mesh cell and counts full grid-cell areas.
             ras_object: Optional initialized RasPrj context used by input
                 standardization for multi-project workflows.
 
@@ -233,6 +240,7 @@ class PrecipitationApplicationArea:
             project_id=project_id,
             plan_id=plan_id,
             geometry_id=geometry_id,
+            method=method,
             source_geometry_hdf=source_identity,
         )
 
@@ -247,6 +255,7 @@ class PrecipitationApplicationArea:
         plan_id: str,
         geometry_id: str,
         source_geometry_hdf: Mapping[str, Any],
+        method: str = "ras-mesh-effective-area",
     ) -> dict[str, Any]:
         """Compile an artifact from already extracted RAS mesh-cell polygons.
 
@@ -263,6 +272,8 @@ class PrecipitationApplicationArea:
             geometry_id: Portable geometry identifier.
             source_geometry_hdf: Portable ``name``, ``size_bytes``, and
                 ``sha256`` identity for the source geometry HDF.
+            method: Explicit receiving-area rule; the center-selected variant
+                conserves full-grid allocation volume, not clipped mesh volume.
 
         Returns:
             Validated JSON-serializable application-area artifact.
@@ -274,13 +285,19 @@ class PrecipitationApplicationArea:
         try:
             import shapely
             from pyproj import CRS
-            from shapely.geometry import box
+            from shapely.geometry import Point, box
             from shapely.ops import unary_union
         except ImportError as exc:  # pragma: no cover - package dependencies
             raise ImportError(
                 "Precipitation application areas require geopandas, pyproj, and shapely"
             ) from exc
 
+        if method not in {
+            PrecipitationApplicationArea.METHOD,
+            PrecipitationApplicationArea.CENTER_METHOD,
+        }:
+            raise ValueError("precipitation application-area method is unsupported")
+        center_selected = method == PrecipitationApplicationArea.CENTER_METHOD
         selected_name = _non_empty(mesh_name, label="mesh_name")
         model = {
             "project_id": _non_empty(project_id, label="project_id"),
@@ -352,6 +369,7 @@ class PrecipitationApplicationArea:
         cells = []
         receiving_area = 0.0
         membership_counts = {"inside": 0, "partial": 0, "outside": 0}
+        selected_mesh_area = 0.0
         for row_index in range(rows):
             minimum_y = origin_y + row_index * cell_size
             maximum_y = minimum_y + cell_size
@@ -360,6 +378,22 @@ class PrecipitationApplicationArea:
                 maximum_x = minimum_x + cell_size
                 target_cell = box(minimum_x, minimum_y, maximum_x, maximum_y)
                 effective_area = float(target_cell.intersection(mesh_union).area)
+                intersection_area = effective_area
+                if center_selected:
+                    point = Point(
+                        minimum_x + cell_size / 2.0, minimum_y + cell_size / 2.0
+                    )
+                    # Match a strict spatial join against individual mesh cells:
+                    # a center on a shared face is not inside either polygon.
+                    matches = selected.sindex.query(point, predicate="within")
+                    if len(matches) > 1:
+                        raise ValueError("target center is within multiple mesh cells")
+                    effective_area = cell_area if len(matches) else 0.0
+                    if len(matches):
+                        selected_mesh_area += round(
+                            intersection_area,
+                            PrecipitationApplicationArea.AREA_PRECISION_DECIMAL_PLACES,
+                        )
                 if effective_area <= area_tolerance:
                     effective_area = 0.0
                     membership = "outside"
@@ -398,13 +432,26 @@ class PrecipitationApplicationArea:
                         "effective_area_square_meters": effective_area,
                     }
                 )
+                if center_selected:
+                    cells[-1]["mesh_intersection_area_square_meters"] = round(
+                        intersection_area,
+                        PrecipitationApplicationArea.AREA_PRECISION_DECIMAL_PLACES,
+                    )
         if receiving_area <= 0:
             raise ValueError("target grid has no positive-area overlap with the mesh")
 
         artifact: dict[str, Any] = {
-            "schema": PrecipitationApplicationArea.SCHEMA,
-            "method": PrecipitationApplicationArea.METHOD,
-            "algorithm": PrecipitationApplicationArea.ALGORITHM,
+            "schema": (
+                PrecipitationApplicationArea.CENTER_SCHEMA
+                if center_selected
+                else PrecipitationApplicationArea.SCHEMA
+            ),
+            "method": method,
+            "algorithm": (
+                PrecipitationApplicationArea.CENTER_ALGORITHM
+                if center_selected
+                else PrecipitationApplicationArea.ALGORITHM
+            ),
             "model": model,
             "source_geometry_hdf": source_identity,
             "source_mesh_crs": source_mesh_crs,
@@ -422,7 +469,11 @@ class PrecipitationApplicationArea:
                 "horizontal_units": "meters",
                 "vertical_datum": "not_applicable",
             },
-            "boundary_predicate": "positive-area-intersection",
+            "boundary_predicate": (
+                "target-center-within-mesh-cell"
+                if center_selected
+                else "positive-area-intersection"
+            ),
             "area_precision_decimal_places": (
                 PrecipitationApplicationArea.AREA_PRECISION_DECIMAL_PLACES
             ),
@@ -451,6 +502,14 @@ class PrecipitationApplicationArea:
                 ),
             },
         }
+        if center_selected:
+            artifact["area_basis"] = "selected-full-grid-cells"
+            artifact["metrics"]["selected_mesh_intersection_area_square_meters"] = (
+                round(
+                    selected_mesh_area,
+                    PrecipitationApplicationArea.AREA_PRECISION_DECIMAL_PLACES,
+                )
+            )
         artifact["application_area_sha256"] = _canonical_sha256(artifact)
         return PrecipitationApplicationArea.validate(artifact)
 
@@ -470,6 +529,9 @@ class PrecipitationApplicationArea:
             ValueError: If the artifact is malformed, stale, or inconsistent.
         """
         normalized = json.loads(json.dumps(artifact, sort_keys=True, allow_nan=False))
+        center_selected = (
+            normalized.get("method") == PrecipitationApplicationArea.CENTER_METHOD
+        )
         _required_mapping(
             normalized,
             {
@@ -488,16 +550,37 @@ class PrecipitationApplicationArea:
                 "cells",
                 "metrics",
                 "application_area_sha256",
-            },
+            }
+            | ({"area_basis"} if center_selected else set()),
             label="precipitation application area",
         )
-        if normalized["schema"] != PrecipitationApplicationArea.SCHEMA:
+        expected_schema = (
+            PrecipitationApplicationArea.CENTER_SCHEMA
+            if center_selected
+            else PrecipitationApplicationArea.SCHEMA
+        )
+        expected_algorithm = (
+            PrecipitationApplicationArea.CENTER_ALGORITHM
+            if center_selected
+            else PrecipitationApplicationArea.ALGORITHM
+        )
+        expected_predicate = (
+            "target-center-within-mesh-cell"
+            if center_selected
+            else "positive-area-intersection"
+        )
+        if center_selected and normalized["area_basis"] != "selected-full-grid-cells":
+            raise ValueError("center-selected area basis is unsupported")
+        if normalized["schema"] != expected_schema:
             raise ValueError("precipitation application-area schema is unsupported")
-        if normalized["method"] != PrecipitationApplicationArea.METHOD:
+        if normalized["method"] not in {
+            PrecipitationApplicationArea.METHOD,
+            PrecipitationApplicationArea.CENTER_METHOD,
+        }:
             raise ValueError("precipitation application-area method is unsupported")
-        if normalized["algorithm"] != PrecipitationApplicationArea.ALGORITHM:
+        if normalized["algorithm"] != expected_algorithm:
             raise ValueError("precipitation application-area algorithm is unsupported")
-        if normalized["boundary_predicate"] != "positive-area-intersection":
+        if normalized["boundary_predicate"] != expected_predicate:
             raise ValueError("precipitation application-area predicate is unsupported")
         if normalized["area_precision_decimal_places"] != (
             PrecipitationApplicationArea.AREA_PRECISION_DECIMAL_PLACES
@@ -559,6 +642,7 @@ class PrecipitationApplicationArea:
             raise ValueError("cells do not cover the complete target grid")
         membership_counts = {"inside": 0, "partial": 0, "outside": 0}
         receiving_area = 0.0
+        selected_mesh_area = 0.0
         for expected_id, cell in enumerate(cells):
             _required_mapping(
                 cell,
@@ -570,7 +654,12 @@ class PrecipitationApplicationArea:
                     "bounds",
                     "membership",
                     "effective_area_square_meters",
-                },
+                }
+                | (
+                    {"mesh_intersection_area_square_meters"}
+                    if center_selected
+                    else set()
+                ),
                 label=f"cells[{expected_id}]",
             )
             expected_row, expected_column = divmod(expected_id, columns)
@@ -606,6 +695,19 @@ class PrecipitationApplicationArea:
                 raise ValueError("inside cell must have its complete area")
             if membership == "partial" and not 0.0 < area < cell_area:
                 raise ValueError("partial cell must have a partial effective area")
+            if center_selected:
+                physical_area = float(cell["mesh_intersection_area_square_meters"])
+                if (
+                    not math.isfinite(physical_area)
+                    or not 0 <= physical_area <= cell_area
+                ):
+                    raise ValueError("mesh intersection area is outside valid bounds")
+                if membership == "partial" or (area > 0 and physical_area <= 0):
+                    raise ValueError(
+                        "center-selected cells must have full allocation area and positive mesh overlap"
+                    )
+                if area > 0:
+                    selected_mesh_area += physical_area
             membership_counts[membership] += 1
             receiving_area += area
 
@@ -621,7 +723,12 @@ class PrecipitationApplicationArea:
                 "outside_target_cell_count",
                 "receiving_area_square_meters",
                 "target_grid_area_square_meters",
-            },
+            }
+            | (
+                {"selected_mesh_intersection_area_square_meters"}
+                if center_selected
+                else set()
+            ),
             label="metrics",
         )
         expected_metrics = {
@@ -638,6 +745,11 @@ class PrecipitationApplicationArea:
                 PrecipitationApplicationArea.AREA_PRECISION_DECIMAL_PLACES,
             ),
         }
+        if center_selected:
+            expected_metrics["selected_mesh_intersection_area_square_meters"] = round(
+                selected_mesh_area,
+                PrecipitationApplicationArea.AREA_PRECISION_DECIMAL_PLACES,
+            )
         if any(metrics[key] != value for key, value in expected_metrics.items()):
             raise ValueError("metrics do not agree with the ordered target cells")
         if int(metrics["mesh_cell_count"]) <= 0:

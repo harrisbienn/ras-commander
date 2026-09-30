@@ -48,6 +48,28 @@ areas in square meters.
 
 ## Contract And Failure Behavior
 
+### Center-selected full-cell alternative
+
+Both constructors also accept
+`method="ras-mesh-center-selected-full-cell-area"`. This emits application-area
+**2.0** with `area_basis="selected-full-grid-cells"`. A precipitation cell is
+selected only when its center is strictly within one mesh-cell polygon.
+Centers on exterior boundaries or shared mesh faces are excluded. Selected
+cells contribute their full grid-cell area; other cells contribute zero.
+
+In this version, `effective_area_square_meters` is the allocation area under
+the declared full-cell rule. Each cell also records
+`mesh_intersection_area_square_meters`, and metrics include the physical
+intersection area of selected cells. These quantities differ at mesh edges:
+full-grid allocation conservation is not a hydraulic volume-balance result.
+`inside`/`outside` describe selection in this variant; `partial` is invalid.
+
+The default `ras-mesh-effective-area` method still emits the original 1.0
+artifact and retains its positive-area-intersection behavior. The new method
+does not alter existing artifacts, grid definitions, or study approvals.
+
+### Original effective-area contract
+
 The `ras-commander/precipitation-application-area/1.0` artifact binds:
 
 - portable project, plan, geometry, and 2D-flow-area identifiers;
