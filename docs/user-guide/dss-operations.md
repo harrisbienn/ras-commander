@@ -11,6 +11,23 @@ The `RasDss` class reads HEC-DSS time series data using HEC's Monolith Java libr
 - Lazy loading - no overhead unless DSS methods are called
 - Tested with 84 DSS files totaling 6.64 GB
 
+## Synthetic rainfall and DSS6 compatibility
+
+`RasDss.copy_grid_with_zero_tail()` translates interval boundaries (including
+Year 3000) without resampling rainfall and can append dry intervals. For a
+model requiring DSS6, create the translated grids in DSS7, then call
+`RasDss.convert_file_version(source, output, 6)`. This uses HEC's native
+conversion utility and verifies the major version and complete catalog.
+It refuses source replacement and existing outputs. The destination filesystem
+must support hard links for atomic, no-overwrite publication.
+
+Validate the converted grid values, missing masks, CRS, cell origin, units,
+and interval coverage for the model before execution. Successful time-series
+DSS6 writing alone does not validate grid compatibility. Native writers may
+retain file locks, so finish the writing process before hashing its artifacts
+or starting a conversion process. The conversion helper explicitly closes its
+source and destination handles without closing unrelated DSS files.
+
 ## Requirements
 
 ```bash

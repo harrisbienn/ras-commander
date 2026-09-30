@@ -48,6 +48,7 @@ Lazy Loading:
 import sys
 import os
 import shutil
+import tempfile
 from numbers import Real
 from pathlib import Path
 from typing import Any, List, Dict, Optional, Tuple, Union
@@ -1774,6 +1775,96 @@ class RasDss:
             "padded_end": padded_end.isoformat(),
             "shifted_pathnames": shifted_pathnames,
             "appended_pathnames": appended_pathnames,
+        }
+
+    @staticmethod
+    @log_call
+    def convert_file_version(
+        source_dss: Union[str, Path],
+        output_dss: Union[str, Path],
+        version: int,
+    ) -> Dict[str, Any]:
+        """Create a DSS6/7 derivative through HEC's native conversion API.
+
+        Never replace a source or existing destination. Check the resulting
+        major version and complete pathname catalog before publishing the
+        derivative. Callers must additionally verify engineering values and
+        metadata for their selected records. In particular, create synthetic
+        grids in DSS7 before converting to DSS6; direct grid writes into a
+        pre-created DSS6 file are not an equivalent conversion path.
+
+        Args:
+            source_dss: Existing DSS6 or DSS7 input.
+            output_dss: New derivative filename.
+            version: Required major version, 6 or 7.
+
+        Returns:
+            Source/output versions and the verified record count.
+        """
+        if isinstance(version, bool) or version not in (6, 7):
+            raise ValueError("version must be 6 or 7")
+        source = Path(source_dss).resolve()
+        output = Path(output_dss).resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"DSS file not found: {source}")
+        if source == output:
+            raise ValueError("output_dss must differ from source_dss")
+        if output.exists():
+            raise FileExistsError(f"Output DSS already exists: {output}")
+        source_version = RasDss.get_file_version(source)
+        source_paths = sorted(RasDss.get_catalog(source)["pathname"].tolist())
+        if not source_paths:
+            raise ValueError("Source DSS catalog is empty")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        from jnius import autoclass
+
+        with tempfile.TemporaryDirectory(
+            prefix="dss-convert-", dir=output.parent
+        ) as temp:
+            staged = Path(temp) / "converted.dss"
+            if source_version == version:
+                source_handle = autoclass("hec.heclib.dss.HecDSSUtilities")()
+                try:
+                    source_handle.setDSSFileName(str(source))
+                    source_handle.closeDSSFile()
+                finally:
+                    source_handle.done()
+                shutil.copy2(source, staged)
+            else:
+                utility = autoclass("hec.heclib.dss.HecDSSUtilities")()
+                try:
+                    status = utility.setDSSFileName(str(source))
+                    if status != 0:
+                        raise RuntimeError(f"HEC source open failed: status {status}")
+                    status = utility.convertVersion(str(staged))
+                    if status != 0:
+                        raise RuntimeError(
+                            f"HEC DSS conversion failed: status {status}"
+                        )
+                finally:
+                    utility.closeDSSFile()
+                    utility.done()
+            if RasDss.get_file_version(staged) != version:
+                raise RuntimeError("Converted DSS has an unexpected major version")
+            if sorted(RasDss.get_catalog(staged)["pathname"].tolist()) != source_paths:
+                raise RuntimeError("Converted DSS pathname catalog differs from source")
+            # The conversion utility can retain a cached native destination
+            # handle after done(). Close this file explicitly before publishing;
+            # never close unrelated DSS files in the process.
+            destination_handle = autoclass("hec.heclib.dss.HecDSSUtilities")()
+            try:
+                destination_handle.setDSSFileName(str(staged))
+                destination_handle.closeDSSFile()
+            finally:
+                destination_handle.done()
+            # Hard-link creation refuses even a destination created concurrently.
+            os.link(staged, output)
+        return {
+            "source_dss": str(source),
+            "output_dss": str(output),
+            "source_version": source_version,
+            "output_version": version,
+            "record_count": len(source_paths),
         }
 
     @staticmethod
