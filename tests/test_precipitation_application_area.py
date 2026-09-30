@@ -254,3 +254,45 @@ def test_packaged_schema_matches_public_contract() -> None:
     assert schema["properties"]["method"]["const"] == (
         PrecipitationApplicationArea.METHOD
     )
+
+
+def _multi_area(names):
+    mesh = gpd.GeoDataFrame(
+        {"mesh_name": ["West", "East"], "cell_id": [0, 0]},
+        geometry=[box(0, 0, 10, 20), box(10, 0, 30, 20)],
+        crs="EPSG:3857",
+    )
+    return PrecipitationApplicationArea.compile_from_mesh_cells(
+        mesh,
+        names,
+        _grid(),
+        project_id="fixture",
+        plan_id="p01",
+        geometry_id="g01",
+        source_geometry_hdf={
+            "name": "fixture.hdf",
+            "size_bytes": 123,
+            "sha256": "a" * 64,
+        },
+        method=PrecipitationApplicationArea.CENTER_METHOD,
+    )
+
+
+def test_multi_area_preserves_area_local_ids_and_order_independent_identity():
+    artifact = _multi_area(["West", "East"])
+    assert artifact == _multi_area(["East", "West"])
+    assert artifact["model"]["two_d_flow_areas"] == ["East", "West"]
+    assert artifact["metrics"]["mesh_cell_count"] == 2
+    assert artifact["metrics"]["receiving_area_square_meters"] == 600
+    schema = json.loads(
+        files("ras_commander")
+        .joinpath("contracts/precipitation-application-area-v3.0.schema.json")
+        .read_text()
+    )
+    pytest.importorskip("jsonschema").validate(artifact, schema)
+
+
+@pytest.mark.parametrize("names", [[], ["West", "West"], ["Unknown"]])
+def test_multi_area_rejects_invalid_selection(names):
+    with pytest.raises(ValueError):
+        _multi_area(names)

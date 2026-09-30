@@ -168,6 +168,7 @@ class PrecipitationApplicationArea:
     SCHEMA = "ras-commander/precipitation-application-area/1.0"
     METHOD = "ras-mesh-effective-area"
     ALGORITHM = "target-cell-intersection-with-mesh-union-v1"
+    MULTI_SCHEMA = "ras-commander/precipitation-application-area/3.0"
     CENTER_SCHEMA = "ras-commander/precipitation-application-area/2.0"
     CENTER_METHOD = "ras-mesh-center-selected-full-cell-area"
     CENTER_ALGORITHM = "target-center-within-mesh-cell-full-area-v1"
@@ -178,7 +179,7 @@ class PrecipitationApplicationArea:
     @standardize_input(file_type="geom_hdf")
     def from_geometry_hdf(
         hdf_path: Union[Path, str],
-        mesh_name: str,
+        mesh_name: Union[str, list[str]],
         target_grid_definition: Mapping[str, Any],
         *,
         project_id: str,
@@ -191,7 +192,8 @@ class PrecipitationApplicationArea:
 
         Args:
             hdf_path: Geometry HDF path, plan number, or supported RAS input.
-            mesh_name: Exact HEC-RAS 2D flow-area name.
+            mesh_name: Exact area name, or a list of exact names for the
+                center-selected multi-area 3.0 contract.
             target_grid_definition: Regular target-grid definition with CRS,
                 shape, origin, cell size, and south-to-north row ordering.
             project_id: Portable project identifier selected by the caller.
@@ -248,7 +250,7 @@ class PrecipitationApplicationArea:
     @log_call
     def compile_from_mesh_cells(
         mesh_cells: Any,
-        mesh_name: str,
+        mesh_name: Union[str, list[str]],
         target_grid_definition: Mapping[str, Any],
         *,
         project_id: str,
@@ -265,7 +267,8 @@ class PrecipitationApplicationArea:
         Args:
             mesh_cells: GeoDataFrame with ``mesh_name``, ``cell_id``, and
                 polygon ``geometry`` columns plus a projected CRS.
-            mesh_name: Exact 2D flow-area name to select.
+            mesh_name: Exact area name, or a list for the center-selected
+                multi-area 3.0 contract.
             target_grid_definition: Regular target-grid definition.
             project_id: Portable project identifier.
             plan_id: Portable plan identifier.
@@ -298,12 +301,22 @@ class PrecipitationApplicationArea:
         }:
             raise ValueError("precipitation application-area method is unsupported")
         center_selected = method == PrecipitationApplicationArea.CENTER_METHOD
-        selected_name = _non_empty(mesh_name, label="mesh_name")
+        multi_area = isinstance(mesh_name, (list, tuple))
+        if multi_area:
+            selected_name = sorted(
+                _non_empty(name, label="mesh_name") for name in mesh_name
+            )
+            if not selected_name or len(set(selected_name)) != len(selected_name):
+                raise ValueError("mesh names must be nonempty and unique")
+            if not center_selected:
+                raise ValueError("multiple areas require the center-selected method")
+        else:
+            selected_name = _non_empty(mesh_name, label="mesh_name")
         model = {
             "project_id": _non_empty(project_id, label="project_id"),
             "plan_id": _non_empty(plan_id, label="plan_id"),
             "geometry_id": _non_empty(geometry_id, label="geometry_id"),
-            "two_d_flow_area": selected_name,
+            ("two_d_flow_areas" if multi_area else "two_d_flow_area"): selected_name,
         }
         source_identity = _normalized_source_identity(source_geometry_hdf)
         target_grid = _normalized_grid(target_grid_definition)
@@ -313,7 +326,11 @@ class PrecipitationApplicationArea:
             set(getattr(mesh_cells, "columns", []))
         ):
             raise ValueError("mesh_cells must contain mesh_name, cell_id, and geometry")
-        selected = mesh_cells.loc[mesh_cells["mesh_name"] == selected_name].copy()
+        names = selected_name if multi_area else [selected_name]
+        missing = set(names) - set(mesh_cells["mesh_name"])
+        if missing:
+            raise ValueError(f"2D flow areas have no mesh cells: {sorted(missing)}")
+        selected = mesh_cells.loc[mesh_cells["mesh_name"].isin(names)].copy()
         if selected.empty:
             raise ValueError(f"2D flow area {selected_name!r} has no mesh cells")
         if selected.crs is None:
@@ -322,7 +339,7 @@ class PrecipitationApplicationArea:
         target_crs = CRS.from_user_input(target_grid["crs"])
         if not mesh_crs.is_projected:
             raise ValueError("mesh CRS must be projected")
-        if selected["cell_id"].duplicated().any():
+        if selected.duplicated(["mesh_name", "cell_id"]).any():
             raise ValueError("mesh cell identifiers must be unique within the area")
         if selected.geometry.isna().any() or selected.geometry.is_empty.any():
             raise ValueError("mesh cell geometry must not be missing or empty")
@@ -334,7 +351,9 @@ class PrecipitationApplicationArea:
         ):
             raise ValueError("mesh cell geometry must contain only polygons")
 
-        selected = selected.sort_values("cell_id", kind="stable")
+        selected = selected.sort_values(
+            ["mesh_name", "cell_id"] if multi_area else "cell_id", kind="stable"
+        )
         mesh_records = [
             {
                 "cell_id": int(row.cell_id),
@@ -342,6 +361,9 @@ class PrecipitationApplicationArea:
             }
             for row in selected.itertuples(index=False)
         ]
+        if multi_area:
+            for record, name in zip(mesh_records, selected["mesh_name"], strict=True):
+                record["mesh_name"] = name
         source_mesh_crs = mesh_crs.to_string()
         if not mesh_crs.equals(target_crs):
             selected = selected.to_crs(target_crs)
@@ -442,9 +464,13 @@ class PrecipitationApplicationArea:
 
         artifact: dict[str, Any] = {
             "schema": (
-                PrecipitationApplicationArea.CENTER_SCHEMA
-                if center_selected
-                else PrecipitationApplicationArea.SCHEMA
+                PrecipitationApplicationArea.MULTI_SCHEMA
+                if multi_area
+                else (
+                    PrecipitationApplicationArea.CENTER_SCHEMA
+                    if center_selected
+                    else PrecipitationApplicationArea.SCHEMA
+                )
             ),
             "method": method,
             "algorithm": (
@@ -554,10 +580,17 @@ class PrecipitationApplicationArea:
             | ({"area_basis"} if center_selected else set()),
             label="precipitation application area",
         )
+        multi_area = (
+            normalized.get("schema") == PrecipitationApplicationArea.MULTI_SCHEMA
+        )
         expected_schema = (
-            PrecipitationApplicationArea.CENTER_SCHEMA
-            if center_selected
-            else PrecipitationApplicationArea.SCHEMA
+            PrecipitationApplicationArea.MULTI_SCHEMA
+            if multi_area and center_selected
+            else (
+                PrecipitationApplicationArea.CENTER_SCHEMA
+                if center_selected
+                else PrecipitationApplicationArea.SCHEMA
+            )
         )
         expected_algorithm = (
             PrecipitationApplicationArea.CENTER_ALGORITHM
@@ -589,11 +622,27 @@ class PrecipitationApplicationArea:
 
         _required_mapping(
             normalized["model"],
-            {"project_id", "plan_id", "geometry_id", "two_d_flow_area"},
+            {
+                "project_id",
+                "plan_id",
+                "geometry_id",
+                "two_d_flow_areas" if multi_area else "two_d_flow_area",
+            },
             label="model",
         )
         for key, value in normalized["model"].items():
-            _non_empty(value, label=f"model.{key}")
+            if key == "two_d_flow_areas":
+                if (
+                    not isinstance(value, list)
+                    or not value
+                    or any(
+                        not isinstance(name, str) or not name.strip() for name in value
+                    )
+                    or value != sorted(set(value))
+                ):
+                    raise ValueError("two_d_flow_areas must be uniquely sorted names")
+            else:
+                _non_empty(value, label=f"model.{key}")
         normalized["source_geometry_hdf"] = _normalized_source_identity(
             normalized["source_geometry_hdf"]
         )

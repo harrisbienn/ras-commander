@@ -91,3 +91,7 @@ Any geometry, grid, plan binding, algorithm, or software-provenance change
 creates a different artifact identity. Hydraulic or hydrologic suitability
 must be assessed separately under the consuming workflow's qualification and
 engineering-approval policy.
+
+## Multiple receiving areas
+
+Pass a list of exact 2D flow-area names to `mesh_name` with the center-selected method to emit application-area 3.0. The artifact records sorted `model.two_d_flow_areas`; cell identities are scoped to their area, and missing/duplicate area selections fail. Centers are still tested against individual mesh cells, so internal edges remain excluded. A string continues to emit the unchanged single-area 1.0/2.0 contracts.
