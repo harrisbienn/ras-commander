@@ -323,6 +323,124 @@ class HdfResultsPlan:
         }
 
     @staticmethod
+    @log_call
+    @standardize_input(file_type='plan_hdf')
+    def get_exchange_diagnostics(
+        hdf_path: Path, boundary_flow_signs: Optional[Dict[str, int]] = None
+    ) -> Dict:
+        """Crosswalk lateral/SA connections and integrate saved boundary flows.
+
+        Structure flow is positive from the geometry's US side to its DS side.
+        External BC signs must be supplied explicitly: +1 into the 2D area,
+        -1 out. Unspecified nonzero BCs prevent an area reconciliation; zero
+        inactive BCs are retained. Returns raw sampled hydrographs, topology,
+        signed trapezoidal volumes in native cubic units, and per-area sums.
+        These are sampled estimates, not the solver's every-step accounting.
+        Missing structure results, ambiguous topology, incompatible units,
+        nonfinite flows or incomplete/nonmonotonic time axes raise errors.
+        No engineering acceptance threshold is applied.
+        """
+        from .HdfBase import HdfBase
+
+        def decode(value):
+            return value.decode('utf-8').strip() if isinstance(value, bytes) else str(value).strip()
+
+        signs = boundary_flow_signs or {}
+        if any(isinstance(sign, bool) or sign not in (-1, 1) for sign in signs.values()):
+            raise ValueError('Boundary signs must be +1 (in) or -1 (out)')
+        base = 'Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series'
+        records, boundaries = [], []
+        with h5py.File(hdf_path, 'r') as hdf:
+            times = HdfBase.get_unsteady_timestamps(hdf)
+            seconds = np.array([(value - times[0]).total_seconds() for value in times])
+            if len(times) < 2 or np.any(np.diff(seconds) <= 0):
+                raise ValueError('Exchange integration requires increasing timestamps')
+            area_names = [decode(row['Name']) for row in hdf['Geometry/2D Flow Areas/Attributes'][:]]
+            if len(set(area_names)) != len(area_names):
+                raise ValueError('Duplicate 2D area names')
+            net = {area: 0.0 for area in area_names}
+            unresolved = {area: [] for area in area_names}
+            flow_units = set()
+
+            def integrate(values, unit, label):
+                values = np.asarray(values, dtype=float)
+                if values.shape != seconds.shape or not np.isfinite(values).all():
+                    raise ValueError(f'Invalid/incomplete flow series: {label}')
+                if unit not in ('cfs', 'm3/s', 'm^3/s'):
+                    raise ValueError(f'Unsupported flow unit {unit!r}: {label}')
+                flow_units.add('cfs' if unit == 'cfs' else 'm3/s')
+                return float(np.sum((values[1:] + values[:-1]) * 0.5 * np.diff(seconds)))
+
+            geometry = hdf.get('Geometry/Structures/Attributes')
+            for row in geometry[:] if geometry is not None else []:
+                kind = decode(row['Type'])
+                if kind not in ('Lateral', 'Connection'):
+                    continue
+                if 'LW Span Multiple' in row.dtype.names and row['LW Span Multiple']:
+                    raise ValueError('Multi-reach lateral exchanges require segment-level reconciliation')
+                if kind == 'Lateral':
+                    name = ' '.join(decode(row[field]) for field in ('River', 'Reach', 'RS'))
+                    group = 'Lateral Structures'
+                else:
+                    name = decode(row['Connection'])
+                    group = 'SA 2D Area Conn'
+                dataset = hdf[f'{base}/{group}/{name}/Structure Variables']
+                columns = [(decode(pair[0]), decode(pair[1])) for pair in dataset.attrs['Variable_Unit']]
+                indices = [i for i, (label, _) in enumerate(columns) if label == 'Total Flow']
+                if len(indices) != 1:
+                    raise ValueError(f'Missing/ambiguous Total Flow: {name}')
+                index = indices[0]
+                flow = dataset[:, index]
+                volume = integrate(flow, columns[index][1], name)
+                us, ds = decode(row['US SA/2D']), decode(row['DS SA/2D'])
+                for side, area, multiplier in (('US', us, -1), ('DS', ds, 1)):
+                    if decode(row[f'{side} Type']) == '2D':
+                        if area not in net:
+                            raise ValueError(f'Unknown {side} 2D area {area!r}: {name}')
+                        net[area] += multiplier * volume
+                records.append({'name': name, 'kind': kind, 'us_type': decode(row['US Type']),
+                                'ds_type': decode(row['DS Type']), 'us_area': us, 'ds_area': ds,
+                                'flow_units': columns[index][1], 'signed_volume': volume,
+                                'flow': flow.astype(float).tolist()})
+            bc_group = hdf.get(f'{base}/Boundary Conditions')
+            if bc_group is not None:
+                for name, dataset in bc_group.items():
+                    if 'Columns' not in dataset.attrs:
+                        continue  # Per-face arrays duplicate the aggregate BC flow.
+                    columns = [decode(value) for value in dataset.attrs['Columns']]
+                    if 'Flow' not in columns:
+                        continue
+                    area = decode(dataset.attrs['2D Area'])
+                    if area not in net:
+                        raise ValueError(f'Unknown boundary area {area!r}: {name}')
+                    flow = dataset[:, columns.index('Flow')]
+                    unit = decode(dataset.attrs['Flow'])
+                    volume = integrate(flow, unit, name)
+                    sign = signs.get(name)
+                    if sign is not None:
+                        net[area] += sign * volume
+                    elif np.any(flow != 0):
+                        unresolved[area].append(name)
+                    boundaries.append({'name': name, 'area': area, 'flow_units': unit,
+                                       'into_area_sign': sign, 'signed_volume': volume,
+                                       'flow': flow.astype(float).tolist()})
+            unknown = set(signs) - {row['name'] for row in boundaries}
+            if unknown:
+                raise ValueError(f'Unknown boundary flow sign keys: {sorted(unknown)}')
+            if len(flow_units) != 1:
+                raise ValueError(f'Incompatible or missing exchange units: {flow_units}')
+        return {'time': [value.isoformat() for value in times],
+                'volume_units': 'ft^3' if flow_units == {'cfs'} else 'm^3',
+                'integration': 'trapezoid over all saved output samples',
+                'structures': records, 'boundaries': boundaries,
+                'areas': [{'area': area, 'net_nonprecipitation_volume': net[area]
+                           if not unresolved[area] else None,
+                           'unresolved_boundaries': unresolved[area]} for area in area_names],
+                'limitations': ['Sampled transfers cannot reproduce every-step native accounting exactly.',
+                                'Total Flow is shared exchange output, not independent audits of both solvers.',
+                                'No engineering tolerance or hydraulic acceptance is assigned.']}
+
+    @staticmethod
     @standardize_input(file_type='plan_hdf')
     def get_runtime_data(hdf_path: Path) -> Optional[pd.DataFrame]:
         """

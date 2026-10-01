@@ -223,6 +223,26 @@ Saved `Computations/Volume Error` samples are not assumed cumulative: they can
 be zero even when final accounting reports an imbalance. Missing series remain
 absent. This read-only diagnostic assigns no engineering acceptance threshold.
 
+To crosswalk lateral structures and SA/2D connections to their receiving areas
+and integrate saved flows:
+
+```python
+exchanges = HdfResultsPlan.get_exchange_diagnostics(
+    hdf_path, boundary_flow_signs={"Upstream": 1, "Outlet": -1}
+)
+print(exchanges["areas"])
+```
+
+Supply signs from the active boundary configuration: `+1` means flow into the
+area and `-1` means out. Structure signs follow US-to-DS geometry. The result
+preserves topology, hydrographs and units; an unassigned nonzero boundary leaves
+the area's net volume unresolved. Missing structure results or inconsistent
+units raise errors. Multi-reach lateral structures require separate segment
+reconciliation and are rejected. The signed trapezoidal volumes approximate
+saved samples, including any saved warmup; select a complete common output
+window for comparisons. They cannot replace every-step solver accounting or
+independently confirm that both sides of an exchange conserved water.
+
 ### Unsteady Results Information
 
 Check that unsteady results were properly generated:
