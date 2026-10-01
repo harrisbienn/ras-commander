@@ -1513,6 +1513,7 @@ class RasDss:
         output_pathname: Optional[str] = None,
         x_shift: float = 0.0,
         y_shift: float = 0.0,
+        cell_factors: Optional[np.ndarray] = None,
         overwrite: bool = False,
     ) -> Dict[str, Any]:
         """Create a translated grid derivative with an explicit zero tail.
@@ -1540,6 +1541,12 @@ class RasDss:
                 horizontal units. Must be a whole-cell increment.
             y_shift: Signed spatial translation in the grid projection's
                 vertical units. Must be a whole-cell increment.
+            cell_factors: Optional finite, nonnegative 2-D multipliers in the
+                same row/column order as ``read_grid()["data"]``. Rewrites
+                source frames using lossless ZLIB compression and verifies
+                every output frame against the float32 scaled input. This
+                changes grid volumes; callers own the scientific rationale.
+                It does not change interpolation, timing or the zero tail.
             overwrite: Replace an existing output file when ``True``.
 
         Returns:
@@ -1576,6 +1583,13 @@ class RasDss:
                 raise ValueError(f"{label} must be a finite number")
         x_shift = float(x_shift)
         y_shift = float(y_shift)
+        factors = None
+        if cell_factors is not None:
+            factors = np.asarray(cell_factors, dtype=np.float64)
+            if factors.ndim != 2 or not factors.size:
+                raise ValueError("cell_factors must be a non-empty 2-D array")
+            if not np.isfinite(factors).all() or (factors < 0).any():
+                raise ValueError("cell_factors must be finite and nonnegative")
 
         _, selector_parts = RasDss._split_dss_pathname(pathname)
         if selector_parts[3] or selector_parts[4]:
@@ -1589,7 +1603,8 @@ class RasDss:
                 "output_pathname must select a grid family with blank D and E parts"
             )
         rewrite_source = (
-            time_shift_minutes != 0
+            factors is not None
+            or time_shift_minutes != 0
             or x_shift != 0
             or y_shift != 0
             or tuple(part.upper() for part in derivative_parts)
@@ -1690,7 +1705,7 @@ class RasDss:
             "units": last_grid["units"],
             "data_type": last_grid["data_type"],
             "nodata_value": metadata.get("nodata_value"),
-            "compression": "PRECIP_2_BYTE",
+            "compression": "ZLIB" if factors is not None else "PRECIP_2_BYTE",
             "projection_datum": projection.get("datum_code", "NAD83"),
             "projection_units": projection.get("units", "METERS"),
             "standard_parallel_1": projection.get("standard_parallel_1", 29.5),
@@ -1701,6 +1716,7 @@ class RasDss:
             "false_northing": projection.get("false_northing", 0.0),
         }
         shifted_pathnames: List[str] = []
+        scaling = None
         if not rewrite_source and tail_intervals == 0:
             appended_pathnames = []
             padded_end = output_source_end
@@ -1730,6 +1746,31 @@ class RasDss:
                 [grid["data"] for grid in source_grids],
                 axis=0,
             )
+            if factors is not None:
+                if factors.shape != source_shape:
+                    raise ValueError("cell_factors shape must equal the source grid shape")
+                for grid in source_grids:
+                    if any(grid[key] != last_grid[key] for key in (
+                        "cell_size", "crs", "grid_type", "units", "data_type",
+                    )) or any(grid["metadata"].get(key) != metadata.get(key) for key in (
+                        "lower_left_cell", "projection",
+                    )):
+                        raise ValueError("Matched grid records have inconsistent spatial or unit metadata")
+                source_totals = np.nansum(shifted_data.astype(np.float64), axis=0)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    scaled = (shifted_data.astype(np.float64) * factors).astype(np.float32)
+                if np.any(np.isfinite(shifted_data) & ~np.isfinite(scaled)):
+                    raise ValueError("cell_factors overflow float32 grid values")
+                shifted_data = scaled
+                scaling = {
+                    "minimum_factor": float(factors.min()),
+                    "maximum_factor": float(factors.max()),
+                    "source_total_depth_by_cell": source_totals.tolist(),
+                    "output_total_depth_by_cell": np.nansum(
+                        scaled.astype(np.float64), axis=0,
+                    ).tolist(),
+                    "readback_verified": False,
+                }
             output_data = np.concatenate([shifted_data, zero_data], axis=0)
             source_boundaries = [records[0][0]] + [
                 end for _, end, _ in records
@@ -1756,6 +1797,19 @@ class RasDss:
             shifted_pathnames = written[: len(records)]
             appended_pathnames = written[len(records) :]
             padded_end = output_boundaries[-1]
+            if factors is not None:
+                for index, record_path in enumerate(written):
+                    actual = RasDss.read_grid(output, record_path)
+                    if not np.array_equal(actual["data"], output_data[index], equal_nan=True):
+                        raise RuntimeError(f"Scaled grid readback differs: {record_path}")
+                    if (actual["start_time"] != output_boundaries[index]
+                            or actual["end_time"] != output_boundaries[index + 1]
+                            or actual["units"] != last_grid["units"]
+                            or actual["data_type"] != last_grid["data_type"]
+                            or actual["cell_size"] != cell_size
+                            or tuple(actual["metadata"]["lower_left_cell"]) != output_lower_left):
+                        raise RuntimeError(f"Scaled grid metadata readback differs: {record_path}")
+                scaling["readback_verified"] = True
 
         return {
             "source_dss": str(source),
@@ -1776,6 +1830,7 @@ class RasDss:
             "padded_end": padded_end.isoformat(),
             "shifted_pathnames": shifted_pathnames,
             "appended_pathnames": appended_pathnames,
+            "cell_scaling": scaling,
         }
 
     @staticmethod

@@ -1,5 +1,20 @@
 # DSS Operations
 
+For a controlled rainfall sensitivity experiment,
+`RasDss.copy_grid_with_zero_tail(..., tail_intervals=0, cell_factors=factors)`
+creates a separate derivative with explicit finite, nonnegative multipliers.
+The 2-D factor array uses the same row/column order as `RasDss.read_grid()`;
+do not assume a native HDF raster uses that order. Scaling validates matching
+source grid metadata, preserves no-data cells, uses lossless ZLIB compression,
+and reads back every float32 output frame and interval. The returned
+`cell_scaling` audit includes source/output cell depth totals and readback
+status. Other transformations and zero tails remain available.
+
+This API changes the grid's water volume. It neither determines the correct
+receiving domain nor guarantees volume conservation after RAS interpolation.
+Keep the original forcing immutable, authenticate the derivative, and check
+the imported receiving volumes separately before interpreting the run.
+
 RAS Commander provides read access to HEC-DSS files for extracting boundary condition data.
 
 ## Overview
