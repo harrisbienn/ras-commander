@@ -248,6 +248,15 @@ losses apply. This audit locates discrepancies in stored evidence; it does not
 prove what the engine applied to its equations, repair native accounting, or
 assign hydraulic acceptance. Preserve the native summary when reporting findings.
 
+To locate repeated native coupling failures, use
+`ResultsParser.summarize_coupling_errors(messages)` from
+`ras_commander.results.ResultsParser` on `HdfResultsPlan.get_compute_messages()`
+output. It groups `1D/2D Flow error` occurrences by the complete native location
+label, retaining timestamps, reported-value ranges and unparsed marker counts.
+Repeated messages at one timestamp remain separate occurrences. Reported-value
+units are unspecified; do not assume they are cfs or percentages. This diagnostic
+does not change `is_successful_completion()` or turn a failed run into a pass.
+
 To crosswalk lateral structures and SA/2D connections to their receiving areas
 and integrate saved flows:
 

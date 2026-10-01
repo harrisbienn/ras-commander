@@ -9,6 +9,8 @@ from typing import Dict, Optional
 import logging
 import re
 
+from ..Decorators import log_call
+
 logger = logging.getLogger(__name__)
 
 
@@ -161,6 +163,62 @@ class ResultsParser:
             'error_count': error_count,
             'warning_count': warning_count,
             'first_error_line': first_error_line
+        }
+
+    @staticmethod
+    @log_call
+    def summarize_coupling_errors(messages: str) -> Dict:
+        """Group native 1D/2D flow-error messages without changing acceptance.
+
+        Preserve the entire location label and native timestamp (including
+        24:00 and synthetic years). Counts are message occurrences, not unique
+        timesteps. Reported error values have unspecified native units; do not
+        reinterpret them as cfs or percentages. Unparsed marker lines remain
+        explicit instead of silently disappearing from the diagnostic.
+        """
+        import math
+
+        marker = re.compile(r"1D/2D\s+Flow\s+error", re.IGNORECASE)
+        pattern = re.compile(
+            r"^\s*(\d{2}[A-Za-z]{3}\d{4}\s+\d{2}:\d{2}:\d{2})\s+"
+            r"1D/2D\s+Flow\s+error\s+"
+            r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][-+]?\d+)?)\s+(.+?)\s*$",
+            re.IGNORECASE,
+        )
+        locations = {}
+        unparsed = []
+        count = 0
+        for line in messages.splitlines():
+            if not marker.search(line):
+                continue
+            count += 1
+            match = pattern.match(line)
+            if match is None:
+                unparsed.append(line.strip())
+                continue
+            timestamp, raw_value, location = match.groups()
+            value = float(raw_value.replace("D", "E").replace("d", "e"))
+            if not math.isfinite(value):
+                unparsed.append(line.strip())
+                continue
+            location = " ".join(location.split())
+            row = locations.setdefault(location, {
+                "location": location, "count": 0, "first_timestamp": timestamp,
+                "last_timestamp": timestamp, "minimum_reported_error": value,
+                "maximum_reported_error": value, "maximum_absolute_reported_error": abs(value),
+            })
+            row["count"] += 1
+            row["last_timestamp"] = timestamp
+            row["minimum_reported_error"] = min(row["minimum_reported_error"], value)
+            row["maximum_reported_error"] = max(row["maximum_reported_error"], value)
+            row["maximum_absolute_reported_error"] = max(row["maximum_absolute_reported_error"], abs(value))
+        return {
+            "marker_line_count": count,
+            "parsed_line_count": sum(row["count"] for row in locations.values()),
+            "unparsed_line_count": len(unparsed),
+            "unparsed_examples": unparsed[:10],
+            "reported_error_units": "unspecified-native",
+            "locations": sorted(locations.values(), key=lambda row: (-row["count"], row["location"])),
         }
 
     @staticmethod
