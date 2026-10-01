@@ -1495,6 +1495,36 @@ class RasPlan:
             logger.error(f"Error updating intervals in plan file {plan_file_path}: {e}")
             raise
      
+    @staticmethod
+    @log_call
+    def set_warmup_steps(
+        plan_number_or_path: Union[str, Number, Path], steps: int, ras_object=None
+    ) -> None:
+        """Set the existing UNET warmup step count, preserving text formatting.
+
+        This changes ``UNET MaxInSteps`` only. The effective warmup duration
+        must be verified from engine diagnostics when changing timestep;
+        a fixed count does not guarantee a fixed physical warmup duration.
+        Missing/duplicate keys, negative/noninteger counts and mixed newlines
+        are rejected before writing. Source engineering files should be cloned
+        before using this method.
+        """
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+            raise ValueError('Warmup steps must be a nonnegative integer')
+        path = RasPlan._resolve_plan_file_path(plan_number_or_path, ras_object)
+        if path is None or not Path(path).is_file():
+            raise FileNotFoundError(f'Plan not found: {plan_number_or_path}')
+        lines, newline = RasUtils._read_text_lines_preserving_newline(Path(path))
+        matching = [index for index, line in enumerate(lines) if line.startswith('UNET MaxInSteps=')]
+        if len(matching) != 1:
+            raise ValueError('Expected exactly one UNET MaxInSteps setting')
+        index = matching[0]
+        pattern = r'^(UNET MaxInSteps=[ \t]*)\d+([ \t]*)(\r?\n)?$'
+        if not re.match(pattern, lines[index]):
+            raise ValueError('Invalid existing UNET MaxInSteps setting')
+        lines[index] = re.sub(pattern, lambda match: f'{match[1]}{steps}{match[2]}{match[3] or ""}', lines[index])
+        RasUtils._write_text_lines_with_newline(Path(path), lines, newline)
+
      
 
 
