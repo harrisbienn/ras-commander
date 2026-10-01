@@ -40,3 +40,16 @@ def test_volume_accounting_metrics_are_not_coupling_errors():
     )
     assert result["marker_line_count"] == 0
     assert result["locations"] == []
+
+
+def test_event_times_normalize_midnight_and_preserve_order():
+    messages = (
+        "01JAN3000 24:00:00 1D/2D Flow error 5 River Reach 1\n"
+        "02JAN3000 00:00:00 1D/2D Flow error 4 River Reach 1\n"
+        "32JAN3000 24:00:00 1D/2D Flow error 2 River Reach 1\n"
+    )
+    result = ResultsParser.get_coupling_error_events(messages)
+    assert [event["time"] for event in result["events"]] == ["3000-01-02T00:00:00"] * 2
+    assert [event["reported_error"] for event in result["events"]] == [5, 4]
+    assert result["unparsed_line_count"] == 1
+    assert result["events"][0]["timestamp"] == "01JAN3000 24:00:00"

@@ -16,6 +16,7 @@ Available Functions:
         - get_volume_accounting: Extract volume accounting data
         - get_volume_accounting_diagnostics: Read per-area balances and saved diagnostics
         - get_precipitation_diagnostics: Compare stored forcing, 1D depths and native accounting
+        - get_coupling_diagnostics: Read lateral segments and cumulative cross-section flow
         - get_runtime_data: Extract runtime and compute time data
         - get_reference_timeseries: Extract reference line/point timeseries
         - get_reference_summary: Extract reference line/point summary
@@ -562,6 +563,111 @@ class HdfResultsPlan:
                                 'No engineering tolerance or hydraulic acceptance is assigned.']}
 
     @staticmethod
+    @standardize_input(file_type='plan_hdf')
+    def get_coupling_diagnostics(
+        hdf_path: Path, lateral_names: List[str], cross_sections: List[Tuple[str, str, str]]
+    ) -> Dict:
+        """Read saved lateral segments and cross-section cumulative flow.
+
+        Lateral names are exact native result group names. Cross sections use
+        (river, reach, station) identities. Returns JSON-compatible native
+        labels, units and arrays on the common output time axis, not iteration
+        histories. Tailwater cell labels are preserved without assuming their
+        indexing convention. Segment endpoint arrays and interval cell labels
+        intentionally have different lengths. This read-only diagnostic also
+        supports failed complete runs and assigns no execution/QA acceptance.
+        Currently requires English-unit lateral and cross-section output.
+        """
+        from .HdfBase import HdfBase
+
+        def decode(value):
+            return value.decode("utf-8").strip() if isinstance(value, bytes) else str(value).strip()
+
+        if not lateral_names or len(set(lateral_names)) != len(lateral_names):
+            raise ValueError("Require distinct lateral names")
+        if any(not name or "/" in name for name in lateral_names):
+            raise ValueError("Use exact lateral result group names")
+        identities = [tuple(identity) for identity in cross_sections]
+        if not identities or any(len(identity) != 3 for identity in identities) or len(set(identities)) != len(identities):
+            raise ValueError("Require distinct (river, reach, station) cross sections")
+        base = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series"
+        with h5py.File(hdf_path, "r") as source:
+            times = HdfBase.get_unsteady_timestamps(source)
+            if len(times) < 2 or any(b <= a for a, b in zip(times, times[1:])):
+                raise ValueError("Coupling diagnostics require increasing timestamps")
+
+            def numeric(dataset, shape):
+                values = dataset[:].astype(float)
+                if values.shape != shape or not np.isfinite(values).all():
+                    raise ValueError(f"Invalid shape or nonfinite values: {dataset.name}")
+                return values.tolist()
+
+            laterals = []
+            for name in lateral_names:
+                group = source[f"{base}/Lateral Structures/{name}"]
+                variables = group["Structure Variables"]
+                columns = [(decode(pair[0]), decode(pair[1])) for pair in variables.attrs["Variable_Unit"]]
+                if len({label for label, _ in columns}) != len(columns):
+                    raise ValueError(f"Duplicate structure variables: {name}")
+                if dict(columns).get("Total Flow") != "cfs" or any(
+                    unit != "ft" for label, unit in columns if label.startswith("Stage ")
+                ):
+                    raise ValueError(f"Expected English structure units: {name}")
+                values = np.asarray(numeric(variables, (len(times), len(columns))))
+                if any(np.any(values[:, i] <= -9990) for i, (label, _) in enumerate(columns)
+                       if label.startswith("Stage ")):
+                    raise ValueError(f"Missing structure stage: {name}")
+                segments = group["HW TW Segments"]
+                stations = segments["HW TW Station"][:].astype(float)
+                if stations.ndim != 1 or len(stations) < 2 or not np.isfinite(stations).all() or np.any(np.diff(stations) <= 0):
+                    raise ValueError(f"Invalid segment stations: {name}")
+                cells = [decode(value) for value in segments["Tailwater Cells"][:]]
+                river_stations = [decode(value) for value in segments["Headwater River Stations"][:]]
+                if len(cells) != len(stations) - 1 or len(river_stations) != len(stations):
+                    raise ValueError(f"Invalid segment connectivity: {name}")
+                series = {}
+                for label, unit in (("Flow", "cfs"), ("Water Surface HW", "ft"), ("Water Surface TW", "ft")):
+                    dataset = segments[label]
+                    if decode(dataset.attrs["Units"]) != unit:
+                        raise ValueError(f"Unexpected segment units: {name}/{label}")
+                    series[label] = numeric(dataset, (len(times), len(stations)))
+                    if label.startswith("Water Surface") and np.any(np.asarray(series[label]) <= -9990):
+                        raise ValueError(f"Missing segment stage: {name}/{label}")
+                laterals.append({
+                    "name": name,
+                    "variables": {label: {"units": unit, "values": values[:, i].tolist()}
+                                  for i, (label, unit) in enumerate(columns)},
+                    "segment_stations_ft": stations.tolist(), "tailwater_cell_labels": cells,
+                    "headwater_river_stations": river_stations, "segments": series,
+                })
+            group = source[f"{base}/Cross Sections"]
+            attrs = group["Cross Section Attributes"][:]
+            available = [tuple(decode(row[key]) for key in ("River", "Reach", "Station")) for row in attrs]
+            if len(set(available)) != len(available):
+                raise ValueError("Duplicate cross-section identities")
+            flow_ds, volume_ds = group["Flow"], group["Flow Volume Cumulative"]
+            if decode(flow_ds.attrs["Variable Units"]) != "cfs" or decode(
+                volume_ds.attrs["Cumulative Volumetric Flow"]
+            ) != "Feet^3":
+                raise ValueError("Expected cfs/Feet^3 cross-section flow units")
+            flow = np.asarray(numeric(flow_ds, (len(times), len(attrs))))
+            volume = np.asarray(numeric(volume_ds, (len(times), len(attrs))))
+            sections = []
+            for identity in identities:
+                if identity not in available:
+                    raise ValueError(f"Unknown cross section: {identity}")
+                index = available.index(identity)
+                sections.append({
+                    "river": identity[0], "reach": identity[1], "station": identity[2],
+                    "flow_cfs": flow[:, index].tolist(), "cumulative_flow_ft3": volume[:, index].tolist(),
+                })
+        return {"time": [value.isoformat() for value in times], "laterals": laterals, "cross_sections": sections,
+                "limitations": ["Saved output does not contain every coupling iteration.",
+                                "Cell labels retain the native indexing convention.",
+                                "No execution or hydraulic acceptance is assigned."]}
+
+    @staticmethod
+    @log_call
     @standardize_input(file_type='plan_hdf')
     def get_runtime_data(hdf_path: Path) -> Optional[pd.DataFrame]:
         """

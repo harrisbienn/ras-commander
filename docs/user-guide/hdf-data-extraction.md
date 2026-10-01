@@ -249,6 +249,16 @@ prove what the engine applied to its equations, repair native accounting, or
 assign hydraulic acceptance. Preserve the native summary when reporting findings.
 
 To locate repeated native coupling failures, use
+`ResultsParser.get_coupling_error_events(messages)` retains ordered occurrences
+with both native timestamps and normalized ISO times (including synthetic years
+and midnight written as `24:00`). Malformed dates remain counted as unparsed.
+Use `HdfResultsPlan.get_coupling_diagnostics(hdf_path, lateral_names,
+cross_sections)` for saved lateral segment flows/stages, native tailwater cell
+labels and cumulative cross-section flows. Select exact result-group names and
+`(river, reach, station)` tuples. The reader checks English units and common
+output shapes. It does not reconstruct every coupling iteration or assign
+acceptance, and native cell labels are not silently converted to zero-based IDs.
+
 `ResultsParser.summarize_coupling_errors(messages)` from
 `ras_commander.results.ResultsParser` on `HdfResultsPlan.get_compute_messages()`
 output. It groups `1D/2D Flow error` occurrences by the complete native location

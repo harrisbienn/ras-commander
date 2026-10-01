@@ -167,16 +167,16 @@ class ResultsParser:
 
     @staticmethod
     @log_call
-    def summarize_coupling_errors(messages: str) -> Dict:
-        """Group native 1D/2D flow-error messages without changing acceptance.
+    def get_coupling_error_events(messages: str) -> Dict:
+        """Read ordered native coupling errors, retaining repeated timestamps.
 
-        Preserve the entire location label and native timestamp (including
-        24:00 and synthetic years). Counts are message occurrences, not unique
-        timesteps. Reported error values have unspecified native units; do not
-        reinterpret them as cfs or percentages. Unparsed marker lines remain
-        explicit instead of silently disappearing from the diagnostic.
+        Native dates remain strings alongside normalized ISO times; 24:00 is
+        the next midnight, and synthetic years do not pass through pandas.
+        Error units are unspecified. Malformed/nonfinite marker lines remain
+        counted; this diagnostic never changes completion acceptance.
         """
         import math
+        from datetime import datetime, timedelta
 
         marker = re.compile(r"1D/2D\s+Flow\s+error", re.IGNORECASE)
         pattern = re.compile(
@@ -185,7 +185,7 @@ class ResultsParser:
             r"([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eEdD][-+]?\d+)?)\s+(.+?)\s*$",
             re.IGNORECASE,
         )
-        locations = {}
+        events = []
         unparsed = []
         count = 0
         for line in messages.splitlines():
@@ -201,7 +201,31 @@ class ResultsParser:
             if not math.isfinite(value):
                 unparsed.append(line.strip())
                 continue
+            try:
+                if timestamp.endswith("24:00:00"):
+                    parsed_time = datetime.strptime(timestamp[:9], "%d%b%Y") + timedelta(days=1)
+                else:
+                    parsed_time = datetime.strptime(timestamp, "%d%b%Y %H:%M:%S")
+            except ValueError:
+                unparsed.append(line.strip())
+                continue
             location = " ".join(location.split())
+            events.append({"timestamp": timestamp, "time": parsed_time.isoformat(),
+                           "location": location, "reported_error": value})
+        return {
+            "marker_line_count": count, "parsed_line_count": len(events),
+            "unparsed_line_count": len(unparsed), "unparsed_examples": unparsed[:10],
+            "reported_error_units": "unspecified-native", "events": events,
+        }
+
+    @staticmethod
+    @log_call
+    def summarize_coupling_errors(messages: str) -> Dict:
+        """Group native errors by location; counts are occurrences, not steps."""
+        parsed = ResultsParser.get_coupling_error_events(messages)
+        locations = {}
+        for event in parsed["events"]:
+            timestamp, location, value = event["timestamp"], event["location"], event["reported_error"]
             row = locations.setdefault(location, {
                 "location": location, "count": 0, "first_timestamp": timestamp,
                 "last_timestamp": timestamp, "minimum_reported_error": value,
@@ -213,11 +237,7 @@ class ResultsParser:
             row["maximum_reported_error"] = max(row["maximum_reported_error"], value)
             row["maximum_absolute_reported_error"] = max(row["maximum_absolute_reported_error"], abs(value))
         return {
-            "marker_line_count": count,
-            "parsed_line_count": sum(row["count"] for row in locations.values()),
-            "unparsed_line_count": len(unparsed),
-            "unparsed_examples": unparsed[:10],
-            "reported_error_units": "unspecified-native",
+            **{key: value for key, value in parsed.items() if key != "events"},
             "locations": sorted(locations.values(), key=lambda row: (-row["count"], row["location"])),
         }
 
