@@ -16,6 +16,7 @@ Available Functions:
         - get_volume_accounting: Extract volume accounting data
         - get_volume_accounting_diagnostics: Read per-area balances and saved diagnostics
         - get_precipitation_diagnostics: Compare stored forcing, 1D depths and native accounting
+        - get_precipitation_receiving_diagnostics: Integrate imported rain over stored receiving weights
         - get_coupling_diagnostics: Read lateral segments and cumulative cross-section flow
         - get_runtime_data: Extract runtime and compute time data
         - get_reference_timeseries: Extract reference line/point timeseries
@@ -323,6 +324,156 @@ class HdfResultsPlan:
                 "No engineering tolerance or hydraulic acceptance is assigned.",
             ],
         }
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type='plan_hdf')
+    def get_precipitation_receiving_diagnostics(hdf_path: Path, *, value_semantics: str) -> Dict:
+        """Reconstruct prescribed receiving volumes from imported rain and weights.
+
+        ``value_semantics`` must explicitly be ``interval_depth`` or
+        ``cumulative_depth``. The caller must verify it against source interval
+        totals: source ``per-cum`` metadata alone does not establish how native
+        preprocessing stores Values. Cumulative mode assumes zero depth at the
+        simulation start; full, regular interval-end coverage is required.
+
+        Uses stored cell weights and physical mesh areas for 2D, and stored
+        interpolation-surface weights with explicitly crosswalked ft^2 control
+        volumes for 1D. Face weights are not additional rainfall receivers.
+        Requires English-unit stages and metre-based source raster coordinates.
+        No native rainfall summaries or cumulative output depths enter these
+        calculations. This is prescribed rainfall, not proof of water admitted
+        by the solver, infiltration loss, nonoverlapping footprints or acceptance.
+        Raises on ambiguous identities, units, coverage or interpolation indexes.
+        """
+        from pyproj import CRS
+        from .HdfBase import HdfBase
+
+        if value_semantics not in ("interval_depth", "cumulative_depth"):
+            raise ValueError("Explicit imported rainfall value semantics are required")
+        def decode(value):
+            return value.decode().strip() if isinstance(value, bytes) else str(value).strip()
+
+        base = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series"
+        model_crs = CRS.from_user_input(HdfBase.get_projection(hdf_path))
+        if (not model_crs.is_projected or len(model_crs.axis_info) != 2
+                or any(axis.unit_name not in ("foot", "US survey foot") for axis in model_crs.axis_info)):
+            raise ValueError("Receiving geometry coordinates must be feet")
+        with h5py.File(hdf_path, "r") as source:
+            met = source["Event Conditions/Meteorology/Precipitation"]
+            metadata = HdfUtils.convert_hdf5_attrs_to_dict(met.attrs)
+            if (metadata.get("Mode"), metadata.get("Data Type"), metadata.get("Units")) != (
+                    "Gridded", "per-cum", "in"):
+                raise ValueError("Receiving audit requires Gridded/per-cum/in forcing")
+            if decode(source[f"{base}/Cross Sections/Water Surface"].attrs["Variable Units"]) != "Feet":
+                raise ValueError("Receiving audit requires English geometry/stage units")
+            crs = CRS.from_user_input(metadata["Projection"])
+            if not crs.is_projected or any(axis.unit_name != "metre" for axis in crs.axis_info):
+                raise ValueError("Source raster coordinates must be metres")
+            rows, cols = int(metadata["Raster Rows"]), int(metadata["Raster Cols"])
+            size = float(metadata["Raster Cellsize"])
+            if rows <= 0 or cols <= 0 or not np.isfinite(size) or size <= 0:
+                raise ValueError("Invalid source raster geometry")
+            values = met["Values"][:].astype(float)
+            timestamps = [datetime.strptime(decode(t), "%d%b%Y %H:%M:%S.%f") for t in met["Timestamp"][:]]
+            saved_times = HdfBase.get_unsteady_timestamps(source)
+            if (len(timestamps) < 2 or len(saved_times) < 2 or values.shape != (len(timestamps), rows * cols)
+                    or not np.isfinite(values).all() or np.any(values < 0)):
+                raise ValueError("Invalid imported rainfall values or dimensions")
+            interval = timestamps[1] - timestamps[0]
+            if (interval.total_seconds() <= 0 or timestamps[0] - interval != saved_times[0]
+                    or timestamps[-1] != saved_times[-1]
+                    or any(b - a != interval for a, b in zip(timestamps, timestamps[1:]))):
+                raise ValueError("Imported rainfall requires full regular interval-end coverage")
+            increments = (values if value_semantics == "interval_depth"
+                          else np.diff(values, axis=0, prepend=np.zeros((1, rows * cols))))
+            if np.any(increments < 0):
+                raise ValueError("Cumulative rainfall decreases; verify stored value semantics")
+            total_depth = increments.sum(axis=0)
+
+            def receivers(group, prefix, areas, identities):
+                info = group[f"{prefix}Info"][:]
+                indexes = group[f"{prefix}Indexes"][:]
+                weights = group[f"{prefix}Weights"][:].astype(float)
+                if (info.shape != (len(areas), 2) or not np.issubdtype(info.dtype, np.integer)
+                        or indexes.ndim != 1 or not np.issubdtype(indexes.dtype, np.integer)
+                        or weights.shape != indexes.shape or not np.isfinite(weights).all()
+                        or np.any(weights < 0) or not np.isfinite(areas).all() or np.any(areas <= 0)):
+                    raise ValueError("Invalid receiving areas or sparse weights")
+                effective_areas = np.zeros(rows * cols)
+                records, cursor = [], 0
+                for i, (offset, count) in enumerate(info):
+                    if offset != cursor or count < 0 or offset + count > len(indexes):
+                        raise ValueError("Invalid or overlapping sparse weight slices")
+                    cursor += count
+                    selected, weight = indexes[offset:cursor], weights[offset:cursor]
+                    if np.any(selected < 0) or np.any(selected >= rows * cols):
+                        raise ValueError("Rainfall weight index outside source raster")
+                    if count and not np.isclose(weight.sum(), 1, rtol=0, atol=1e-6):
+                        raise ValueError("Receiving weights do not sum to one")
+                    np.add.at(effective_areas, selected, areas[i] * weight)
+                    depth = float(total_depth[selected] @ weight)
+                    records.append({"identity": identities[i], "area_ft2": float(areas[i]),
+                        "weight_count": int(count), "weight_sum": float(weight.sum()),
+                        "depth_in": depth, "volume_af": depth * float(areas[i]) / 12 / 43560})
+                if cursor != len(indexes):
+                    raise ValueError("Unreferenced interpolation weights")
+                series = increments @ effective_areas / 12 / 43560
+                return {"receiver_count": len(areas), "area_ft2": float(areas.sum()),
+                    "unmapped_receiver_count": sum(r["weight_count"] == 0 for r in records),
+                    "total_volume_af": float(series.sum()), "interval_volume_af": series.tolist(),
+                    "receivers": records}
+
+            two_d = {}
+            attrs = source["Geometry/2D Flow Areas/Attributes"][:]
+            names = [decode(row["Name"]) for row in attrs]
+            if len(set(names)) != len(names) or set(names) != set(met["2D Flow Areas"]):
+                raise ValueError("Precipitation and geometry area identities differ")
+            for row, name in zip(attrs, names):
+                count = int(row["Cell Count"])
+                areas = source[f"Geometry/2D Flow Areas/{name}/Cells Surface Area"][:].astype(float)
+                if count <= 0 or len(areas) < count:
+                    raise ValueError("Invalid physical cell count")
+                two_d[name] = receivers(met[f"2D Flow Areas/{name}"], "Cell ", areas[:count], list(range(count)))
+                two_d[name]["excluded_nonphysical_area_rows"] = len(areas) - count
+
+            geom = source["Geometry/Cross Sections/Attributes"][:]
+            section_ids = [tuple(decode(row[k]) for k in ("River", "Reach", "RS")) for row in geom]
+            cv = source[f"{base}/Cross Sections Control Volume/XS CV Attributes"][:]
+            cv_ids = [tuple(decode(row[k]) for k in ("River", "Reach", "Station US", "Station DS")) for row in cv]
+            if len(set(cv_ids)) != len(cv_ids) or len(set(section_ids)) != len(section_ids):
+                raise ValueError("Duplicate cross-section identities")
+            by_id = dict(zip(cv_ids, cv["Surface Area (ft^2)"].astype(float)))
+            pairs = source["Geometry/Cross Section Interpolation Surfaces/XSIDs"][:]
+            if pairs.ndim != 2 or pairs.shape[1] != 2 or not np.issubdtype(pairs.dtype, np.integer):
+                raise ValueError("Invalid interpolation-surface section pairs")
+            identities, areas = [], []
+            for up, down in pairs:
+                if min(up, down) < 0 or max(up, down) >= len(section_ids) or up == down:
+                    raise ValueError("Invalid interpolation-surface section index")
+                us, ds = section_ids[up], section_ids[down]
+                identity = (*us, ds[2])
+                if us[:2] != ds[:2] or identity not in by_id:
+                    raise ValueError("Interpolation surface cannot resolve its control volume")
+                identities.append(identity)
+                areas.append(by_id[identity])
+            if len(identities) != len(set(identities)) or set(identities) != set(cv_ids):
+                raise ValueError("Incomplete or duplicate control-volume surface mapping")
+            one_d = receivers(met["Cross Section Interpolation Surfaces"], "", np.asarray(areas), identities)
+            # Standard acre-foot: 43,560 cubic feet, using 0.3048 metres per foot.
+            grid_volume = increments.sum(axis=1) * size * size * 0.0254 / 1233.48183754752
+        return {"value_semantics": value_semantics, "meteorology_metadata": metadata,
+            "start": saved_times[0].isoformat(), "end": saved_times[-1].isoformat(),
+            "interval_end": [t.isoformat() for t in timestamps], "interval_seconds": interval.total_seconds(),
+            "grid_total_volume_af": float(grid_volume.sum()), "grid_interval_volume_af": grid_volume.tolist(),
+            "grid_total_depth_in": total_depth.tolist(), "one_d": one_d, "two_d": two_d,
+            "total_two_d_volume_af": sum(area["total_volume_af"] for area in two_d.values()),
+            "total_receiving_volume_af": one_d["total_volume_af"] + sum(
+                area["total_volume_af"] for area in two_d.values()),
+            "limitations": ["Prescribed rainfall from stored weights, not solver-admitted water or excess after losses.",
+                "Summed 1D and 2D recipients do not establish geometrically disjoint footprints.",
+                "Imported value semantics must be checked against independently authenticated source intervals.",
+                "No hydraulic acceptance or production correction is assigned."]}
 
     @staticmethod
     @log_call
