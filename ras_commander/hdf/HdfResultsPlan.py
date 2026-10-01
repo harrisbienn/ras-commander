@@ -15,6 +15,7 @@ Available Functions:
         - get_unsteady_summary: Extract unsteady summary data
         - get_volume_accounting: Extract volume accounting data
         - get_volume_accounting_diagnostics: Read per-area balances and saved diagnostics
+        - get_precipitation_diagnostics: Compare stored forcing, 1D depths and native accounting
         - get_runtime_data: Extract runtime and compute time data
         - get_reference_timeseries: Extract reference line/point timeseries
         - get_reference_summary: Extract reference line/point summary
@@ -319,6 +320,117 @@ class HdfResultsPlan:
                 "Overall minus 2D errors is unattributed; 1D exchange terms require separate reconciliation.",
                 "Saved Volume Error is not assumed cumulative or equivalent to final accounting Error.",
                 "No engineering tolerance or hydraulic acceptance is assigned.",
+            ],
+        }
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type='plan_hdf')
+    def get_precipitation_diagnostics(hdf_path: Path) -> Dict:
+        """Audit stored gridded forcing and 1D cumulative precipitation.
+
+        Fingerprint every preprocessed meteorology dataset (including spatial
+        weights) and reconstruct volume from saved cross-section control-volume
+        depths and areas. This checks stored output, not solver source code or
+        water actually admitted to the hydraulic equations. Currently requires
+        gridded, period-cumulative precipitation in inches and areas in ft^2.
+        Missing output, ambiguous units, invalid areas, and nonfinite depths
+        raise instead of yielding a misleading zero. No acceptance is assigned.
+        """
+        import hashlib
+        from .HdfBase import HdfBase
+
+        met_path = "Event Conditions/Meteorology/Precipitation"
+        base = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series"
+        cv_path = f"{base}/Cross Sections Control Volume"
+        with h5py.File(hdf_path, "r") as source:
+            met = source[met_path]
+            metadata = HdfUtils.convert_hdf5_attrs_to_dict(met.attrs)
+            if (metadata.get("Mode"), metadata.get("Data Type"), metadata.get("Units")) != (
+                "Gridded", "per-cum", "in"
+            ):
+                raise ValueError("Precipitation audit requires Gridded/per-cum/in metadata")
+            fingerprints = {}
+
+            def fingerprint(name, dataset):
+                if isinstance(dataset, h5py.Dataset):
+                    values = dataset[()]
+                    if dataset.dtype.hasobject:
+                        raise ValueError(f"Unsupported variable-length meteorology dataset: {name}")
+                    fingerprints[name] = {
+                        "shape": list(dataset.shape),
+                        "dtype": str(dataset.dtype),
+                        "sha256": hashlib.sha256(values.tobytes()).hexdigest(),
+                    }
+
+            met.visititems(fingerprint)
+            for required in ("Timestamp", "Values"):
+                if required not in fingerprints:
+                    raise KeyError(f"Missing precipitation dataset: {required}")
+            forcing_times = [v.decode("utf-8").strip() for v in met["Timestamp"][:]]
+            forcing_values = met["Values"][:]
+            if forcing_values.ndim != 2 or forcing_values.shape[0] != len(forcing_times) or not forcing_times:
+                raise ValueError("Gridded precipitation shape/time mismatch")
+            if not np.isfinite(forcing_values).all():
+                raise ValueError("Nonfinite gridded precipitation values")
+            depth_ds = source[f"{cv_path}/Cumulative Precipitation Depth"]
+            depth_metadata = HdfUtils.convert_hdf5_attrs_to_dict(depth_ds.attrs)
+            if depth_metadata.get("Units") != "in":
+                raise ValueError("Control-volume precipitation depths must be in inches")
+            depths = depth_ds[:].astype(np.float64)
+            attrs = source[f"{cv_path}/XS CV Attributes"][:]
+            fields = {"River", "Reach", "Station US", "Station DS", "Surface Area (ft^2)"}
+            if not fields.issubset(attrs.dtype.names or ()):
+                raise ValueError("Missing cross-section control-volume identity or ft^2 area")
+            areas = attrs["Surface Area (ft^2)"].astype(np.float64)
+            times = HdfBase.get_unsteady_timestamps(source)
+            if depths.shape != (len(times), len(attrs)) or len(times) < 2 or len(attrs) == 0:
+                raise ValueError("Control-volume precipitation shape/time mismatch")
+            if any(b <= a for a, b in zip(times, times[1:])):
+                raise ValueError("Precipitation output timestamps must strictly increase")
+            if not np.isfinite(depths).all() or not np.isfinite(areas).all() or np.any(areas <= 0):
+                raise ValueError("Invalid precipitation depths or control-volume areas")
+            identities = [tuple(row[key].decode("utf-8").strip() for key in (
+                "River", "Reach", "Station US", "Station DS"
+            )) for row in attrs]
+            if len(set(identities)) != len(identities):
+                raise ValueError("Duplicate cross-section control-volume identities")
+            volumes = depths @ areas / (12.0 * 43560.0)
+            controls = []
+            for index, identity in enumerate(identities):
+                controls.append(dict(zip(("river", "reach", "station_us", "station_ds"), identity)) | {
+                    "area_ft2": float(areas[index]),
+                    "initial_depth_in": float(depths[0, index]),
+                    "final_depth_in": float(depths[-1, index]),
+                    "depth_series_sha256": hashlib.sha256(depths[:, index].tobytes()).hexdigest(),
+                    "final_volume_af": float(depths[-1, index] * areas[index] / (12.0 * 43560.0)),
+                })
+            one_d = HdfUtils.convert_hdf5_attrs_to_dict(
+                source["Results/Unsteady/Summary/Volume Accounting/Volume Accounting 1D"].attrs
+            )
+            native = one_d.get("Precip Excess (acre feet)")
+            if one_d.get("Vol Accounting in") != "Acre Feet" or not isinstance(native, (int, float)):
+                raise ValueError("Missing native 1D precipitation accounting in acre-feet")
+            if not np.isfinite(native):
+                raise ValueError("Nonfinite native 1D precipitation accounting")
+        return {
+            "meteorology_metadata": metadata,
+            "meteorology_datasets": fingerprints,
+            "forcing_timestamp_count": len(forcing_times),
+            "forcing_first_timestamp": forcing_times[0],
+            "forcing_last_timestamp": forcing_times[-1],
+            "control_volumes": controls,
+            "time": [t.isoformat() for t in times],
+            "saved_cumulative_volume_af": volumes.tolist(),
+            "saved_final_volume_af": float(volumes[-1]),
+            "saved_window_volume_af": float(volumes[-1] - volumes[0]),
+            "native_1d_precipitation_af": native,
+            "saved_final_minus_native_af": float(volumes[-1] - native),
+            "limitations": [
+                "Saved cumulative depths may be precipitation, while native accounting labels excess precipitation.",
+                "A mismatch does not establish actual hydraulic input loss or a unique engine defect.",
+                "Dataset fingerprints cover stored meteorology, not all native execution internals.",
+                "No engineering acceptance is assigned.",
             ],
         }
 

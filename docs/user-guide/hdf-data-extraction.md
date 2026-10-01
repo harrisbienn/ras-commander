@@ -223,6 +223,31 @@ Saved `Computations/Volume Error` samples are not assumed cumulative: they can
 be zero even when final accounting reports an imbalance. Missing series remain
 absent. This read-only diagnostic assigns no engineering acceptance threshold.
 
+For gridded period-cumulative precipitation in inches, compare stored 1D
+control-volume depths and areas with the native precipitation summary:
+
+```python
+precipitation = HdfResultsPlan.get_precipitation_diagnostics(hdf_path)
+print(precipitation["saved_final_volume_af"])
+print(precipitation["native_1d_precipitation_af"])
+print(precipitation["saved_final_minus_native_af"])
+```
+
+The reader fingerprints all stored meteorology datasets, including interpolation
+weights, and preserves metadata for comparison across runs. It reconstructs
+acre-feet as the sum of depth in inches times control-volume area in square feet,
+divided by 12 and 43,560. Initial cumulative depth is retained; final volume and
+the change over the saved window are separate outputs. Missing data, unsupported
+units, duplicate identities, nonfinite values and invalid output time axes raise.
+Fixed-width native meteorology arrays are required; variable-length object arrays
+are rejected rather than hashing memory addresses. The reader loads the stored
+forcing and 1D depth arrays into memory.
+
+Saved precipitation and native **excess** precipitation need not match when
+losses apply. This audit locates discrepancies in stored evidence; it does not
+prove what the engine applied to its equations, repair native accounting, or
+assign hydraulic acceptance. Preserve the native summary when reporting findings.
+
 To crosswalk lateral structures and SA/2D connections to their receiving areas
 and integrate saved flows:
 
