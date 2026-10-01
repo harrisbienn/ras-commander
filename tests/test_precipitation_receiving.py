@@ -90,6 +90,7 @@ def test_invalid_or_unassigned_wet_labels_fail(rain_hdf, labels):
 def receiver_polygons(monkeypatch):
     import geopandas as gpd
     from shapely.geometry import box
+
     from ras_commander import HdfMesh, HdfXsec
 
     cells = gpd.GeoDataFrame({"mesh_name": ["Mesh", "Mesh"], "cell_id": [0, 1]},
