@@ -33,6 +33,13 @@ monitor = BcoMonitor(project_path=project_folder, project_name="Model", plan_num
 print(monitor.get_initial_time_window())
 ```
 
+Use `RasPlan.set_1d_2d_max_iterations(plan_path, 3)` to change the existing
+`UNET D1D2 MaxIter` coupling limit on an isolated clone. Values are integers
+from 0 through 20; zero disables additional coupling iterations. This is
+separate from the per-area 2D solver iteration limit. The setter preserves
+other bytes and rejects missing/duplicate keys, malformed values and mixed
+newlines. It does not change convergence tolerances or establish acceptance.
+
 The setter changes only `UNET MaxInSteps`, preserving formatting and newlines.
 The monitor reads the first solver window in hours relative to simulation
 start; a negative start measures the actual warmup duration. Missing or

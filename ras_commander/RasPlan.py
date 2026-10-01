@@ -1532,6 +1532,36 @@ class RasPlan:
 
     @staticmethod
     @log_call
+    def set_1d_2d_max_iterations(
+        plan_number_or_path: Union[str, Number, Path], iterations: int, ras_object=None
+    ) -> None:
+        """Set existing 1D/2D coupling iterations (0-20), preserving formatting.
+
+        Zero disables additional coupling iterations. This changes only
+        ``UNET D1D2 MaxIter``, not the separate 2D solver iteration limit or
+        convergence tolerances. Missing/duplicate/malformed keys and mixed
+        newlines are rejected before writing. Use an isolated model clone.
+        """
+        if isinstance(iterations, bool) or not isinstance(iterations, int) or not 0 <= iterations <= 20:
+            raise ValueError('1D/2D maximum iterations must be an integer from 0 to 20')
+        path = RasPlan._resolve_plan_file_path(plan_number_or_path, ras_object)
+        if path is None or not Path(path).is_file():
+            raise FileNotFoundError(f'Plan not found: {plan_number_or_path}')
+        lines, newline = RasUtils._read_text_lines_preserving_newline(Path(path))
+        key = 'UNET D1D2 MaxIter'
+        matching = [index for index, line in enumerate(lines) if line.startswith(f'{key}=')]
+        if len(matching) != 1:
+            raise ValueError(f'Expected exactly one {key} setting')
+        index = matching[0]
+        pattern = r'^(UNET D1D2 MaxIter=[ \t]*)\d+([ \t]*)(\r?\n)?$'
+        match = re.fullmatch(pattern, lines[index])
+        if match is None:
+            raise ValueError(f'Invalid existing {key} setting')
+        lines[index] = f'{match[1]}{iterations}{match[2]}{match[3] or ""}'
+        RasUtils._write_text_lines_with_newline(Path(path), lines, newline)
+
+    @staticmethod
+    @log_call
     def read_plan_description(plan_number_or_path: Union[str, Path], ras_object: Optional['RasPrj'] = None) -> str:
         """
         Read the description from the plan file.
