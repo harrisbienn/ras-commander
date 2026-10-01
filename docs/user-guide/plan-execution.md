@@ -17,6 +17,28 @@ success = RasCmdr.compute_plan("01")
 
 ### Parameters
 
+For controlled timestep comparisons, preserve the intended physical warmup
+duration as well as the simulation and output windows. A fixed warmup step
+count can represent a different duration after changing computation interval.
+On a cloned plan, change the existing count through the package API:
+
+```python
+from ras_commander import RasPlan
+from ras_commander.RasBco import BcoMonitor
+
+RasPlan.set_warmup_steps("01", 672)
+# After execution, verify the actual solver window rather than assuming
+# that a configured warmup interval was used by the engine.
+monitor = BcoMonitor(project_path=project_folder, project_name="Model", plan_number="01")
+print(monitor.get_initial_time_window())
+```
+
+The setter changes only `UNET MaxInSteps`, preserving formatting and newlines.
+The monitor reads the first solver window in hours relative to simulation
+start; a negative start measures the actual warmup duration. Missing or
+incomplete timing evidence raises an error. These helpers assign no engineering
+acceptance and do not guarantee identical equilibrated initial states.
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `plan_number` | str | Plan identifier ("01", "02", etc.) |
