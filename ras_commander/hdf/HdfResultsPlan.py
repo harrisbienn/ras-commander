@@ -14,6 +14,7 @@ Available Functions:
         - get_unsteady_info: Extract unsteady attributes
         - get_unsteady_summary: Extract unsteady summary data
         - get_volume_accounting: Extract volume accounting data
+        - get_volume_accounting_diagnostics: Read per-area balances and saved diagnostics
         - get_runtime_data: Extract runtime and compute time data
         - get_reference_timeseries: Extract reference line/point timeseries
         - get_reference_summary: Extract reference line/point summary
@@ -190,6 +191,136 @@ class HdfResultsPlan:
             )
         except Exception as e:
             raise RuntimeError(f"Error reading volume accounting attributes: {str(e)}")
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type="plan_hdf")
+    def get_volume_accounting_diagnostics(hdf_path: Path) -> Dict:
+        """Read overall, 1D and per-area accounting without modifying results.
+
+        Preserve native attributes and units alongside balance arithmetic.
+        Positive residual means ending storage exceeds starting storage plus
+        cumulative inflow minus outflow. Cumulative 2D inflow already includes
+        precipitation; never add the separately reported precipitation again.
+        Internal exchanges prevent summing area inflows into an external total.
+
+        Args:
+            hdf_path: Plan HDF path or supported plan selector.
+            ras_object: Optional project context supplied by the decorator.
+
+        Returns:
+            Dictionary of raw accounting, reconstructed residuals and optional
+            saved computation series. No hydraulic acceptance is assigned.
+            Overall-minus-2D error is an unattributed remainder, not a measured
+            1D solver error. Saved Volume Error samples need not be cumulative.
+
+        Raises:
+            KeyError: Required overall or area accounting is missing.
+            ValueError: Accounting units differ or required values are invalid.
+            OSError: The HDF cannot be read.
+        """
+        import math
+        from numbers import Real
+        from .HdfResultsMesh import HdfResultsMesh
+
+        base = "Results/Unsteady/Summary/Volume Accounting"
+
+        def number(attributes, key):
+            value = attributes[key]
+            if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
+                raise ValueError(f"Volume accounting {key!r} must be a finite number")
+            return float(value)
+
+        def residual(attributes, start, end, incoming, outgoing):
+            return (
+                number(attributes, end)
+                - number(attributes, start)
+                - number(attributes, incoming)
+                + number(attributes, outgoing)
+            )
+
+        with h5py.File(hdf_path, "r") as source:
+            if base not in source:
+                raise KeyError(f"Missing HDF group: {base}")
+            overall = HdfUtils.convert_hdf5_attrs_to_dict(source[base].attrs)
+            units = overall.get("Vol Accounting in")
+            if not isinstance(units, str) or not units.strip():
+                raise ValueError("Overall volume accounting units are missing")
+            overall_residual = residual(
+                overall,
+                "Volume Starting",
+                "Volume Ending",
+                "Total Boundary Flux of Water In",
+                "Total Boundary Flux of Water Out",
+            )
+            reported_error = number(overall, "Error")
+            one_d_path = f"{base}/Volume Accounting 1D"
+            one_d = (
+                HdfUtils.convert_hdf5_attrs_to_dict(source[one_d_path].attrs)
+                if one_d_path in source
+                else None
+            )
+            two_d_path = f"{base}/Volume Accounting 2D"
+            areas = []
+            series_available = {}
+            for name in sorted(source[two_d_path]) if two_d_path in source else []:
+                raw = HdfUtils.convert_hdf5_attrs_to_dict(source[f"{two_d_path}/{name}"].attrs)
+                if raw.get("Vol Accounting in") != units:
+                    raise ValueError(f"Volume accounting units differ for {name!r}")
+                reconstructed = residual(raw, "Vol Starting", "Vol Ending", "Cum Inflow", "Cum Outflow")
+                area_error = number(raw, "Error")
+                areas.append(
+                    {
+                        "area": name,
+                        "raw": raw,
+                        "reconstructed_error": reconstructed,
+                        "reconstruction_minus_reported": reconstructed - area_error,
+                    }
+                )
+                series_base = (
+                    "Results/Unsteady/Output/Output Blocks/Base Output/"
+                    f"Unsteady Time Series/2D Flow Areas/{name}/Computations"
+                )
+                series_available[name] = [
+                    var for var in ("Volume", "Volume Error") if f"{series_base}/{var}" in source
+                ]
+
+        saved_series = {}
+        for name, variables in series_available.items():
+            saved_series[name] = {}
+            for variable in variables:
+                data = HdfResultsMesh.get_mesh_timeseries(
+                    hdf_path, name, f"Computations/{variable}", truncate=False
+                )
+                values = np.asarray(data.values)
+                if values.ndim != 2 or values.shape[1] != 1:
+                    raise ValueError(f"Expected one {variable} value per time for {name}")
+                if not np.isfinite(values).all():
+                    raise ValueError(f"Nonfinite {variable} samples for {name}")
+                saved_series[name][variable] = {
+                    "units": data.attrs.get("units", ""),
+                    "times": [pd.Timestamp(t).isoformat() for t in data.time.values],
+                    "values": values[:, 0].tolist(),
+                }
+        area_sum = math.fsum(number(area["raw"], "Error") for area in areas) if areas else None
+        return {
+            "units": units,
+            "overall": overall,
+            "one_d": one_d,
+            "two_d": areas,
+            "overall_reconstructed_error": overall_residual,
+            "overall_reconstruction_minus_reported": overall_residual - reported_error,
+            "sum_reported_two_d_errors": area_sum,
+            "overall_minus_two_d_errors": reported_error - area_sum if area_sum is not None else None,
+            "saved_computation_series": saved_series,
+            "limitations": [
+                "Do not add precipitation to cumulative 2D inflow a second time.",
+                "Internal transfers mean per-area inflows/outflows are not external totals.",
+                "Overall minus 2D errors is unattributed; 1D exchange terms require separate reconciliation.",
+                "Saved Volume Error is not assumed cumulative or equivalent to final accounting Error.",
+                "No engineering tolerance or hydraulic acceptance is assigned.",
+            ],
+        }
 
     @staticmethod
     @standardize_input(file_type='plan_hdf')

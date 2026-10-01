@@ -205,6 +205,24 @@ else:
     print("No volume accounting - check if run completed successfully")
 ```
 
+For the overall, 1D and individual 2D-area accounting, including retained
+computation-series samples:
+
+```python
+diagnostic = HdfResultsPlan.get_volume_accounting_diagnostics(hdf_path)
+for area in diagnostic["two_d"]:
+    print(area["area"], area["raw"]["Error"], area["reconstructed_error"])
+```
+
+The diagnostic preserves native units and reported percentages. Positive
+reconstructed error is ending storage minus starting storage and inflow plus
+outflow. The 2D cumulative inflow includes precipitation; adding it again
+double-counts water. Do not sum internal-area flows as external model flows.
+The overall-minus-2D remainder does not isolate a measured 1D solver error.
+Saved `Computations/Volume Error` samples are not assumed cumulative: they can
+be zero even when final accounting reports an imbalance. Missing series remain
+absent. This read-only diagnostic assigns no engineering acceptance threshold.
+
 ### Unsteady Results Information
 
 Check that unsteady results were properly generated:
