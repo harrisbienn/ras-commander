@@ -6345,6 +6345,41 @@ class RasUnsteady:
 
     @staticmethod
     @log_call
+    def disable_evapotranspiration(
+        unsteady_file: Union[str, Path],
+        ras_object: Optional[Any] = None,
+    ) -> None:
+        """Explicitly disable ET while preserving its inactive input definitions.
+
+        Older files can omit the ET mode. HEC-RAS 6.6 may then write an enabled
+        meteorology group without a mode when precipitation is enabled, which
+        prevents event preparation. This is an explicit modeling choice; rain
+        setters do not silently disable another water-balance term.
+
+        Args:
+            unsteady_file: Unsteady-flow path or number resolved by ras_object.
+            ras_object: Optional project used to resolve an unsteady number.
+
+        Returns:
+            None. Atomically updates only the ET mode, preserving newlines.
+
+        Raises:
+            ValueError: The input has mixed newline conventions.
+        """
+        path = RasUnsteady._resolve_unsteady_file_path(unsteady_file, ras_object)
+        lines, newline = RasUtils._read_text_lines_preserving_newline(path)
+        prefix = "Met BC=Evapotranspiration|Mode="
+        indices = [i for i, line in enumerate(lines) if line.startswith(prefix)]
+        insert_at = indices[0] if indices else RasUnsteady._get_default_met_insert_index(lines)
+        retained = [line for line in lines if not line.startswith(prefix)]
+        if insert_at == len(retained) and retained and not retained[-1].endswith(("\n", "\r")):
+            retained[-1] += newline
+        retained.insert(insert_at, f"{prefix}None{newline}")
+        RasUnsteady._atomic_write_lines(path, retained)
+        logger.info("Disabled evapotranspiration in %s", path.name)
+
+    @staticmethod
+    @log_call
     def set_point_evapotranspiration(
         unsteady_file: Union[str, Path],
         station_name: str,
