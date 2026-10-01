@@ -361,6 +361,7 @@ class HdfResultsPlan:
             net = {area: 0.0 for area in area_names}
             unresolved = {area: [] for area in area_names}
             flow_units = set()
+            mapped_structures = {'Lateral Structures': set(), 'SA 2D Area Conn': set()}
 
             def integrate(values, unit, label):
                 values = np.asarray(values, dtype=float)
@@ -384,6 +385,9 @@ class HdfResultsPlan:
                 else:
                     name = decode(row['Connection'])
                     group = 'SA 2D Area Conn'
+                if name in mapped_structures[group]:
+                    raise ValueError(f'Duplicate structure identity: {group}/{name}')
+                mapped_structures[group].add(name)
                 dataset = hdf[f'{base}/{group}/{name}/Structure Variables']
                 columns = [(decode(pair[0]), decode(pair[1])) for pair in dataset.attrs['Variable_Unit']]
                 indices = [i for i, (label, _) in enumerate(columns) if label == 'Total Flow']
@@ -402,6 +406,11 @@ class HdfResultsPlan:
                                 'ds_type': decode(row['DS Type']), 'us_area': us, 'ds_area': ds,
                                 'flow_units': columns[index][1], 'signed_volume': volume,
                                 'flow': flow.astype(float).tolist()})
+            for group, mapped in mapped_structures.items():
+                stored = hdf.get(f'{base}/{group}')
+                result_names = set(stored) if stored is not None else set()
+                if result_names != mapped:
+                    raise ValueError(f'Unmapped structure results in {group}: {sorted(result_names - mapped)}')
             bc_group = hdf.get(f'{base}/Boundary Conditions')
             if bc_group is not None:
                 for name, dataset in bc_group.items():

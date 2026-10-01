@@ -55,7 +55,7 @@ def test_rejects_invalid_boundary_directions(exchange_hdf, signs):
         HdfResultsPlan.get_exchange_diagnostics(exchange_hdf, signs)
 
 
-@pytest.mark.parametrize('fault', ['missing', 'nonfinite', 'mixed_units', 'nonmonotonic', 'unknown_area'])
+@pytest.mark.parametrize('fault', ['missing', 'nonfinite', 'mixed_units', 'nonmonotonic', 'unknown_area', 'unmapped'])
 def test_rejects_incomplete_or_ambiguous_exchange_data(exchange_hdf, fault):
     with h5py.File(exchange_hdf, 'a') as hdf:
         target = f'{BASE}/Lateral Structures/River Reach 10/Structure Variables'
@@ -67,7 +67,11 @@ def test_rejects_incomplete_or_ambiguous_exchange_data(exchange_hdf, fault):
             hdf[target].attrs['Variable_Unit'] = np.array([['Total Flow', 'm3/s']], dtype='S16')
         elif fault == 'nonmonotonic':
             hdf[f'{BASE}/Time Date Stamp (ms)'][1] = b'02JAN3000 00:00:00:000'
-        else:
+        elif fault == 'unknown_area':
             hdf[f'{BASE}/Boundary Conditions/outlet'].attrs['2D Area'] = np.bytes_('Missing')
+        else:
+            data = hdf['Geometry/Structures/Attributes'][1:]
+            del hdf['Geometry/Structures/Attributes']
+            hdf.create_dataset('Geometry/Structures/Attributes', data=data)
     with pytest.raises((KeyError, ValueError)):
         HdfResultsPlan.get_exchange_diagnostics(exchange_hdf, {'outlet': -1})
