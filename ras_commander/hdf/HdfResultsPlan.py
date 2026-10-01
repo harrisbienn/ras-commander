@@ -17,6 +17,7 @@ Available Functions:
         - get_volume_accounting_diagnostics: Read per-area balances and saved diagnostics
         - get_precipitation_diagnostics: Compare stored forcing, 1D depths and native accounting
         - get_precipitation_receiving_diagnostics: Integrate imported rain over stored receiving weights
+        - get_precipitation_footprint_overlap: Measure stored 1D/2D footprint overlap and rain on each side
         - get_coupling_diagnostics: Read lateral segments and cumulative cross-section flow
         - get_runtime_data: Extract runtime and compute time data
         - get_reference_timeseries: Extract reference line/point timeseries
@@ -328,7 +329,9 @@ class HdfResultsPlan:
     @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_precipitation_receiving_diagnostics(hdf_path: Path, *, value_semantics: str) -> Dict:
+    def get_precipitation_receiving_diagnostics(
+        hdf_path: Path, *, value_semantics: str, source_grid_labels: Optional[List[Optional[str]]] = None,
+    ) -> Dict:
         """Reconstruct prescribed receiving volumes from imported rain and weights.
 
         ``value_semantics`` must explicitly be ``interval_depth`` or
@@ -345,6 +348,9 @@ class HdfResultsPlan:
         calculations. This is prescribed rainfall, not proof of water admitted
         by the solver, infiltration loss, nonoverlapping footprints or acceptance.
         Raises on ambiguous identities, units, coverage or interpolation indexes.
+        Optional source_grid_labels attribute volumes to caller-authenticated
+        source regions in the native flattened Values order. None denotes an
+        unassigned cell and must have zero rain. Labels do not alter forcing.
         """
         from pyproj import CRS
         from .HdfBase import HdfBase
@@ -390,6 +396,16 @@ class HdfResultsPlan:
             if np.any(increments < 0):
                 raise ValueError("Cumulative rainfall decreases; verify stored value semantics")
             total_depth = increments.sum(axis=0)
+            label_indexes = {}
+            if source_grid_labels is not None:
+                if len(source_grid_labels) != rows * cols or any(
+                        label is not None and (not isinstance(label, str) or not label.strip())
+                        for label in source_grid_labels):
+                    raise ValueError("Source grid labels require one nonempty string or None per raster cell")
+                if any(label is None and total_depth[i] != 0 for i, label in enumerate(source_grid_labels)):
+                    raise ValueError("Unassigned source grid cells have rainfall; verify label alignment")
+                label_indexes = {label: np.array([i for i, name in enumerate(source_grid_labels) if name == label])
+                                 for label in sorted({v for v in source_grid_labels if v is not None})}
 
             def receivers(group, prefix, areas, identities):
                 info = group[f"{prefix}Info"][:]
@@ -422,7 +438,9 @@ class HdfResultsPlan:
                 return {"receiver_count": len(areas), "area_ft2": float(areas.sum()),
                     "unmapped_receiver_count": sum(r["weight_count"] == 0 for r in records),
                     "total_volume_af": float(series.sum()), "interval_volume_af": series.tolist(),
-                    "receivers": records}
+                    "receivers": records,
+                    "source_label_volume_af": {label: float(total_depth[idx] @ effective_areas[idx] / 12 / 43560)
+                                               for label, idx in label_indexes.items()}}
 
             two_d = {}
             attrs = source["Geometry/2D Flow Areas/Attributes"][:]
@@ -467,6 +485,9 @@ class HdfResultsPlan:
             "interval_end": [t.isoformat() for t in timestamps], "interval_seconds": interval.total_seconds(),
             "grid_total_volume_af": float(grid_volume.sum()), "grid_interval_volume_af": grid_volume.tolist(),
             "grid_total_depth_in": total_depth.tolist(), "one_d": one_d, "two_d": two_d,
+            "source_label_grid_volume_af": {label: float(total_depth[idx].sum() * size * size * 0.0254
+                                                        / 1233.48183754752)
+                                            for label, idx in label_indexes.items()},
             "total_two_d_volume_af": sum(area["total_volume_af"] for area in two_d.values()),
             "total_receiving_volume_af": one_d["total_volume_af"] + sum(
                 area["total_volume_af"] for area in two_d.values()),
@@ -474,6 +495,76 @@ class HdfResultsPlan:
                 "Summed 1D and 2D recipients do not establish geometrically disjoint footprints.",
                 "Imported value semantics must be checked against independently authenticated source intervals.",
                 "No hydraulic acceptance or production correction is assigned."]}
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type='plan_hdf')
+    def get_precipitation_footprint_overlap(hdf_path: Path, *, value_semantics: str) -> Dict:
+        """Measure stored 1D interpolation-surface / physical 2D cell overlap.
+
+        Requires complete valid polygons and consistent IDs; never repairs or
+        clips model geometry. Measures overlap in native foot coordinates.
+        Rainfall-on-overlap uses each recipient's uniform prescribed depth,
+        not a separate integration of the original rainfall field. Neither
+        overlap nor these two side-specific volumes is a hydraulic correction.
+        Stored polygons may differ from the physical computational footprint.
+        """
+        from shapely.ops import unary_union
+        from .HdfMesh import HdfMesh
+        from .HdfXsec import HdfXsec
+
+        rainfall = HdfResultsPlan.get_precipitation_receiving_diagnostics(hdf_path, value_semantics=value_semantics)
+        cells = HdfMesh.get_mesh_cell_polygons(hdf_path)
+        surfaces = HdfXsec.get_xs_interpolation_surface(hdf_path)
+        if cells.empty or surfaces.empty or cells.crs is None or cells.crs != surfaces.crs:
+            raise ValueError("Complete receiving polygons with a common CRS are required")
+        if (not cells.geometry.is_valid.all() or not surfaces.geometry.is_valid.all()
+                or not (cells.geometry.area > 0).all() or not (surfaces.geometry.area > 0).all()):
+            raise ValueError("Invalid receiving polygons; no automatic repair is permitted")
+        expected_cells = {(name, rec["identity"]) for name, area in rainfall["two_d"].items()
+                          for rec in area["receivers"]}
+        actual_cells = list(zip(cells.mesh_name, cells.cell_id))
+        if len(set(actual_cells)) != len(actual_cells) or set(actual_cells) != expected_cells:
+            raise ValueError("Incomplete or duplicate physical cell polygons")
+        with h5py.File(hdf_path, "r") as source:
+            pairs = source["Geometry/Cross Section Interpolation Surfaces/XSIDs"][:]
+        surface_ids = list(surfaces.surface_id)
+        if len(set(surface_ids)) != len(surface_ids) or set(surface_ids) != set(range(len(pairs))):
+            raise ValueError("Incomplete interpolation-surface polygons")
+        for row in surfaces.itertuples():
+            if (row.us_xs_id, row.ds_xs_id) != tuple(pairs[row.surface_id]):
+                raise ValueError("Interpolation-surface identities differ")
+        one_union, two_union = unary_union(surfaces.geometry), unary_union(cells.geometry)
+        both = one_union.intersection(two_union)
+        per_area = []
+        two_d_rain = {(name, rec["identity"]): rec for name, area in rainfall["two_d"].items()
+                     for rec in area["receivers"]}
+        for name, group in cells.groupby("mesh_name", sort=True):
+            union = unary_union(group.geometry)
+            overlap = union.intersection(one_union)
+            rain_volume = sum(row.geometry.intersection(one_union).area
+                              * two_d_rain[(name, row.cell_id)]["depth_in"] / 12 / 43560
+                              for row in group.itertuples())
+            per_area.append({"area": name, "polygon_area_ft2": float(union.area),
+                "overlap_with_one_d_ft2": float(overlap.area),
+                "two_d_prescribed_rain_on_overlap_af": float(rain_volume)})
+        one_d_on_overlap = sum(row.geometry.intersection(two_union).area
+            * rainfall["one_d"]["receivers"][row.surface_id]["depth_in"] / 12 / 43560
+            for row in surfaces.itertuples())
+        return {"units": "square feet", "crs": str(cells.crs),
+            "one_d_surface_count": len(surfaces), "two_d_cell_count": len(cells),
+            "one_d_union_area_ft2": float(one_union.area), "two_d_union_area_ft2": float(two_union.area),
+            "one_d_sum_minus_union_ft2": float(surfaces.geometry.area.sum() - one_union.area),
+            "two_d_sum_minus_union_ft2": float(cells.geometry.area.sum() - two_union.area),
+            "one_d_two_d_overlap_ft2": float(both.area),
+            "one_d_prescribed_rain_on_overlap_af": float(one_d_on_overlap), "areas": per_area,
+            "maximum_one_d_polygon_minus_accounting_area_ft2": max(abs(row.geometry.area
+                - rainfall["one_d"]["receivers"][row.surface_id]["area_ft2"]) for row in surfaces.itertuples()),
+            "maximum_two_d_polygon_minus_accounting_area_ft2": max(abs(row.geometry.area
+                - two_d_rain[(row.mesh_name, row.cell_id)]["area_ft2"]) for row in cells.itertuples()),
+            "limitations": ["Stored map polygons are not proof of solver computational footprint or duplicate water.",
+                "Overlap rainfall uses each recipient's uniform prescribed depth; the two sides can differ.",
+                "No overlap volume is automatically removable from forcing or hydraulic accounting."]}
 
     @staticmethod
     @log_call

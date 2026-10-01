@@ -71,6 +71,61 @@ def test_value_semantics_are_explicit_and_cumulative_mode_differences(rain_hdf):
     assert r["total_receiving_volume_af"] == pytest.approx(14 / 12)
 
 
+def test_source_labels_partition_grid_and_receiving_volumes(rain_hdf):
+    r = HdfResultsPlan.get_precipitation_receiving_diagnostics(
+        rain_hdf, value_semantics="interval_depth", source_grid_labels=["A", "A", "B", "B"])
+    assert sum(r["source_label_grid_volume_af"].values()) == pytest.approx(r["grid_total_volume_af"])
+    assert r["one_d"]["source_label_volume_af"] == pytest.approx({"A": 1.5 / 12, "B": 1.5 / 12})
+    assert r["two_d"]["Mesh"]["source_label_volume_af"] == pytest.approx({"A": 1 / 12, "B": 10 / 12})
+
+
+@pytest.mark.parametrize("labels", [["A"], ["A", "", "B", "B"], ["A", None, "B", "B"]])
+def test_invalid_or_unassigned_wet_labels_fail(rain_hdf, labels):
+    with pytest.raises(ValueError):
+        HdfResultsPlan.get_precipitation_receiving_diagnostics(
+            rain_hdf, value_semantics="interval_depth", source_grid_labels=labels)
+
+
+@pytest.fixture
+def receiver_polygons(monkeypatch):
+    import geopandas as gpd
+    from shapely.geometry import box
+    from ras_commander import HdfMesh, HdfXsec
+
+    cells = gpd.GeoDataFrame({"mesh_name": ["Mesh", "Mesh"], "cell_id": [0, 1]},
+        geometry=[box(0, 0, 1, 43560), box(1, 0, 3, 43560)], crs="EPSG:2276")
+    surfaces = gpd.GeoDataFrame({"surface_id": [0], "us_xs_id": [0], "ds_xs_id": [1]},
+        geometry=[box(0, 0, 1, 43560)], crs="EPSG:2276")
+    monkeypatch.setattr(HdfMesh, "get_mesh_cell_polygons", lambda _: cells)
+    monkeypatch.setattr(HdfXsec, "get_xs_interpolation_surface", lambda _: surfaces)
+    return cells, surfaces
+
+
+def test_footprint_overlap_preserves_both_recipient_depths(rain_hdf, receiver_polygons):
+    r = HdfResultsPlan.get_precipitation_footprint_overlap(rain_hdf, value_semantics="interval_depth")
+    assert r["one_d_two_d_overlap_ft2"] == 43560
+    assert r["one_d_prescribed_rain_on_overlap_af"] == pytest.approx(3 / 12)
+    assert r["areas"][0]["two_d_prescribed_rain_on_overlap_af"] == pytest.approx(1 / 12)
+    assert r["one_d_sum_minus_union_ft2"] == r["two_d_sum_minus_union_ft2"] == 0
+    assert r["maximum_one_d_polygon_minus_accounting_area_ft2"] == 0
+    assert r["maximum_two_d_polygon_minus_accounting_area_ft2"] == 0
+
+
+@pytest.mark.parametrize("defect", ["cell_identity", "surface_identity", "section_pair", "crs"])
+def test_footprint_requires_complete_aligned_geometry(rain_hdf, receiver_polygons, defect):
+    cells, surfaces = receiver_polygons
+    if defect == "cell_identity":
+        cells.loc[1, "cell_id"] = 0
+    elif defect == "surface_identity":
+        surfaces.loc[0, "surface_id"] = 7
+    elif defect == "section_pair":
+        surfaces.loc[0, "us_xs_id"] = 1
+    else:
+        surfaces.set_crs("EPSG:5070", allow_override=True, inplace=True)
+    with pytest.raises(ValueError):
+        HdfResultsPlan.get_precipitation_footprint_overlap(rain_hdf, value_semantics="interval_depth")
+
+
 @pytest.mark.parametrize("defect", ["units", "geometry_crs", "nan", "negative", "time", "weights", "index",
                                   "slice", "count", "area", "surface", "identity", "missing_area"])
 def test_invalid_units_weights_coverage_and_identities_fail_closed(rain_hdf, defect):
