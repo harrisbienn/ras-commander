@@ -57,6 +57,29 @@ def test_end_wall_assumption_is_explicit_and_reported(storage_hdf):
     assert len(result["sections_exceeding_surveyed_ends"]) == 2
 
 
+def test_explicit_pairs_support_dry_outputs_without_guessing_order(storage_hdf):
+    expected = HdfResultsXsec.estimate_storage_from_geometry(storage_hdf)
+    with h5py.File(storage_hdf, "a") as hdf:
+        del hdf[f"{BASE}/Cross Sections Control Volume"]
+    with pytest.raises(ValueError, match="Missing control-volume index"):
+        HdfResultsXsec.estimate_storage_from_geometry(storage_hdf)
+    actual = HdfResultsXsec.estimate_storage_from_geometry(
+        storage_hdf, control_volumes=expected["control_volumes"])
+    assert actual["mean_overbank_length_storage_af"] == expected["mean_overbank_length_storage_af"]
+    assert actual["control_volume_index_source"] == "explicit"
+    with pytest.raises(ValueError, match="Unresolved control-volume"):
+        HdfResultsXsec.estimate_storage_from_geometry(storage_hdf, control_volumes=[("R", "A", "2", "3")])
+    with pytest.raises(ValueError, match="Duplicate control-volume"):
+        HdfResultsXsec.estimate_storage_from_geometry(storage_hdf, control_volumes=expected["control_volumes"] * 2)
+
+
+def test_explicit_pairs_cannot_override_native_index(storage_hdf):
+    with pytest.raises(ValueError, match="differ from native"):
+        HdfResultsXsec.estimate_storage_from_geometry(storage_hdf, control_volumes=[("R", "A", "1", "2")])
+    with pytest.raises(ValueError, match="four nonempty"):
+        HdfResultsXsec.estimate_storage_from_geometry(storage_hdf, control_volumes=[("R", "A", "1")])
+
+
 def test_overbank_length_sensitivity_is_separate(storage_hdf):
     with h5py.File(storage_hdf, "a") as hdf:
         hdf[f"{GEOM}/Station Elevation Values"][:] = [[0, 0], [5, 0], [10, 0]] * 2

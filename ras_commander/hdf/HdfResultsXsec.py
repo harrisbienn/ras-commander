@@ -71,7 +71,10 @@ class HdfResultsXsec:
     @staticmethod
     @log_call
     @standardize_input(file_type="plan_hdf")
-    def estimate_storage_from_geometry(hdf_path: Path, *, allow_vertical_end_walls: bool = False) -> Dict:
+    def estimate_storage_from_geometry(
+        hdf_path: Path, *, allow_vertical_end_walls: bool = False,
+        control_volumes: Optional[Sequence[Tuple[str, str, str, str]]] = None,
+    ) -> Dict:
         """Estimate 1D storage from saved stages and surveyed section profiles.
 
         Integrates wetted station/elevation area separately for left overbank,
@@ -91,6 +94,10 @@ class HdfResultsXsec:
             allow_vertical_end_walls: Explicitly permit a vertical-wall assumption
                 at the surveyed horizontal limits and report every affected
                 section. This is a sensitivity assumption, not model geometry.
+            control_volumes: Explicit (river, reach, upstream station, downstream
+                station) pairs when a dry result omits the native index. The caller
+                must authenticate matching geometry and preserve the index source.
+                If the native index exists, supplied pairs must match it exactly.
 
         Returns:
             JSON-compatible time series in acre-feet, section count, identities,
@@ -118,7 +125,22 @@ class HdfResultsXsec:
             attrs = source[f"{geom}/Attributes"][:]
             info = source[f"{geom}/Station Elevation Info"][:]
             values = source[f"{geom}/Station Elevation Values"][:].astype(float)
-            cvs = source[f"{base}/Cross Sections Control Volume/XS CV Attributes"][:]
+            cv_path = f"{base}/Cross Sections Control Volume/XS CV Attributes"
+            native_cells = ([tuple(decode(row[key]) for key in ("River", "Reach", "Station US", "Station DS"))
+                             for row in source[cv_path][:]] if cv_path in source else None)
+        if control_volumes is None:
+            if native_cells is None:
+                raise ValueError("Missing control-volume index; provide authenticated explicit section pairs")
+            selected_cells = native_cells
+        else:
+            selected_cells = list(control_volumes)
+            if any(isinstance(cell, (str, bytes)) or len(cell) != 4
+                   or any(not isinstance(value, str) or not value.strip() for value in cell)
+                   for cell in selected_cells):
+                raise ValueError("Control-volume pairs require four nonempty string identities")
+            selected_cells = [tuple(value.strip() for value in cell) for cell in selected_cells]
+            if native_cells is not None and selected_cells != native_cells:
+                raise ValueError("Explicit control volumes differ from native index")
         if (stages.shape != (len(times), len(result_attrs)) or not np.isfinite(stages).all()
                 or np.any(stages <= -9990)):
             raise ValueError("Invalid stage dimensions or values")
@@ -172,10 +194,9 @@ class HdfResultsXsec:
             lengths[identity] = np.array([attrs[i][key] for key in ("Len Left", "Len Channel", "Len Right")], float)
         mean_storage, separate_storage = np.zeros(len(times)), np.zeros(len(times))
         cells = []
-        for row in cvs:
-            river, reach = decode(row["River"]), decode(row["Reach"])
-            upstream = (river, reach, decode(row["Station US"]))
-            downstream = (river, reach, decode(row["Station DS"]))
+        for river, reach, station_us, station_ds in selected_cells:
+            upstream = (river, reach, station_us)
+            downstream = (river, reach, station_ds)
             if upstream not in section_areas or downstream not in section_areas or upstream == downstream:
                 raise ValueError("Unresolved control-volume section pair")
             cell_id = (*upstream, downstream[2])
@@ -195,6 +216,7 @@ class HdfResultsXsec:
             "method": "surveyed-profile areas with trapezoidal reach integration",
             "units": "acre-feet", "time": [time.isoformat() for time in times],
             "section_count": len(identities), "control_volumes": [list(cell) for cell in cells],
+            "control_volume_index_source": "native" if control_volumes is None else "explicit",
             "mean_overbank_length_storage_af": mean_storage.tolist(),
             "separate_overbank_lengths_storage_af": separate_storage.tolist(),
             "vertical_end_wall_assumption": allow_vertical_end_walls,
