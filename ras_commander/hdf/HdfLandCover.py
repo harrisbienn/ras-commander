@@ -719,13 +719,12 @@ class HdfLandCover:
                         idx = name_to_index[class_name]
                         row = variables[idx]
                         old_n = float(row['ManningsN'])
-                        row['ManningsN'] = new_n
-                        variables[idx] = row
+                        # Write only the numeric member: rewriting native NULLTERM
+                        # strings can truncate a class name that fills its field.
+                        variables[idx, 'ManningsN'] = new_n
 
                         raster_idx = raster_map_index[class_name]
-                        raster_row = raster_map[raster_idx]
-                        raster_row['ManningsN'] = new_n
-                        raster_map[raster_idx] = raster_row
+                        raster_map[raster_idx, 'ManningsN'] = new_n
 
                         logger.debug(
                             f"Updated '{class_name}' in {hdf_path.name} "
@@ -745,8 +744,8 @@ class HdfLandCover:
                         idx = name_to_index[class_name]
                         row = variables[idx]
                         old_n = float(row['ManningsN'])
-                        row['ManningsN'] = new_n
-                        variables[idx] = row
+                        # Preserve native fixed-width class names byte-for-byte.
+                        variables[idx, 'ManningsN'] = new_n
                         logger.debug(
                             f"Updated '{class_name}' in {hdf_path.name} "
                             f"(v6_modern Variables): {old_n} -> {new_n}"
