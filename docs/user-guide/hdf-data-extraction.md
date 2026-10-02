@@ -205,6 +205,115 @@ else:
     print("No volume accounting - check if run completed successfully")
 ```
 
+For the overall, 1D and individual 2D-area accounting, including retained
+computation-series samples:
+
+```python
+diagnostic = HdfResultsPlan.get_volume_accounting_diagnostics(hdf_path)
+for area in diagnostic["two_d"]:
+    print(area["area"], area["raw"]["Error"], area["reconstructed_error"])
+```
+
+The diagnostic preserves native units and reported percentages. Positive
+reconstructed error is ending storage minus starting storage and inflow plus
+outflow. The 2D cumulative inflow includes precipitation; adding it again
+double-counts water. Do not sum internal-area flows as external model flows.
+The overall-minus-2D remainder does not isolate a measured 1D solver error.
+Saved `Computations/Volume Error` samples are not assumed cumulative: they can
+be zero even when final accounting reports an imbalance. Missing series remain
+absent. This read-only diagnostic assigns no engineering acceptance threshold.
+
+For gridded period-cumulative precipitation in inches, compare stored 1D
+control-volume depths and areas with the native precipitation summary:
+
+```python
+precipitation = HdfResultsPlan.get_precipitation_diagnostics(hdf_path)
+print(precipitation["saved_final_volume_af"])
+print(precipitation["native_1d_precipitation_af"])
+print(precipitation["saved_final_minus_native_af"])
+```
+
+The reader fingerprints all stored meteorology datasets, including interpolation
+weights, and preserves metadata for comparison across runs. It reconstructs
+acre-feet as the sum of depth in inches times control-volume area in square feet,
+divided by 12 and 43,560. Initial cumulative depth is retained; final volume and
+the change over the saved window are separate outputs. Missing data, unsupported
+units, duplicate identities, nonfinite values and invalid output time axes raise.
+Fixed-width native meteorology arrays are required; variable-length object arrays
+are rejected rather than hashing memory addresses. The reader loads the stored
+forcing and 1D depth arrays into memory.
+
+Saved precipitation and native **excess** precipitation need not match when
+losses apply. This audit locates discrepancies in stored evidence; it does not
+prove what the engine applied to its equations, repair native accounting, or
+assign hydraulic acceptance. Preserve the native summary when reporting findings.
+
+To locate repeated native coupling failures, call
+`ResultsParser.get_coupling_error_events(messages)`. It retains ordered occurrences
+with both native timestamps and normalized ISO times (including synthetic years
+and midnight written as `24:00`). Malformed dates remain counted as unparsed.
+Use `HdfResultsPlan.get_coupling_diagnostics(hdf_path, lateral_names,
+cross_sections)` for saved lateral segment flows/stages, native tailwater cell
+labels and cumulative cross-section flows. Select exact result-group names and
+`(river, reach, station)` tuples. The reader checks English units and common
+output shapes. It does not reconstruct every coupling iteration or assign
+acceptance, and native cell labels are not silently converted to zero-based IDs.
+
+Call `ResultsParser.summarize_coupling_errors(messages)` from
+`ras_commander.results.ResultsParser` on `HdfResultsPlan.get_compute_messages()`
+output. It groups `1D/2D Flow error` occurrences by the complete native location
+label, retaining timestamps, reported-value ranges and unparsed marker counts.
+Repeated messages at one timestamp remain separate occurrences. Reported-value
+units are unspecified; do not assume they are cfs or percentages. This diagnostic
+does not change `is_successful_completion()` or turn a failed run into a pass.
+
+To crosswalk lateral structures and SA/2D connections to their receiving areas
+and integrate saved flows:
+
+```python
+exchanges = HdfResultsPlan.get_exchange_diagnostics(
+    hdf_path, boundary_flow_signs={"Upstream": 1, "Outlet": -1}
+)
+print(exchanges["areas"])
+```
+
+Supply signs from the active boundary configuration: `+1` means flow into the
+area and `-1` means out. Structure signs follow US-to-DS geometry. The result
+preserves topology, hydrographs and units; an unassigned nonzero boundary leaves
+the area's net volume unresolved. Missing structure results or inconsistent
+units raise errors. Multi-reach lateral structures require separate segment
+reconciliation and are rejected. The signed trapezoidal volumes approximate
+saved samples, including any saved warmup; select a complete common output
+window for comparisons. They cannot replace every-step solver accounting or
+independently confirm that both sides of an exchange conserved water.
+
+For a read-only geometric estimate of 1D storage, use
+`HdfResultsXsec.estimate_storage_from_geometry(hdf_path)`. It integrates
+surveyed section profiles at saved water levels and reports the effect of
+using mean versus separate overbank lengths. It does not reproduce native
+storage tables, obstructions, levees, junctions or off-channel storage. Water
+above surveyed section ends is rejected unless the caller explicitly permits
+and records the vertical-end-wall assumption. No geometry is modified.
+
+`HdfResultsPlan.get_precipitation_receiving_diagnostics(hdf_path,
+value_semantics="cumulative_depth")` reconstructs prescribed rainfall from
+stored interpolation weights and recipient areas. Choose `cumulative_depth`
+or `interval_depth` only after checking native values against authenticated
+source intervals; DSS `per-cum` metadata alone does not establish this meaning.
+Optional `source_grid_labels` attribute volumes to authenticated source regions
+without changing forcing. The reader requires full interval coverage, English
+model units and a metre-based rainfall grid.
+
+`HdfResultsPlan.get_precipitation_footprint_overlap(hdf_path,
+value_semantics="cumulative_depth")` compares stored 1D interpolation surfaces
+with physical 2D polygons. It reports overlap and each recipient's prescribed
+rainfall on that overlap. Those estimates neither establish duplicate water
+in the solver nor authorize subtracting rainfall. Invalid or incomplete
+polygons raise errors; the reader never repairs model geometry.
+
+These APIs inspect retained results. They do not adjust hydraulic settings,
+scale rainfall, run sensitivity experiments or assign engineering acceptance.
+
 ### Unsteady Results Information
 
 Check that unsteady results were properly generated:

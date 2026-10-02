@@ -17,6 +17,21 @@ success = RasCmdr.compute_plan("01")
 
 ### Parameters
 
+To inspect the actual warmup duration after a run, read the native solver log:
+
+```python
+from ras_commander.RasBco import BcoMonitor
+
+monitor = BcoMonitor(project_path=project_folder, project_name="Model", plan_number="01")
+window = monitor.get_initial_time_window()
+print(window["warmup_duration_hours"])
+```
+
+The first solver window is expressed in hours relative to simulation start.
+A negative start measures the observed warmup duration. Missing or incomplete
+timing evidence raises an error. This reader changes no settings and assigns
+no completion or hydraulic acceptance.
+
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `plan_number` | str | Plan identifier ("01", "02", etc.) |

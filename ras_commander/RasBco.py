@@ -17,6 +17,7 @@ import subprocess
 import time
 import re
 from .LoggingConfig import get_logger
+from .Decorators import log_call
 
 logger = get_logger(__name__)
 
@@ -189,6 +190,30 @@ class BcoMonitor:
         )
         logger.debug(f"Timed out monitoring .bco file path: {self.bco_file}")
         return False
+
+    @log_call
+    def get_initial_time_window(self) -> dict:
+        """Read the first native solver time window in hours relative to start.
+
+        Negative start time measures the actual warmup duration, independently
+        of the configured timestep or warmup count. Does not infer successful
+        completion. Raises FileNotFoundError or ValueError when unavailable.
+        Reads only until the first time-window line, including on large logs.
+        """
+        number = r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?'
+        pattern = re.compile(rf'Solving for Time Window\s*=\s*({number})\s+to\s+({number})\s+Hours')
+        with self.bco_file.open('r', encoding='utf-8', errors='replace') as stream:
+            for line in stream:
+                match = pattern.search(line)
+                if match:
+                    start, end = float(match[1]), float(match[2])
+                    if not start < end:
+                        raise ValueError('Initial solver time window is not increasing')
+                    if start > 0:
+                        raise ValueError('Log starts after simulation time zero; warmup is unknown')
+                    return {'start_hours': start, 'end_hours': end,
+                            'warmup_duration_hours': max(0.0, -start), 'native_line': line.strip()}
+        raise ValueError(f'No solver time window found in {self.bco_file.name}')
 
     def get_final_messages(self) -> Optional[str]:
         """

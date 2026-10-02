@@ -10,6 +10,7 @@ All of the methods in this class are static and are designed to be used without 
 
 List of Functions in HdfResultsXsec:
 - get_xsec_timeseries(): Extract cross-section timeseries data including water surface, velocity, and flow
+- estimate_storage_from_geometry(): Independent approximate 1D storage from surveyed profiles and saved stages
 - get_ref_lines_timeseries(): Get timeseries output for reference lines
 - get_ref_points_timeseries(): Get timeseries output for reference points
 
@@ -66,6 +67,167 @@ class HdfResultsXsec:
     )
     _XSEC_OUTPUT_PATH = f"{_BASE_TS_PATH}/Cross Sections"
     _TIME_STAMP_PATH = f"{_BASE_TS_PATH}/Time Date Stamp (ms)"
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type="plan_hdf")
+    def estimate_storage_from_geometry(
+        hdf_path: Path, *, allow_vertical_end_walls: bool = False,
+        control_volumes: Optional[Sequence[Tuple[str, str, str, str]]] = None,
+    ) -> Dict:
+        """Estimate 1D storage from saved stages and surveyed section profiles.
+
+        Integrates wetted station/elevation area separately for left overbank,
+        channel and right overbank, then trapezoidally averages endpoint areas
+        between the explicitly identified control-volume sections. Channel
+        lengths and mean left/right overbank lengths are used. A second estimate
+        uses separate overbank lengths as a method-sensitivity check, NOT an
+        uncertainty bound. Neither estimate reproduces native hydraulic tables,
+        blocked obstructions, levee connectivity, structures or off-channel storage.
+
+        Requires English stage/geometry units and by default rejects water above
+        surveyed section ends. Does not read precipitation or accounting
+        summary attributes and assigns no acceptance. Original HDF is read-only.
+
+        Args:
+            hdf_path: Plan HDF path or supported plan selector.
+            allow_vertical_end_walls: Explicitly permit a vertical-wall assumption
+                at the surveyed horizontal limits and report every affected
+                section. This is a sensitivity assumption, not model geometry.
+            control_volumes: Explicit (river, reach, upstream station, downstream
+                station) pairs when a dry result omits the native index. The caller
+                must authenticate matching geometry and preserve the index source.
+                If the native index exists, supplied pairs must match it exactly.
+
+        Returns:
+            JSON-compatible time series in acre-feet, section count, identities,
+            method sensitivity and limitations. This is an estimate, not saved
+            solver storage.
+
+        Raises:
+            ValueError: Units, geometry, identities or time series are invalid.
+            KeyError: Required stage/profile/control-volume datasets are absent.
+        """
+        def decode(value):
+            return value.decode("utf-8").strip() if isinstance(value, bytes) else str(value).strip()
+
+        base = HdfResultsXsec._BASE_TS_PATH
+        geom = "Geometry/Cross Sections"
+        with h5py.File(hdf_path, "r") as source:
+            times = HdfBase.get_unsteady_timestamps(source)
+            if len(times) < 2 or any(b <= a for a, b in zip(times, times[1:])):
+                raise ValueError("Storage estimation requires increasing saved times")
+            stages_ds = source[f"{base}/Cross Sections/Water Surface"]
+            if decode(stages_ds.attrs["Variable Units"]) != "Feet":
+                raise ValueError("Storage estimator requires English stage units")
+            stages = np.asarray(stages_ds, dtype=float)
+            result_attrs = source[f"{base}/Cross Sections/Cross Section Attributes"][:]
+            attrs = source[f"{geom}/Attributes"][:]
+            info = source[f"{geom}/Station Elevation Info"][:]
+            values = source[f"{geom}/Station Elevation Values"][:].astype(float)
+            cv_path = f"{base}/Cross Sections Control Volume/XS CV Attributes"
+            native_cells = ([tuple(decode(row[key]) for key in ("River", "Reach", "Station US", "Station DS"))
+                             for row in source[cv_path][:]] if cv_path in source else None)
+        if control_volumes is None:
+            if native_cells is None:
+                raise ValueError("Missing control-volume index; provide authenticated explicit section pairs")
+            selected_cells = native_cells
+        else:
+            selected_cells = list(control_volumes)
+            if any(isinstance(cell, (str, bytes)) or len(cell) != 4
+                   or any(not isinstance(value, str) or not value.strip() for value in cell)
+                   for cell in selected_cells):
+                raise ValueError("Control-volume pairs require four nonempty string identities")
+            selected_cells = [tuple(value.strip() for value in cell) for cell in selected_cells]
+            if native_cells is not None and selected_cells != native_cells:
+                raise ValueError("Explicit control volumes differ from native index")
+        if (stages.shape != (len(times), len(result_attrs)) or not np.isfinite(stages).all()
+                or np.any(stages <= -9990)):
+            raise ValueError("Invalid stage dimensions or values")
+        if (info.shape != (len(attrs), 2) or not np.issubdtype(info.dtype, np.integer)
+                or values.ndim != 2 or values.shape[1] != 2 or not np.isfinite(values).all()):
+            raise ValueError("Invalid surveyed profiles")
+        identities = [tuple(decode(row[key]) for key in ("River", "Reach", "RS")) for row in attrs]
+        result_ids = [tuple(decode(row[key]) for key in ("River", "Reach", "Station")) for row in result_attrs]
+        if len(set(identities)) != len(identities) or len(set(result_ids)) != len(result_ids):
+            raise ValueError("Duplicate section identities")
+        if set(identities) != set(result_ids):
+            raise ValueError("Geometry and result section identities differ")
+
+        def wetted_area(profile, water):
+            dx = np.diff(profile[:, 0])
+            depths = water[:, None] - profile[None, :, 1]
+            left, right = depths[:, :-1], depths[:, 1:]
+            positive_left, positive_right = np.maximum(left, 0), np.maximum(right, 0)
+            area = (positive_left + positive_right) * dx / 2
+            crossing = (left * right) < 0
+            denominator = abs(left - right)
+            triangles = np.divide((positive_left ** 2 + positive_right ** 2) * dx,
+                                  2 * denominator, out=np.zeros_like(area), where=denominator > 0)
+            return np.where(crossing, triangles, area).sum(axis=1)
+
+        section_areas, lengths, end_wall_sections = {}, {}, []
+        for i, identity in enumerate(identities):
+            start, count = map(int, info[i, :2])
+            if start < 0 or count < 2 or start + count > len(values):
+                raise ValueError(f"Invalid profile indexes: {identity}")
+            profile = values[start:start + count, :2]
+            if np.any(np.diff(profile[:, 0]) < 0) or profile[-1, 0] <= profile[0, 0]:
+                raise ValueError(f"Invalid profile stations: {identity}")
+            water = stages[:, result_ids.index(identity)]
+            if water.max() > min(profile[0, 1], profile[-1, 1]):
+                if not allow_vertical_end_walls:
+                    raise ValueError(f"Stage exceeds surveyed section end: {identity}")
+                end_wall_sections.append({"section": list(identity),
+                    "maximum_exceedance_ft": float(water.max() - min(profile[0, 1], profile[-1, 1]))})
+            bounds = [profile[0, 0], float(attrs[i]["Left Bank"]),
+                      float(attrs[i]["Right Bank"]), profile[-1, 0]]
+            if not np.isfinite(bounds).all() or np.any(np.diff(bounds) < 0) or bounds[2] <= bounds[1]:
+                raise ValueError(f"Invalid bank stations: {identity}")
+            areas = []
+            for left, right in zip(bounds, bounds[1:]):
+                interior = profile[(profile[:, 0] > left) & (profile[:, 0] < right)]
+                subprofile = np.vstack(([left, np.interp(left, profile[:, 0], profile[:, 1])],
+                                         interior, [right, np.interp(right, profile[:, 0], profile[:, 1])]))
+                areas.append(wetted_area(subprofile, water))
+            section_areas[identity] = np.stack(areas, axis=1)
+            lengths[identity] = np.array([attrs[i][key] for key in ("Len Left", "Len Channel", "Len Right")], float)
+        mean_storage, separate_storage = np.zeros(len(times)), np.zeros(len(times))
+        cells = []
+        for river, reach, station_us, station_ds in selected_cells:
+            upstream = (river, reach, station_us)
+            downstream = (river, reach, station_ds)
+            if upstream not in section_areas or downstream not in section_areas or upstream == downstream:
+                raise ValueError("Unresolved control-volume section pair")
+            cell_id = (*upstream, downstream[2])
+            if cell_id in cells:
+                raise ValueError("Duplicate control-volume pair")
+            cells.append(cell_id)
+            cell_lengths = lengths[upstream]
+            if not np.isfinite(cell_lengths).all() or np.any(cell_lengths <= 0):
+                raise ValueError(f"Invalid reach lengths: {upstream}")
+            areas = (section_areas[upstream] + section_areas[downstream]) / 2
+            floodplain_length = (cell_lengths[0] + cell_lengths[2]) / 2
+            mean_storage += areas @ np.array([floodplain_length, cell_lengths[1], floodplain_length]) / 43560
+            separate_storage += areas @ cell_lengths / 43560
+        if not cells:
+            raise ValueError("No cross-section control volumes")
+        return {
+            "method": "surveyed-profile areas with trapezoidal reach integration",
+            "units": "acre-feet", "time": [time.isoformat() for time in times],
+            "section_count": len(identities), "control_volumes": [list(cell) for cell in cells],
+            "control_volume_index_source": "native" if control_volumes is None else "explicit",
+            "mean_overbank_length_storage_af": mean_storage.tolist(),
+            "separate_overbank_lengths_storage_af": separate_storage.tolist(),
+            "vertical_end_wall_assumption": allow_vertical_end_walls,
+            "sections_exceeding_surveyed_ends": end_wall_sections,
+            "limitations": [
+                "Geometric estimate, not saved solver storage or hydraulic acceptance.",
+                "Does not reproduce native interpolation tables, obstruction/levee/structure or junction storage.",
+                "Off-channel storage and 2D storage are excluded.",
+                "Alternate overbank-length calculation is method sensitivity, not an uncertainty bound.",
+            ],
+        }
 
 
 # Tested functions from AWS webinar where the code was developed
