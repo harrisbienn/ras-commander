@@ -64,6 +64,8 @@ List of Functions in RasUtils:
 
 """
 import os
+import hashlib
+import tempfile
 from pathlib import Path
 from .RasPrj import ras
 from typing import Union, Optional, Dict, Callable, List, Tuple, Any
@@ -855,6 +857,80 @@ class RasUtils:
         metrics = {'cor': correlation, 'rmse': rmse, 'pb': percent_bias}
         logger.debug(f"Calculated error metrics: {metrics}")
         return metrics
+
+    @staticmethod
+    @log_call
+    def normalize_text_newlines(
+        file_path: Union[str, Path],
+        *,
+        newline: str,
+    ) -> Dict[str, Any]:
+        r"""Explicitly normalize line endings in a disposable RAS text copy.
+
+        Ordinary mutators still reject mixed endings. This opt-in preparation
+        operation preserves every non-newline byte (including encoding and
+        trailing whitespace), writes an exclusive ``.newline.bak`` backup before
+        replacement, and returns hashes for provenance. Never use on canonical
+        source models. A repeat call on normalized content is a no-op.
+
+        Args:
+            file_path: Authored RAS project, geometry, plan, or flow text file.
+            newline: Explicit target convention, either ``"\r\n"`` or ``"\n"``.
+
+        Returns:
+            Evidence with before/after SHA-256, original newline counts,
+            changed status, and backup path when a change was made.
+
+        Raises:
+            ValueError: Unsupported suffix, target convention, NUL bytes, or
+                bare CR endings. Such inputs need separate inspection.
+            FileExistsError: A required backup already exists; it is not replaced.
+            OSError: Reading, backup, or atomic replacement fails.
+        """
+        path = Path(file_path)
+        if newline not in ("\r\n", "\n"):
+            raise ValueError("newline must be CRLF or LF")
+        if path.suffix.casefold() != ".prj" and not re.fullmatch(
+            r"\.(?:f|g|p|q|s|u|w)\d+", path.suffix, re.IGNORECASE
+        ):
+            raise ValueError(f"Not an authored RAS text file: {path}")
+        original = path.read_bytes()
+        lf_content = original.replace(b"\r\n", b"\n")
+        if b"\x00" in original or b"\r" in lf_content:
+            raise ValueError(f"NUL bytes or bare CR endings require inspection: {path}")
+        normalized = lf_content.replace(b"\n", newline.encode("ascii"))
+        evidence = {
+            "file": str(path),
+            "changed": normalized != original,
+            "newline": newline,
+            "before_sha256": hashlib.sha256(original).hexdigest(),
+            "after_sha256": hashlib.sha256(normalized).hexdigest(),
+            "original_crlf_count": original.count(b"\r\n"),
+            "original_bare_lf_count": (
+                lf_content.count(b"\n") - original.count(b"\r\n")
+            ),
+            "backup": None,
+        }
+        if normalized == original:
+            return evidence
+        backup = path.with_name(path.name + ".newline.bak")
+        with backup.open("xb") as handle:
+            handle.write(original)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+                temporary = Path(handle.name)
+                handle.write(normalized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            shutil.copymode(path, temporary)
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        evidence["backup"] = str(backup)
+        logger.info("Normalized RAS text line endings: %s", path)
+        return evidence
 
     @staticmethod
     def _detect_text_newline(file_path: Path) -> str:
