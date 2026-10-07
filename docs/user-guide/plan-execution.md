@@ -541,6 +541,20 @@ project while leaving Plan, Geometry, and Flow sections blank. Generated
 compute artifacts such as `.b##`, `.c##`, `.o##`, `.r##`, and `.x##` are not
 part of this text-file check because they may be binary.
 
+If a received model already has mixed endings, normalize an **isolated copy**
+explicitly before initialization or compute:
+
+```python
+evidence = RasUtils.normalize_text_newlines(cloned_geometry, newline="\r\n")
+```
+
+This operation changes newline bytes only, retains an exclusive
+`.newline.bak` original, and returns before/after hashes and line-ending counts.
+Repeat calls on normalized content do nothing; an existing conflicting backup
+is never overwritten. Preserve the evidence in the run's preparation manifest.
+Ordinary mutators continue to reject mixed input. Never normalize canonical
+source models in place.
+
 After compute, report two independent outcomes:
 
 1. **Execution completion**: the solver completed, the result HDF is populated,
