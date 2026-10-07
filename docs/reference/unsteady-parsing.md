@@ -45,6 +45,20 @@ file. HEC-RAS restart/Hot Start output creation is stored in the plan file
 keys. In HEC-RAS 5.x through 7.0, the GUI labels these as Restart File Options
 or Initial Conditions file options.
 
+### Named Initial-Elevation Points
+
+Use `RasUnsteady.get_initial_point_elevations("01", ras_object=project)` to
+read `IC Point Elev=` records. An explicit `.u##` path also works. The returned
+DataFrame has `point_name`, `elevation`, and `trailing_fields` columns, including
+when no records exist. Trailing comma fields remain uninterpreted strings.
+
+This read-only API rejects malformed, nonfinite and duplicate-name records.
+It leaves the existing `get_initial_conditions()` flow/storage/RRR table
+unchanged. Named points are geometry objects; they are not storage-area or BC-line
+selectors. Verify their membership in the selected geometry and obtain units
+and vertical datum from the model configuration and engineering contract.
+Reading an elevation does not establish its suitability or hydraulic acceptance.
+
 ### Boundary Location Block
 
 Each boundary condition starts with a location definition:

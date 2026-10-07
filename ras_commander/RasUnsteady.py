@@ -98,6 +98,7 @@ Initial Conditions Method Selection:
 
 Initial Flow Distribution Table:
 - get_initial_conditions() - Read all IC entries (flow, storage, rrr) as DataFrame
+- get_initial_point_elevations() - Read named IC Point Elev records separately
 - set_initial_conditions() - Write IC entries from list of dicts or DataFrame (auto-sets IC method)
 - validate_initial_flow_stations() - Check IC flow stations match geometry cross sections
 
@@ -524,6 +525,64 @@ class RasUnsteady:
             ras_object=ras_object,
         )
         return InitialConditions.parse_initial_conditions(unsteady_file_path)
+
+    @staticmethod
+    @log_call
+    def get_initial_point_elevations(
+        unsteady_number_or_path: Union[str, Path],
+        ras_object: Optional[Any] = None,
+    ) -> pd.DataFrame:
+        """Read named initial-elevation points without changing the file.
+
+        This table is separate from the existing flow/storage/RRR IC table.
+        Point names refer to geometry-defined IC points, not storage areas or
+        flow boundary lines. Geometry membership, units and vertical datum
+        must be verified from the selected model and its engineering contract.
+
+        Args:
+            unsteady_number_or_path: Unsteady number or explicit .u## path.
+            ras_object: Optional project context for number-based resolution.
+
+        Returns:
+            DataFrame with stable columns ``point_name`` (str), ``elevation``
+            (float), and ``trailing_fields`` (tuple of str). Trailing comma
+            fields are preserved without interpreting their meaning. An
+            absent point table returns an empty frame with the same columns.
+
+        Raises:
+            ValueError: Missing file, malformed/duplicate point records,
+                nonfinite elevation, or mixed newline conventions.
+        """
+        path = RasUnsteady._resolve_unsteady_file_path(
+            unsteady_number_or_path, ras_object=ras_object,
+        )
+        lines, _ = RasUtils._read_text_lines_preserving_newline(path)
+        records = []
+        names = set()
+        for line_number, line in enumerate(lines, start=1):
+            if not line.startswith("IC Point Elev="):
+                continue
+            fields = line.rstrip("\r\n").split("=", 1)[1].split(",")
+            if len(fields) < 2 or not fields[0].strip():
+                raise ValueError(f"Malformed IC Point Elev record at line {line_number}")
+            name = fields[0].strip()
+            try:
+                elevation = float(fields[1])
+            except ValueError as exc:
+                raise ValueError(f"Invalid IC point elevation at line {line_number}") from exc
+            if not np.isfinite(elevation):
+                raise ValueError(f"Nonfinite IC point elevation at line {line_number}")
+            if name.casefold() in names:
+                raise ValueError(f"Duplicate IC point name at line {line_number}: {name!r}")
+            names.add(name.casefold())
+            records.append({
+                "point_name": name,
+                "elevation": elevation,
+                "trailing_fields": tuple(fields[2:]),
+            })
+        return pd.DataFrame.from_records(
+            records, columns=["point_name", "elevation", "trailing_fields"],
+        ).astype({"point_name": "object", "elevation": "float64", "trailing_fields": "object"})
 
     @staticmethod
     @log_call
