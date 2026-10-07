@@ -61,6 +61,14 @@ the existing method selection. LF and CRLF files keep their authored convention.
 Operate on disposable model copies; choosing initial values is an engineering
 decision. This writer retains named `IC Point Elev=` records unchanged.
 
+Flow and RRR station selectors are serialized as plain decimal values without
+rounding (for example, `5.99` and `138154.4`). Integer stations retain integer
+formatting, with at least eight characters of padding; longer values are not
+truncated. NaN and infinite stations are rejected before writing. This preserves
+the numeric value supplied to the API, not an original textual spelling such as
+trailing decimal zeros. It does not establish geometry membership or hydraulic
+acceptance of a station.
+
 ### Named Initial-Elevation Points
 
 Use `RasUnsteady.get_initial_point_elevations("01", ras_object=project)` to
