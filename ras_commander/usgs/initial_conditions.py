@@ -16,9 +16,11 @@ Functions:
 - create_ic_line() - Format IC line string for file writing
 """
 
+from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Union, Optional, Any, Dict, List, Tuple
-from datetime import datetime, timedelta
+
 import pandas as pd
 
 from ..LoggingConfig import get_logger
@@ -146,6 +148,18 @@ class InitialConditions:
         return pd.DataFrame(ic_entries)
 
     @staticmethod
+    def _format_station(station: float) -> str:
+        """Preserve the numeric selector in plain decimal with minimum padding."""
+        # Convert via str: Decimal(float) would expose binary representation noise.
+        number = Decimal(str(station))
+        if not number.is_finite():
+            raise ValueError("River station must be finite")
+        text = format(number, 'f')
+        if '.' in text:
+            text = text.rstrip('0').rstrip('.')
+        return text.ljust(8)
+
+    @staticmethod
     @log_call
     def create_ic_line(
         ic_type: str,
@@ -167,7 +181,10 @@ class InitialConditions:
         reach : str, optional
             Reach name (required for 'flow' and 'rrr' types)
         station : float, optional
-            River station (required for 'flow' and 'rrr' types)
+            Finite river station (required for 'flow' and 'rrr' types).
+            Fractional values are preserved as plain decimal text; integer
+            values retain integer formatting. Padding is a minimum width,
+            never a reason to truncate or round the station selector.
         value : float, optional
             Flow (cfs/cms) or elevation (ft/m) value
         area_name : str, optional
@@ -181,7 +198,8 @@ class InitialConditions:
         Raises
         ------
         ValueError
-            If required parameters are missing for the specified IC type
+            If required parameters are missing for the specified IC type,
+            or a flow/RRR station is not finite
 
         Examples
         --------
@@ -212,7 +230,7 @@ class InitialConditions:
             # Format with fixed-width fields (17 chars for strings, variable for numbers)
             river_str = f"{river:<17}"
             reach_str = f"{reach:<17}"
-            station_str = f"{station:<8.0f}"
+            station_str = InitialConditions._format_station(station)
             value_str = str(value)
 
             return f"Initial Flow Loc={river_str},{reach_str},{station_str},{value_str}"
@@ -234,7 +252,7 @@ class InitialConditions:
             # Format with fixed-width fields
             river_str = f"{river:<17}"
             reach_str = f"{reach:<17}"
-            station_str = f"{station:<8.0f}"
+            station_str = InitialConditions._format_station(station)
             value_str = str(value)
 
             return f"Initial RRR Elev={river_str},{reach_str},{station_str},{value_str}"
