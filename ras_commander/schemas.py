@@ -28,9 +28,21 @@ Each entry of :data:`DATAFRAME_SCHEMAS`:
 """
 
 # Schema contract version -- bump when the documented column surface changes meaningfully.
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 DATAFRAME_SCHEMAS = {
+    "initial_point_elevations": {
+        "description": "Named initial-elevation point records; geometry membership, units and datum are external.",
+        "accessor": "RasUnsteady.get_initial_point_elevations(unsteady_number_or_path, ras_object=None)",
+        "source": "RasUnsteady.get_initial_point_elevations()",
+        "extra_columns": False,
+        "dynamic": False,
+        "columns": [
+            {"name": "point_name", "dtype": "str", "description": "Geometry IC-point name, stripped of field padding."},
+            {"name": "elevation", "dtype": "float", "description": "Finite elevation in the model's units and datum."},
+            {"name": "trailing_fields", "dtype": "tuple[str, ...]", "description": "Uninterpreted trailing comma fields, preserving whitespace."},
+        ],
+    },
     "plan_df": {
         "description": "One row per HEC-RAS plan in the project, with its linked geometry and flow files.",
         "accessor": "ras.plan_df  (or RasPrj instance .plan_df; refreshed by RasPrj.get_plan_entries())",
