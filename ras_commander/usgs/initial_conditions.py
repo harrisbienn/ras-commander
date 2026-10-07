@@ -297,9 +297,9 @@ class InitialConditions:
             raise FileNotFoundError(f"Unsteady flow file not found: {unsteady_path}")
 
         try:
-            # Read existing file
-            with open(unsteady_path, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()
+            # Reject mixed input and preserve the authored convention.
+            from ..RasUtils import RasUtils
+            lines, newline = RasUtils._read_text_lines_preserving_newline(unsteady_path)
 
             # Find insertion point (after headers, before Boundary Location)
             header_end_idx = None
@@ -344,14 +344,13 @@ class InitialConditions:
                     value=entry.get('value'),
                     area_name=entry.get('area_name')
                 )
-                ic_lines.append(ic_line + '\n')
+                ic_lines.append(ic_line + newline)
 
             # Insert IC lines at correct position
             final_lines = new_lines[:header_end_idx] + ic_lines + new_lines[header_end_idx:]
 
             # Write modified file
-            with open(unsteady_path, 'w', encoding='utf-8', errors='replace') as f:
-                f.writelines(final_lines)
+            RasUtils._write_text_lines_with_newline(unsteady_path, final_lines, newline)
 
             logger.info(f"Wrote {len(ic_entries)} initial condition entries to {unsteady_path.name}")
 
