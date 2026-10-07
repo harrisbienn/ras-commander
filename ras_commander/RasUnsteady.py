@@ -597,6 +597,10 @@ class RasUnsteady:
 
         Replaces all existing ``Initial Flow Loc=``, ``Initial Storage Elev=``,
         and ``Initial RRR Elev=`` lines with the provided entries.
+        Explicit paths do not require an initialized project. Row preparation
+        and optional method selection occur on a temporary copy; the target
+        is replaced atomically only after both succeed. Mixed line endings
+        are rejected before modification. Named IC-point records are retained.
 
         Parameters
         ----------
@@ -635,14 +639,33 @@ class RasUnsteady:
             unsteady_number_or_path,
             ras_object=ras_object,
         )
-        InitialConditions.write_initial_conditions(unsteady_file_path, entries)
+        RasUtils._detect_text_newline(unsteady_file_path)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=unsteady_file_path.parent, suffix=unsteady_file_path.suffix,
+                prefix=f".{unsteady_file_path.stem}.ic-", delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(unsteady_file_path.read_bytes())
+            InitialConditions.write_initial_conditions(temporary, entries)
+            if auto_set_method and entries:
+                RasUnsteady.set_initial_flow_method(temporary, method="initial_flow_distribution")
+            prepared, _ = RasUtils._read_text_lines_preserving_newline(temporary)
+            RasUnsteady._atomic_write_lines(unsteady_file_path, prepared)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        RasUnsteady._refresh_initial_condition_context(unsteady_number_or_path, ras_object)
 
-        if auto_set_method and entries:
-            RasUnsteady.set_initial_flow_method(
-                unsteady_number_or_path,
-                method="initial_flow_distribution",
-                ras_object=ras_object,
-            )
+    @staticmethod
+    def _refresh_initial_condition_context(unsteady_file, ras_object) -> None:
+        """Refresh only the context selected by a number or explicitly supplied."""
+        context = ras_object
+        if context is None and not Path(unsteady_file).is_file():
+            context = ras
+        if context is not None and getattr(context, "initialized", False):
+            context.unsteady_df = context.get_unsteady_entries()
 
     @staticmethod
     @log_call
@@ -2862,6 +2885,9 @@ class RasUnsteady:
         """
         Determine which Initial Conditions method is active in an unsteady flow file.
 
+        An existing explicit path does not require a project context. Number
+        resolution uses the supplied project or the initialized global project.
+
         HEC-RAS uses implicit state to select the IC method:
         - ``Use Restart= -1`` or ``1`` → Restart File mode
         - ``Use Restart= 0`` with ``Prior WS Filename=`` → Prior Water Surface mode
@@ -2889,15 +2915,7 @@ class RasUnsteady:
               ``Initial RRR Elev`` lines present
             - ``raw_use_restart`` (str or None): Raw value from file
         """
-        ras_obj = ras_object or ras
-        ras_obj.check_initialized()
-
-        unsteady_path = Path(unsteady_file)
-        if not unsteady_path.is_file():
-            from .RasPlan import RasPlan
-            resolved_path = RasPlan.get_unsteady_path(unsteady_file, ras_obj)
-            if resolved_path:
-                unsteady_path = Path(resolved_path)
+        unsteady_path = RasUnsteady._resolve_unsteady_file_path(unsteady_file, ras_object=ras_object)
 
         raw_use_restart = None
         restart_filename = None
@@ -2970,6 +2988,9 @@ class RasUnsteady:
 
         Configures which IC approach HEC-RAS will use by writing the appropriate
         ``Use Restart`` value and optionally adding or removing associated lines.
+        Existing explicit paths work without project initialization and do not
+        refresh an unrelated global project. Preserve the file's single newline
+        convention and atomically replace it after validation.
 
         Parameters
         ----------
@@ -2981,7 +3002,7 @@ class RasUnsteady:
             - ``'prior_ws'`` — use prior water surface profile (requires
               *prior_ws_filename*; *prior_ws_profile* defaults to first profile)
             - ``'initial_flow_distribution'`` — disable restart; existing IC lines are kept
-            - ``'none'`` — disable restart and remove all IC lines
+            - ``'none'`` — disable restart and remove flow/storage/RRR IC lines
         restart_filename : str, optional
             Required when *method* is ``'restart_file'``.
         prior_ws_filename : str, optional
@@ -3008,21 +3029,8 @@ class RasUnsteady:
         if method == "prior_ws" and not prior_ws_filename:
             raise ValueError("prior_ws_filename is required when method is 'prior_ws'")
 
-        ras_obj = ras_object or ras
-        ras_obj.check_initialized()
-
-        unsteady_path = Path(unsteady_file)
-        if not unsteady_path.is_file():
-            from .RasPlan import RasPlan
-            resolved_path = RasPlan.get_unsteady_path(unsteady_file, ras_obj)
-            if resolved_path:
-                unsteady_path = Path(resolved_path)
-
-        try:
-            with open(unsteady_path, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Unsteady flow file not found: {unsteady_path}")
+        unsteady_path = RasUnsteady._resolve_unsteady_file_path(unsteady_file, ras_object=ras_object)
+        lines, newline = RasUtils._read_text_lines_preserving_newline(unsteady_path)
 
         new_value = "-1" if method == "restart_file" else "0"
 
@@ -3047,29 +3055,27 @@ class RasUnsteady:
                 program_version_idx = len(retained)
             if line.startswith("Use Restart="):
                 use_restart_idx = len(retained)
-                retained.append(f"Use Restart={new_value}\n")
+                retained.append(f"Use Restart={new_value}{newline}")
             else:
                 retained.append(line)
 
         if use_restart_idx is None:
             insert_idx = (program_version_idx + 1) if program_version_idx is not None else 0
-            retained.insert(insert_idx, f"Use Restart={new_value}\n")
+            retained.insert(insert_idx, f"Use Restart={new_value}{newline}")
             use_restart_idx = insert_idx
 
         if method == "restart_file":
-            retained.insert(use_restart_idx + 1, f"Restart Filename={restart_filename}\n")
+            retained.insert(use_restart_idx + 1, f"Restart Filename={restart_filename}{newline}")
         elif method == "prior_ws":
             profile = prior_ws_profile if prior_ws_profile is not None else ""
-            retained.insert(use_restart_idx + 1, f"Prior WS Filename={prior_ws_filename}\n")
-            retained.insert(use_restart_idx + 2, f"Prior WS Profile={profile}\n")
+            retained.insert(use_restart_idx + 1, f"Prior WS Filename={prior_ws_filename}{newline}")
+            retained.insert(use_restart_idx + 2, f"Prior WS Profile={profile}{newline}")
 
-        with open(unsteady_path, 'w', encoding='utf-8', errors='replace') as f:
-            f.writelines(retained)
+        RasUnsteady._atomic_write_lines(unsteady_path, retained)
 
         logger.info(f"Set IC method to '{method}' in {unsteady_path.name}")
 
-        if hasattr(ras_obj, "get_unsteady_entries"):
-            ras_obj.unsteady_df = ras_obj.get_unsteady_entries()
+        RasUnsteady._refresh_initial_condition_context(unsteady_file, ras_object)
 
     @staticmethod
     @log_call

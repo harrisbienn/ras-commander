@@ -45,6 +45,22 @@ file. HEC-RAS restart/Hot Start output creation is stored in the plan file
 keys. In HEC-RAS 5.x through 7.0, the GUI labels these as Restart File Options
 or Initial Conditions file options.
 
+### Initial-Condition File Preparation
+
+`get_initial_flow_method()`, `set_initial_flow_method()` and
+`set_initial_conditions()` accept either an existing explicit `.u##` path or
+an unsteady number with a project context. Explicit paths work without global
+project initialization and do not refresh an unrelated global project.
+
+`set_initial_conditions()` prepares the replacement flow/storage/RRR rows and,
+by default for nonempty input, selects `initial_flow_distribution` on a temporary
+copy. It replaces the target atomically after both steps succeed. Invalid rows,
+mixed line endings or failed preparation/replacement leave the target unchanged;
+temporary files are cleaned up. Empty entries or `auto_set_method=False` retain
+the existing method selection. LF and CRLF files keep their authored convention.
+Operate on disposable model copies; choosing initial values is an engineering
+decision. This writer retains named `IC Point Elev=` records unchanged.
+
 ### Named Initial-Elevation Points
 
 Use `RasUnsteady.get_initial_point_elevations("01", ras_object=project)` to
