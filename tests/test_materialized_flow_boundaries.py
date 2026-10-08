@@ -4,7 +4,7 @@ from dataclasses import replace
 from datetime import datetime
 import pytest
 
-from ras_commander import RasBoundaryLink, RasScenario, RasUnsteady
+from ras_commander import RasBoundaryLink, RasScenario, RasScenarioWorkspace, RasUnsteady
 from test_ras_scenario import RAS_EXE, _write_project
 from test_rasunsteady_dss_link_selectors import _write_unsteady
 
@@ -53,6 +53,32 @@ def test_default_dss_link_preserves_source_qmult(tmp_path):
     path = _source(tmp_path)
     assert _link(path)
     assert RasUnsteady.inspect_boundary_flow(path, boundary_index=1)["qmult"] == 0.5
+
+
+def test_materialized_readback_accepts_explicit_external_hydrology_path(tmp_path):
+    source = _write_project(tmp_path / "source")
+    hydrology = tmp_path / "materialized.dss"
+    hydrology.write_bytes(b"readback-only fixture")
+    pathname = "//JUNCTION/FLOW/01JAN2020-02JAN2020/5MIN/RUN/"
+    RasUnsteady.set_boundary_dss_link(
+        source.with_suffix(".u01"), river=None, reach=None, station=None,
+        dss_file=str(hydrology), dss_path=pathname,
+        sa_2d_name="Area2D", bc_line="Junction", flow_multiplier_policy="materialized",
+    )
+    link = RasBoundaryLink(
+        mapping_id="junction", dss_path=pathname, expected_bc_type="Flow Hydrograph",
+        sa_2d_name="Area2D", bc_line="Junction", flow_multiplier_policy="materialized",
+    )
+    workspace = RasScenarioWorkspace(
+        scenario_id="external-readback", source_project=source,
+        project_folder=source.parent, project_file=source, plan_number="01",
+        plan_file=source.with_suffix(".p01"), unsteady_number="01",
+        unsteady_file=source.with_suffix(".u01"), hydrology_source=hydrology,
+        hydrology_file=hydrology, result_hdf=source.with_suffix(".p01.hdf"),
+        boundary_mapping_ids=("junction",), simulation_start="2020-01-01T00:00:00",
+        simulation_end="2020-01-02T00:00:00",
+    )
+    assert RasScenario.validate_workspace(workspace, [link])["materialized_flow_bindings_match"]
 
 
 @pytest.mark.parametrize("modifier", [

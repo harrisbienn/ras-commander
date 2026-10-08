@@ -917,8 +917,13 @@ class RasScenario:
                     expected_path, datetime.fromisoformat(workspace.simulation_start),
                     datetime.fromisoformat(workspace.simulation_end),
                 )
-            reference = PureWindowsPath(state["dss_file"] or "")
-            bound_file = workspace.project_folder.joinpath(*reference.parts).resolve()
+            reference_text = state["dss_file"] or ""
+            native_reference = Path(reference_text)
+            bound_file = (
+                native_reference
+                if native_reference.is_absolute()
+                else workspace.project_folder.joinpath(*PureWindowsPath(reference_text).parts)
+            ).resolve()
             passed = (
                 state["qmult"] == 1.0 and not state["unsupported_modifiers"]
                 and state["use_dss"] and state["dss_path"] == expected_path
