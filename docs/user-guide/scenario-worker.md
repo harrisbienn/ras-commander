@@ -102,8 +102,45 @@ boundary selectors and execution options may change.
 
 The packaged contracts are:
 
-- `ras-commander/scenario-worker-request/1.0`
+- `ras-commander/scenario-worker-request/1.1` (current)
+- `ras-commander/scenario-worker-request/1.0` (historical compatibility)
 - `ras-commander/scenario-worker-result/1.0`
+
+## Materialized flow inputs
+
+Request 1.1 requires `flow_multiplier_policy` on every boundary link. Use
+`preserve-source` when the DSS contains original values and RAS must apply its
+authored multiplier. Use `materialized` when upstream processing has already
+applied the required conversion or split. For example, a half-flow DSS uses
+`materialized` so the cloned RAS QMult is unity, giving half the original flow
+instead of one quarter. The scientific split remains in upstream provenance.
+
+The default Python `RasBoundaryLink`/`set_boundary_dss_link()` behavior remains
+`preserve-source`. Request 1.0 preserves historical behavior and rejects the new
+field. Old requests/results are not relabeled. Request 1.1 accepts both policies
+explicitly; the worker does not infer a policy from a pathname or multiplier.
+
+Only the exact selected flow boundary is changed. An absent QMult already means
+unity and remains absent. `RasUnsteady.inspect_boundary_flow()` reports the
+effective multiplier, its explicit/implicit source and the DSS binding.
+Materialized preparation rejects ambiguous or conflicting selectors, duplicate
+or nonfinite multipliers and unsupported modifiers such as minimum-flow clamps,
+fixed start times or critical-boundary overrides. It preserves energy-grade
+slope and other boundaries. Mutations preserve LF/CRLF and reject mixed input.
+
+Preparation evidence includes `boundary_flow_preparation` before/after records
+and final `materialized_flow_boundaries` readback. The
+`materialized_flow_bindings_match` check requires unity multipliers, exact DSS
+bindings and no unsupported modifiers. Checks account for audited removal of
+inactive inherited records; no scientific split is applied again in RAS.
+
+Request 1.1 also permits `forcing_excess.interpolation = "preserve-source"` to
+retain the source gridded interpolation, including an unset method. This uses
+the existing precipitation API; it does not choose an alternative interpolation
+for a delivered model. Explicit `Nearest`/`Bilinear` and the historical default
+remain available. Blank and absent source interpolation both remain unset;
+the precipitation writer may omit the blank text key. Source models are never
+modified by scenario preparation.
 
 ## Configure the installed-engine test
 

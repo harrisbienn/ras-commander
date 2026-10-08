@@ -108,6 +108,7 @@ Non-Newtonian Method Selection:
 
 """
 import os
+import math
 import numbers
 import shutil
 import tempfile
@@ -7168,96 +7169,11 @@ class RasUnsteady:
         return update_count
 
     @staticmethod
-    @log_call
-    def set_boundary_dss_link(
-        unsteady_file: Union[str, Path],
-        river: Optional[str],
-        reach: Optional[str],
-        station: Optional[str],
-        dss_file: str,
-        dss_path: str,
-        interval: str = "5MIN",
-        ras_object: Optional[Any] = None,
-        *,
-        sa_2d_name: Optional[str] = None,
-        bc_line: Optional[str] = None,
-        boundary_index: Optional[int] = None,
-        expected_bc_type: Optional[str] = None,
-    ) -> bool:
-        """
-        Convert an inline hydrograph boundary to use DSS linkage.
-
-        This function modifies a boundary condition in a .u## file to use a DSS
-        file reference instead of inline table data. It performs a complete state
-        transition: sets Use DSS=True, adds DSS File/Path, sets the inline table
-        count to 0, and removes any inline data lines.
-
-        Parameters
-        ----------
-        unsteady_file : str or Path
-            Path to the unsteady flow file (.u##)
-        river : str
-            River name for the boundary
-        reach : str
-            Reach name for the boundary
-        station : str
-            River station for the boundary
-        dss_file : str
-            Path to the DSS file (relative to project folder)
-        dss_path : str
-            Full DSS path (e.g., "//SUBBASIN/FLOW/DATE/5MIN/RUN:1%_24HR/")
-        interval : str, default "5MIN"
-            Time interval for the boundary condition
-        ras_object : optional
-            Custom RAS object to use instead of the global one
-        sa_2d_name, bc_line : str, optional
-            Exact 2D/storage-area boundary selectors. ``sa_2d_name`` matches
-            field index 5 and ``bc_line`` matches field index 7 of the
-            ``Boundary Location=`` record. Pass ``river``, ``reach``, and
-            ``station`` as ``None`` when using these selectors.
-        boundary_index : int, optional
-            Zero-based boundary block index used alone or to disambiguate a
-            partial selector.
-        expected_bc_type : str, optional
-            Require the selected block to have this boundary type before
-            changing it.
-
-        Returns
-        -------
-        bool
-            True if boundary was successfully updated, False if not found
-
-        Example
-        -------
-        >>> from ras_commander import RasUnsteady
-        >>> # Link a boundary to DSS
-        >>> success = RasUnsteady.set_boundary_dss_link(
-        ...     "project.u01",
-        ...     river="Turkey Creek",
-        ...     reach="A119-00-00",
-        ...     station="23601.19",
-        ...     dss_file="P1000000.dss",
-        ...     dss_path="//A119-01-00A/FLOW/31MAY2007/5MIN/RUN:1%_24HR/"
-        ... )
-        """
-        ras_obj = ras_object or ras
-        if ras_obj is not None:
-            try:
-                ras_obj.check_initialized()
-            except:
-                pass
-
-        unsteady_path = Path(unsteady_file)
-        if not unsteady_path.exists():
-            raise FileNotFoundError(f"Unsteady flow file not found: {unsteady_path}")
-        dss_file = RasUnsteady._format_dss_filename(
-            dss_file,
-            unsteady_path,
-        )
-
-        with open(unsteady_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
-
+    def _select_boundary_block(
+        lines: List[str], *, river=None, reach=None, station=None,
+        sa_2d_name=None, bc_line=None, boundary_index=None, expected_bc_type=None,
+    ) -> Optional[Dict[str, Any]]:
+        """Share exact selector semantics between DSS mutation and readback."""
         river = RasUnsteady._clean_boundary_selector(river)
         reach = RasUnsteady._clean_boundary_selector(reach)
         station = RasUnsteady._clean_boundary_selector(station)
@@ -7330,7 +7246,7 @@ class RasUnsteady:
                     sa_2d_name,
                     bc_line,
                 )
-                return False
+                return None
             if len(matches) > 1:
                 choices = ", ".join(
                     f"{block['boundary_index']}:"
@@ -7348,6 +7264,211 @@ class RasUnsteady:
                 f"Selected boundary type is {target_block['bc_type']!r}, "
                 f"expected {expected_bc_type!r}"
             )
+        return target_block
+
+    @staticmethod
+    def _flow_multiplier_state(lines: List[str], block: Dict[str, Any]) -> Dict[str, Any]:
+        """Inspect supported flow modifiers without changing scientific controls."""
+        flow_types = {
+            "Flow Hydrograph", "Lateral Inflow Hydrograph",
+            "Uniform Lateral Inflow", "Uniform Lateral Inflow Hydrograph",
+        }
+        if block["bc_type"] not in flow_types:
+            raise ValueError("Materialized flow requires a flow hydrograph boundary")
+        values = {}
+        for line in lines[block["start_idx"] + 1:block["end_idx"]]:
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key in values:
+                raise ValueError(f"Duplicate boundary setting: {key}")
+            values[key] = value.strip()
+        raw = values.get("Flow Hydrograph QMult")
+        try:
+            multiplier = float(raw) if raw is not None else 1.0
+        except ValueError as exc:
+            raise ValueError("Invalid Flow Hydrograph QMult") from exc
+        if not math.isfinite(multiplier) or multiplier < 0:
+            raise ValueError("Flow Hydrograph QMult must be finite and nonnegative")
+        # Slope is an energy-grade control, not an ordinate transformation.
+        allowed = {
+            *flow_types, "Boundary Name", "Interval", "Flow Hydrograph QMult",
+            "Flow Hydrograph Slope", "Stage Hydrograph TW Check", "DSS File",
+            "DSS Path", "Use DSS", "Use Fixed Start Time", "Fixed Start Date/Time",
+            "Is Critical Boundary", "Critical Boundary Flow",
+        }
+        unsupported = sorted(set(values) - allowed)
+        if len(set(values) & flow_types) != 1:
+            unsupported.append("multiple flow hydrograph types")
+        for key in ("Use Fixed Start Time", "Is Critical Boundary"):
+            if values.get(key, "False").casefold() not in {"false", "0"}:
+                unsupported.append(key)
+        if values.get("Stage Hydrograph TW Check", "0") != "0":
+            unsupported.append("Stage Hydrograph TW Check")
+        if values.get("Critical Boundary Flow", ""):
+            unsupported.append("Critical Boundary Flow")
+        return {
+            "boundary_index": block["boundary_index"],
+            "boundary_name": RasUnsteady._boundary_block_name(block),
+            "bc_type": block["bc_type"],
+            "qmult_explicit": raw is not None,
+            "qmult": multiplier,
+            "unsupported_modifiers": unsupported,
+            "dss_file": values.get("DSS File"),
+            "dss_path": values.get("DSS Path"),
+            "use_dss": values.get("Use DSS", "False").casefold() == "true",
+        }
+
+    @staticmethod
+    @log_call
+    def inspect_boundary_flow(
+        unsteady_file: Union[str, Path], *, river: Optional[str] = None,
+        reach: Optional[str] = None, station: Optional[str] = None,
+        sa_2d_name: Optional[str] = None, bc_line: Optional[str] = None,
+        boundary_index: Optional[int] = None, expected_bc_type: Optional[str] = None,
+        ras_object: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Read one exact flow boundary and its effective ordinate multiplier.
+
+        Args:
+            unsteady_file: Explicit unsteady file path (no global project lookup).
+            river, reach, station: Exact 1D selectors, or use the 2D selectors.
+            sa_2d_name, bc_line: Exact storage/2D area and boundary-line selectors.
+            boundary_index: Optional zero-based index; must agree with names.
+            expected_bc_type: Optional required boundary type.
+            ras_object: Optional caller context; no project metadata is mutated.
+
+        Returns:
+            Scalar evidence including implicit/explicit QMult, DSS binding and
+            unsupported materialized-flow modifiers. Missing QMult means unity.
+
+        Raises:
+            ValueError: Ambiguous/missing target, wrong type, mixed newlines,
+                duplicate settings or malformed multiplier.
+            FileNotFoundError: The explicit file does not exist.
+        """
+        lines, _ = RasUtils._read_text_lines_preserving_newline(Path(unsteady_file))
+        block = RasUnsteady._select_boundary_block(
+            lines, river=river, reach=reach, station=station, sa_2d_name=sa_2d_name,
+            bc_line=bc_line, boundary_index=boundary_index, expected_bc_type=expected_bc_type,
+        )
+        if block is None:
+            raise ValueError("Flow boundary selector did not match")
+        return RasUnsteady._flow_multiplier_state(lines, block)
+
+    @staticmethod
+    @log_call
+    def set_boundary_dss_link(
+        unsteady_file: Union[str, Path],
+        river: Optional[str],
+        reach: Optional[str],
+        station: Optional[str],
+        dss_file: str,
+        dss_path: str,
+        interval: str = "5MIN",
+        ras_object: Optional[Any] = None,
+        *,
+        sa_2d_name: Optional[str] = None,
+        bc_line: Optional[str] = None,
+        boundary_index: Optional[int] = None,
+        expected_bc_type: Optional[str] = None,
+        flow_multiplier_policy: str = "preserve-source",
+    ) -> bool:
+        """
+        Convert an inline hydrograph boundary to use DSS linkage.
+
+        This function modifies a boundary condition in a .u## file to use a DSS
+        file reference instead of inline table data. It performs a complete state
+        transition: sets Use DSS=True, adds DSS File/Path, sets the inline table
+        count to 0, and removes any inline data lines.
+
+        Parameters
+        ----------
+        unsteady_file : str or Path
+            Path to the unsteady flow file (.u##)
+        river : str
+            River name for the boundary
+        reach : str
+            Reach name for the boundary
+        station : str
+            River station for the boundary
+        dss_file : str
+            Path to the DSS file (relative to project folder)
+        dss_path : str
+            Full DSS path (e.g., "//SUBBASIN/FLOW/DATE/5MIN/RUN:1%_24HR/")
+        interval : str, default "5MIN"
+            Time interval for the boundary condition
+        ras_object : optional
+            Custom RAS object to use instead of the global one
+        sa_2d_name, bc_line : str, optional
+            Exact 2D/storage-area boundary selectors. ``sa_2d_name`` matches
+            field index 5 and ``bc_line`` matches field index 7 of the
+            ``Boundary Location=`` record. Pass ``river``, ``reach``, and
+            ``station`` as ``None`` when using these selectors.
+        boundary_index : int, optional
+            Zero-based boundary block index used alone or to disambiguate a
+            partial selector.
+        expected_bc_type : str, optional
+            Require the selected block to have this boundary type before
+            changing it.
+
+        flow_multiplier_policy : str, default "preserve-source"
+            Preserve source QMult by default. ``materialized`` declares that
+            input flow values already include transformations; set only this
+            flow boundary's QMult to unity and reject unsupported modifiers.
+
+        Returns
+        -------
+        bool
+            True if boundary was successfully updated, False if not found
+
+        Example
+        -------
+        >>> from ras_commander import RasUnsteady
+        >>> # Link a boundary to DSS
+        >>> success = RasUnsteady.set_boundary_dss_link(
+        ...     "project.u01",
+        ...     river="Turkey Creek",
+        ...     reach="A119-00-00",
+        ...     station="23601.19",
+        ...     dss_file="P1000000.dss",
+        ...     dss_path="//A119-01-00A/FLOW/31MAY2007/5MIN/RUN:1%_24HR/"
+        ... )
+        """
+        ras_obj = ras_object or ras
+        if ras_obj is not None:
+            try:
+                ras_obj.check_initialized()
+            except:
+                pass
+
+        unsteady_path = Path(unsteady_file)
+        if not unsteady_path.exists():
+            raise FileNotFoundError(f"Unsteady flow file not found: {unsteady_path}")
+        dss_file = RasUnsteady._format_dss_filename(
+            dss_file,
+            unsteady_path,
+        )
+
+        lines, newline = RasUtils._read_text_lines_preserving_newline(unsteady_path)
+        lines = [line.replace("\r\n", "\n") for line in lines]
+
+        target_block = RasUnsteady._select_boundary_block(
+            lines, river=river, reach=reach, station=station, sa_2d_name=sa_2d_name,
+            bc_line=bc_line, boundary_index=boundary_index, expected_bc_type=expected_bc_type,
+        )
+        if target_block is None:
+            return False
+        if flow_multiplier_policy not in {"preserve-source", "materialized"}:
+            raise ValueError("Unsupported flow_multiplier_policy")
+        if flow_multiplier_policy == "materialized":
+            state = RasUnsteady._flow_multiplier_state(lines, target_block)
+            if state["unsupported_modifiers"]:
+                raise ValueError(
+                    "Unsupported materialized flow modifiers: "
+                    + ", ".join(state["unsupported_modifiers"])
+                )
         boundary_idx = target_block["start_idx"]
 
         # Inline table type keywords that may have data to remove
@@ -7471,8 +7592,22 @@ class RasUnsteady:
         if use_dss_idx is None:
             lines.insert(insert_idx, 'Use DSS=True\n')
 
-        with open(unsteady_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+        if flow_multiplier_policy == "materialized":
+            # Table/DSS insertion can shift line offsets, but not block indices.
+            block = RasUnsteady._find_boundary_blocks(lines)[target_block["boundary_index"]]
+            qmult_indices = [
+                i for i in range(block["start_idx"] + 1, block["end_idx"])
+                if lines[i].startswith("Flow Hydrograph QMult=")
+            ]
+            if qmult_indices:
+                lines[qmult_indices[0]] = "Flow Hydrograph QMult= 1 \n"
+            # An absent QMult already means unity; do not add unnecessary settings.
+            readback = RasUnsteady._flow_multiplier_state(lines, block)
+            if readback["qmult"] != 1.0 or readback["unsupported_modifiers"]:
+                raise ValueError("Materialized flow multiplier readback failed")
+        RasUnsteady._atomic_write_lines(
+            unsteady_path, [line.replace("\n", newline) for line in lines]
+        )
 
         logger.info(
             "Updated boundary %s to use DSS link (removed %d inline data lines)",
