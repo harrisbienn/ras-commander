@@ -17,6 +17,7 @@ from ras_commander import (
     RasScenarioWorker,
     RasScenarioWorkspace,
 )
+from ras_commander.RasScenarioWorker import RasScenarioWorkerError
 
 
 def _sha256(path: Path) -> str:
@@ -79,6 +80,7 @@ def _request(tmp_path: Path):
                 "mapping_id": "tributary",
                 "dss_path": "//TRIBUTARY/FLOW//5MIN/RUN:SCENARIO/",
                 "expected_bc_type": "Flow Hydrograph",
+                "flow_multiplier_policy": "preserve-source",
                 "river": "River",
                 "reach": "Reach",
                 "station": "1000",
@@ -563,7 +565,7 @@ def test_worker_rejects_request_contract_drift(tmp_path):
 def test_packaged_worker_schemas_match_public_contract_constants():
     package = importlib.resources.files("ras_commander") / "contracts"
     request_schema = json.loads(
-        (package / "scenario-worker-request-v1.0.schema.json").read_text(
+        (package / "scenario-worker-request-v1.1.schema.json").read_text(
             encoding="utf-8"
         )
     )
@@ -575,6 +577,46 @@ def test_packaged_worker_schemas_match_public_contract_constants():
 
     assert request_schema["$id"] == RasScenarioWorker.REQUEST_SCHEMA
     assert result_schema["$id"] == RasScenarioWorker.RESULT_SCHEMA
+
+
+@pytest.mark.parametrize("policy", ["preserve-source", "materialized"])
+def test_worker_11_authenticates_explicit_flow_policy(tmp_path, policy):
+    request, _, _ = _request(tmp_path)
+    request["boundary_links"][0]["flow_multiplier_policy"] = policy
+    normalized = RasScenarioWorker._validate_request(request)
+    assert normalized["boundary_links"][0]["flow_multiplier_policy"] == policy
+    assert normalized["schema"] == RasScenarioWorker.REQUEST_SCHEMA
+
+
+def test_worker_10_preserves_legacy_schema_and_rejects_new_policy(tmp_path):
+    request, _, _ = _request(tmp_path)
+    request["schema"] = RasScenarioWorker.LEGACY_REQUEST_SCHEMA
+    with pytest.raises(RasScenarioWorkerError, match="unknown flow_multiplier_policy"):
+        RasScenarioWorker._validate_request(request)
+    del request["boundary_links"][0]["flow_multiplier_policy"]
+    normalized = RasScenarioWorker._validate_request(request)
+    assert normalized["schema"] == RasScenarioWorker.LEGACY_REQUEST_SCHEMA
+    assert "flow_multiplier_policy" not in normalized["boundary_links"][0]
+
+
+def test_worker_11_requires_policy_and_rejects_invalid_policy(tmp_path):
+    request, _, _ = _request(tmp_path)
+    request["boundary_links"][0]["flow_multiplier_policy"] = "automatic"
+    with pytest.raises(RasScenarioWorkerError, match="Unsupported flow_multiplier_policy"):
+        RasScenarioWorker._validate_request(request)
+    del request["boundary_links"][0]["flow_multiplier_policy"]
+    with pytest.raises(RasScenarioWorkerError, match="requires flow_multiplier_policy"):
+        RasScenarioWorker._validate_request(request)
+
+
+def test_worker_interpolation_preservation_requires_request_11(tmp_path):
+    request, _, _ = _request(tmp_path)
+    request["forcing_excess"]["interpolation"] = "preserve-source"
+    assert RasScenarioWorker._validate_request(request)["forcing_excess"]["interpolation"] == "preserve-source"
+    request["schema"] = RasScenarioWorker.LEGACY_REQUEST_SCHEMA
+    del request["boundary_links"][0]["flow_multiplier_policy"]
+    with pytest.raises(RasScenarioWorkerError, match="interpolation"):
+        RasScenarioWorker._validate_request(request)
 
 
 @pytest.mark.integration

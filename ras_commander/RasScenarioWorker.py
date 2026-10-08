@@ -46,7 +46,8 @@ class RasScenarioWorkerError(RuntimeError):
 class RasScenarioWorker:
     """Static namespace for the RAS scenario-worker request/result contract."""
 
-    REQUEST_SCHEMA = "ras-commander/scenario-worker-request/1.0"
+    REQUEST_SCHEMA = "ras-commander/scenario-worker-request/1.1"
+    LEGACY_REQUEST_SCHEMA = "ras-commander/scenario-worker-request/1.0"
     RESULT_SCHEMA = "ras-commander/scenario-worker-result/1.0"
 
     @staticmethod
@@ -332,7 +333,7 @@ class RasScenarioWorker:
             optional={"retry"},
             label="request",
         )
-        if payload["schema"] != RasScenarioWorker.REQUEST_SCHEMA:
+        if payload["schema"] not in {RasScenarioWorker.REQUEST_SCHEMA, RasScenarioWorker.LEGACY_REQUEST_SCHEMA}:
             raise RasScenarioWorkerError(
                 f"Unsupported RAS worker request schema: {payload['schema']!r}",
                 classification="invalid_request",
@@ -420,14 +421,21 @@ class RasScenarioWorker:
         forcing["interpolation"] = _choice(
             payload["forcing_excess"].get("interpolation", "Bilinear"),
             "forcing_excess.interpolation",
-            {"Nearest", "Bilinear"},
+            (
+                {"Nearest", "Bilinear", "preserve-source"}
+                if payload["schema"] == RasScenarioWorker.REQUEST_SCHEMA
+                else {"Nearest", "Bilinear"}
+            ),
         )
 
         raw_links = payload["boundary_links"]
         if not isinstance(raw_links, list) or not raw_links:
             _invalid("boundary_links must be a non-empty array")
         links: list[Dict[str, Any]] = []
+        legacy = payload["schema"] == RasScenarioWorker.LEGACY_REQUEST_SCHEMA
         allowed_link_fields = set(RasBoundaryLink.__dataclass_fields__)
+        if legacy:
+            allowed_link_fields.remove("flow_multiplier_policy")
         for index, raw_link in enumerate(raw_links):
             link = _object(raw_link, f"boundary_links[{index}]")
             unknown = sorted(set(link) - allowed_link_fields)
@@ -436,6 +444,8 @@ class RasScenarioWorker:
                     f"Invalid boundary_links[{index}] fields: unknown "
                     + ", ".join(unknown)
                 )
+            if not legacy and "flow_multiplier_policy" not in link:
+                _invalid(f"boundary_links[{index}] requires flow_multiplier_policy in request 1.1")
             try:
                 normalized_link = RasBoundaryLink.from_mapping(link)
             except (TypeError, ValueError) as exc:
@@ -448,7 +458,7 @@ class RasScenarioWorker:
                 {
                     name: value
                     for name, value in normalized_link.__dict__.items()
-                    if value is not None
+                    if value is not None and not (legacy and name == "flow_multiplier_policy")
                 }
             )
         if len({link["mapping_id"] for link in links}) != len(links):
@@ -528,7 +538,7 @@ class RasScenarioWorker:
             }
 
         normalized_request = {
-            "schema": RasScenarioWorker.REQUEST_SCHEMA,
+            "schema": payload["schema"],
             "scenario": normalized_scenario,
             "source_model": normalized_source,
             "hydrology": hydrology,
@@ -855,6 +865,8 @@ class RasScenarioWorker:
             classification = "wrong_window"
         elif "all_boundaries_exist_in_active_geometry" in lower:
             classification = "inactive_geometry"
+        elif "materialized flow" in lower or "materialized_flow" in lower or "qmult" in lower:
+            classification = "materialized_flow_preparation"
         elif "boundary mapping" in lower or "boundary selector" in lower:
             classification = "invalid_boundary_selector"
         elif "forcing_excess_link_matches" in lower:

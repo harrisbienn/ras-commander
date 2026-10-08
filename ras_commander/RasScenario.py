@@ -40,7 +40,7 @@ _RAS_AUTHORED_TEXT_SUFFIX = re.compile(
 
 @dataclass(frozen=True)
 class RasBoundaryLink:
-    """One exact HMS DSS pathname to HEC-RAS boundary mapping."""
+    """One exact DSS mapping with an explicit source/materialized flow policy."""
 
     mapping_id: str
     dss_path: str
@@ -52,8 +52,11 @@ class RasBoundaryLink:
     sa_2d_name: Optional[str] = None
     bc_line: Optional[str] = None
     boundary_index: Optional[int] = None
+    flow_multiplier_policy: str = "preserve-source"
 
     def __post_init__(self) -> None:
+        if self.flow_multiplier_policy not in {"preserve-source", "materialized"}:
+            raise ValueError("Unsupported flow_multiplier_policy")
         if not self.mapping_id.strip():
             raise ValueError("mapping_id must be non-empty")
         if not self.dss_path.startswith("/") or not self.dss_path.endswith("/"):
@@ -97,6 +100,7 @@ class RasScenarioWorkspace:
     linked_asset_cache: Optional[Dict[str, Any]] = None
     source_output_exclusions: Optional[Dict[str, Any]] = None
     inactive_inherited_boundaries: tuple[Dict[str, Any], ...] = ()
+    boundary_flow_preparation: tuple[Dict[str, Any], ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a JSON-serializable workspace record."""
@@ -483,6 +487,10 @@ class RasScenario:
         ``.rasmap`` files. When ``linked_asset_cache_key`` is supplied, those
         sibling copies are authenticated and reused by other workspaces under
         the same parent directory.
+
+        Materialized boundary links neutralize only their cloned QMult after
+        upstream transformations. ``forcing_excess_interpolation="preserve-source"``
+        retains the template's gridded method, including an unset method.
         """
         source_file = RasScenario._resolve_project_file(source_project)
         source_folder = source_file.parent.resolve()
@@ -665,7 +673,13 @@ class RasScenario:
         if unsteady_file is None:
             raise RuntimeError("Cloned unsteady flow file could not be resolved")
 
+        flow_preparation = []
         for link in links:
+            before = None
+            if link.flow_multiplier_policy == "materialized":
+                before = RasUnsteady.inspect_boundary_flow(
+                    unsteady_file, **RasScenario._boundary_selector(link)
+                )
             changed = RasUnsteady.set_boundary_dss_link(
                 unsteady_file,
                 river=link.river,
@@ -679,17 +693,38 @@ class RasScenario:
                 bc_line=link.bc_line,
                 boundary_index=link.boundary_index,
                 expected_bc_type=link.expected_bc_type,
+                flow_multiplier_policy=link.flow_multiplier_policy,
             )
             if not changed:
                 raise ValueError(f"Boundary mapping {link.mapping_id!r} did not match")
+            if before is not None:
+                after = RasUnsteady.inspect_boundary_flow(
+                    unsteady_file, **RasScenario._boundary_selector(link)
+                )
+                flow_preparation.append({
+                    "mapping_id": link.mapping_id,
+                    "policy": link.flow_multiplier_policy,
+                    "before": before,
+                    "after": after,
+                })
 
         if excess_file is not None:
+            if forcing_excess_interpolation == "preserve-source":
+                forcing_excess_interpolation = (
+                    RasUnsteady.get_met_precipitation_config(unsteady_file)["interpolation"]
+                    or ""
+                )
             RasUnsteady.configure_gridded_dss_precipitation(
                 unsteady_file,
                 dss_filename=str(excess_file),
                 dss_pathname=forcing_excess_pathname,
                 interpolation=forcing_excess_interpolation,
             )
+            if (
+                RasUnsteady.get_met_precipitation_config(unsteady_file)["interpolation"]
+                or ""
+            ) != forcing_excess_interpolation:
+                raise ValueError("Prepared precipitation interpolation does not match requested setting")
 
         plan_file = RasPlan.get_plan_path(plan_number, ras_object=project)
         if plan_file is None:
@@ -710,6 +745,7 @@ class RasScenario:
             forcing_excess_pathname=forcing_excess_pathname,
             linked_asset_cache=linked_asset_cache,
             source_output_exclusions=source_output_exclusions,
+            boundary_flow_preparation=tuple(flow_preparation),
             result_hdf=destination / f"{project.project_name}.p{plan_number}.hdf",
             boundary_mapping_ids=tuple(link.mapping_id for link in links),
             simulation_start=start_time.isoformat(),
@@ -853,6 +889,50 @@ class RasScenario:
         return audit
 
     @staticmethod
+    def _boundary_selector(link: RasBoundaryLink) -> Dict[str, Any]:
+        return {name: getattr(link, name) for name in (
+            "river", "reach", "station", "sa_2d_name", "bc_line",
+            "boundary_index", "expected_bc_type",
+        )}
+
+    @staticmethod
+    def _materialized_flow_evidence(
+        workspace: RasScenarioWorkspace, links: tuple[RasBoundaryLink, ...],
+    ) -> list[Dict[str, Any]]:
+        """Recheck final targets after audited inherited-boundary removal."""
+        evidence = []
+        for link in links:
+            if link.flow_multiplier_policy != "materialized":
+                continue
+            selector = RasScenario._boundary_selector(link)
+            if link.boundary_index is not None:
+                selector["boundary_index"] -= sum(
+                    item["boundary_index"] < link.boundary_index
+                    for item in workspace.inactive_inherited_boundaries
+                )
+            state = RasUnsteady.inspect_boundary_flow(workspace.unsteady_file, **selector)
+            expected_path = link.dss_path
+            if workspace.simulation_start and workspace.simulation_end:
+                expected_path = RasScenario.format_dss_pathname_for_window(
+                    expected_path, datetime.fromisoformat(workspace.simulation_start),
+                    datetime.fromisoformat(workspace.simulation_end),
+                )
+            reference_text = state["dss_file"] or ""
+            native_reference = Path(reference_text)
+            bound_file = (
+                native_reference
+                if native_reference.is_absolute()
+                else workspace.project_folder.joinpath(*PureWindowsPath(reference_text).parts)
+            ).resolve()
+            passed = (
+                state["qmult"] == 1.0 and not state["unsupported_modifiers"]
+                and state["use_dss"] and state["dss_path"] == expected_path
+                and bound_file == workspace.hydrology_file.resolve()
+            )
+            evidence.append({"mapping_id": link.mapping_id, "passed": passed, **state})
+        return evidence
+
+    @staticmethod
     @log_call
     def validate_workspace(
         workspace: RasScenarioWorkspace,
@@ -945,7 +1025,9 @@ class RasScenario:
             else None
         )
 
+        flow_evidence = RasScenario._materialized_flow_evidence(workspace, links)
         checks = {
+            "materialized_flow_bindings_match": all(item["passed"] for item in flow_evidence),
             "project_file_exists": workspace.project_file.is_file(),
             "plan_file_exists": workspace.plan_file.is_file(),
             "unsteady_file_exists": workspace.unsteady_file.is_file(),
@@ -1112,6 +1194,8 @@ class RasScenario:
                 links,
                 plan_text,
             ),
+            "materialized_flow_boundaries": RasScenario._materialized_flow_evidence(workspace, links),
+            "boundary_flow_preparation": list(workspace.boundary_flow_preparation),
             "inactive_inherited_boundaries": list(
                 workspace.inactive_inherited_boundaries
             ),
