@@ -16,6 +16,7 @@ All of the methods in this class are static and are designed to be used without 
 
 List of Functions in HdfBndry:
 - get_bc_lines()           # Returns boundary condition lines as a GeoDataFrame.
+- get_bc_external_faces()  # Returns native BC-line-to-external-face associations.
 - get_breaklines()         # Returns 2D mesh area breaklines as a GeoDataFrame.
 - get_refinement_regions() # Returns refinement regions as a GeoDataFrame.
 - get_reference_lines()    # Returns reference lines as a GeoDataFrame.
@@ -24,20 +25,54 @@ List of Functions in HdfBndry:
 
 
 """
+
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Any
+from typing import ClassVar, Literal, Optional, Union
+
 import h5py
 import numpy as np
 import pandas as pd
-import geopandas as gpd
-from shapely.geometry import LineString, MultiLineString, Polygon, MultiPolygon, Point
+
+from .._optional_deps import optional_module
+from ..Decorators import log_call, standardize_input
+from ..fast_hdf import read_typed, reraise_required
+from ..LoggingConfig import get_logger
 from .HdfBase import HdfBase
 from .HdfUtils import HdfUtils
-from .HdfMesh import HdfMesh
-from ..Decorators import standardize_input, log_call
-from ..LoggingConfig import setup_logging, get_logger
+from ._packed_parts import _nonnegative_index, resolve_feature_part_ranges
+
+# GeoPandas/Shapely load on first use, so the tabular readers work on the core
+# h5py/numpy/pandas install.
+gpd = optional_module("geopandas", "Building geometry in HdfBndry")
+shapely_geometry = optional_module("shapely.geometry", "Building geometry in HdfBndry")
 
 logger = get_logger(__name__)
+
+
+def _assemble_polygon_rings(polygons):
+    """Assemble shells, holes and islands by ring containment, preserving vertices."""
+    containers = [
+        [j for j, outer in enumerate(polygons)
+         if i != j and outer.contains(ring)]
+        for i, ring in enumerate(polygons)
+    ]
+    parents = [
+        min(indices, key=lambda j: polygons[j].area)
+        if indices else None
+        for indices in containers
+    ]
+    shells = [
+        shapely_geometry.Polygon(
+            ring.exterior.coords,
+            [hole.exterior.coords for j, hole in enumerate(polygons)
+             if parents[j] == i and len(containers[j]) % 2 == 1],
+        )
+        for i, ring in enumerate(polygons)
+        if len(containers[i]) % 2 == 0
+    ]
+    return shells[0] if len(shells) == 1 else shapely_geometry.MultiPolygon(shells)
 
 
 class HdfBndry:
@@ -55,6 +90,627 @@ class HdfBndry:
         This class relies on the HdfBase and HdfUtils classes for some of its
         functionality. Ensure these classes are available in the same package.
     """
+    _BC_EXTERNAL_FACES_PATH = "Geometry/Boundary Condition Lines/External Faces"
+    _BC_ATTRIBUTES_PATH = "Geometry/Boundary Condition Lines/Attributes"
+    _BC_EXTERNAL_FACE_COLUMNS: ClassVar[list[str]] = [
+        "bc_line_id",
+        "bc_line_name",
+        "mesh_name",
+        "bc_line_type",
+        "face_id",
+        "fp_start_index",
+        "fp_end_index",
+        "station_start",
+        "station_end",
+    ]
+
+    @staticmethod
+    def _empty_bc_external_faces(
+        status: str,
+        *,
+        include_geometry: bool = False,
+        crs=None,
+        report_ownership: bool = False,
+    ) -> pd.DataFrame:
+        """Build a typed empty native-association result."""
+        result = pd.DataFrame(
+            {
+                "bc_line_id": pd.Series(dtype="Int64"),
+                "bc_line_name": pd.Series(dtype="string"),
+                "mesh_name": pd.Series(dtype="string"),
+                "bc_line_type": pd.Series(dtype="string"),
+                "face_id": pd.Series(dtype="int64"),
+                "fp_start_index": pd.Series(dtype="Int64"),
+                "fp_end_index": pd.Series(dtype="Int64"),
+                "station_start": pd.Series(dtype="float64"),
+                "station_end": pd.Series(dtype="float64"),
+            }
+        )
+        result.attrs.update(
+            {
+                "association_status": status,
+                "dataset_present": status != "absent",
+                "authoritative": status != "absent",
+                "source_dataset": HdfBndry._BC_EXTERNAL_FACES_PATH,
+                "attributes_dataset": HdfBndry._BC_ATTRIBUTES_PATH,
+                "face_count": 0,
+                "unique_face_count": 0,
+                "face_ownership_unique": True,
+                "duplicate_face_count": 0,
+                "duplicate_face_row_count": 0,
+            }
+        )
+        if include_geometry:
+            result = gpd.GeoDataFrame(
+                result,
+                geometry=gpd.GeoSeries([], dtype="geometry", crs=crs),
+                crs=crs,
+            )
+            result.attrs.update(
+                {
+                    "association_status": status,
+                    "dataset_present": status != "absent",
+                    "authoritative": status != "absent",
+                    "source_dataset": HdfBndry._BC_EXTERNAL_FACES_PATH,
+                    "attributes_dataset": HdfBndry._BC_ATTRIBUTES_PATH,
+                    "face_count": 0,
+                    "unique_face_count": 0,
+                    "face_ownership_unique": True,
+                    "duplicate_face_count": 0,
+                    "duplicate_face_row_count": 0,
+                }
+            )
+        if report_ownership:
+            HdfBndry._report_bc_face_ownership(result)
+        return result
+
+    @staticmethod
+    def _report_bc_face_ownership(result: pd.DataFrame) -> None:
+        """Annotate all association rows without choosing or discarding an owner."""
+        keys = (
+            ["mesh_name", "face_id"]
+            if result["mesh_name"].notna().all()
+            else ["face_id"]
+        )
+        result["duplicate_ownership"] = result.duplicated(keys, keep=False)
+        result["owning_bc_line_ids"] = pd.Series(
+            [[] for _ in range(len(result))], index=result.index, dtype="object"
+        )
+        result["owning_bc_line_names"] = pd.Series(
+            [[] for _ in range(len(result))], index=result.index, dtype="object"
+        )
+        summary = []
+        for _, rows in result.groupby(keys, sort=False, dropna=False):
+            owners = rows[["bc_line_id", "bc_line_name"]].drop_duplicates()
+            ids = [None if pd.isna(value) else int(value) for value in owners.bc_line_id]
+            names = [None if pd.isna(value) else str(value) for value in owners.bc_line_name]
+            for index in rows.index:
+                result.at[index, "owning_bc_line_ids"] = ids.copy()
+                result.at[index, "owning_bc_line_names"] = names.copy()
+            if rows["duplicate_ownership"].any():
+                summary.append(
+                    {
+                        "mesh_name": (
+                            str(rows.mesh_name.iloc[0])
+                            if rows.mesh_name.notna().all() and rows.mesh_name.nunique() == 1
+                            else None
+                        ),
+                        "face_id": int(rows.face_id.iloc[0]),
+                        "owning_bc_line_ids": ids,
+                        "owning_bc_line_names": names,
+                    }
+                )
+        result.attrs["duplicate_ownership"] = summary
+
+    @staticmethod
+    def _find_structured_field(
+        field_names: tuple[str, ...],
+        *candidates: str,
+    ) -> Optional[str]:
+        """Resolve a native structured-array field without punctuation sensitivity."""
+        def normalized(value: str) -> str:
+            return "".join(character for character in value.lower() if character.isalnum())
+
+        available = {normalized(name): name for name in field_names}
+        for candidate in candidates:
+            matched = available.get(normalized(candidate))
+            if matched is not None:
+                return matched
+        return None
+
+    @staticmethod
+    def _decode_bc_text(value) -> str:
+        """Decode and trim one fixed-width HEC-RAS text value."""
+        return str(HdfUtils.convert_ras_string(value)).rstrip("\x00 ")
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type='geom_hdf')
+    def get_bc_external_faces(
+        hdf_path: Union[str, Path],
+        include_geometry: bool = False,
+        validate_unique_faces: bool = True,
+        *,
+        on_duplicate_ownership: Literal["raise", "report"] = "raise",
+    ) -> Union[pd.DataFrame, gpd.GeoDataFrame]:
+        """Return native BC-line-to-external-face associations.
+
+        The association is read directly from
+        ``Geometry/Boundary Condition Lines/External Faces``.  It is the
+        authoritative HEC-RAS native boundary-connectivity result; this method
+        does not infer faces from proximity to a BC line.
+
+        Parameters
+        ----------
+        hdf_path : str or Path
+            Path to a HEC-RAS geometry or plan HDF containing geometry data.
+        include_geometry : bool, default False
+            If ``True``, return a GeoDataFrame whose LineString geometry is
+            built from only the natively associated faces.  Selected face
+            rows, face-point coordinates, and any intermediate ``Faces
+            Perimeter Values`` are indexed directly when the external-face
+            endpoints agree with the referenced mesh face.  HEC-RAS can retain
+            stale face IDs after remeshing while writing valid native endpoint
+            IDs; those rows fall back to endpoint-only segments and are
+            reported in ``DataFrame.attrs``.  The full mesh face network is
+            never materialized.
+        validate_unique_faces : bool, default True
+            Require each mesh-local face to be owned by exactly one native BC
+            association. Set to ``False`` only for diagnostics: all native rows
+            are returned and duplicate counts are reported in ``DataFrame.attrs``.
+            This legacy switch retains the original column shape.
+        on_duplicate_ownership : {"raise", "report"}, default "raise"
+            With ``"report"``, suppress only duplicate-ownership errors, even
+            when ``validate_unique_faces=True``. Preserve every association
+            and add ``duplicate_ownership`` (bool), ``owning_bc_line_ids`` and
+            ``owning_bc_line_names`` (parallel lists in native encounter order,
+            deduplicated by owner ID/name pair; missing values are ``None``).
+            Repeated associations to the same owner are also marked.
+            ``attrs['duplicate_ownership']`` lists duplicate keys and their
+            owner lists, using ``mesh_name=None`` when mesh metadata is unknown.
+            No files are modified; other validation remains active.
+
+        Returns
+        -------
+        pandas.DataFrame or geopandas.GeoDataFrame
+            A GeoDataFrame when ``include_geometry=True``, otherwise a
+            DataFrame. One row per native external-face association with columns
+            ``bc_line_id``, ``bc_line_name``, ``mesh_name``,
+            ``bc_line_type``, ``face_id``, ``fp_start_index``,
+            ``fp_end_index``, ``station_start``, and ``station_end``.
+            ``DataFrame.attrs['association_status']`` is ``'present'``,
+            ``'empty'``, or ``'absent'``.  An empty-but-present native dataset
+            is therefore distinguishable from geometry that has not been
+            preprocessed to create the association.
+            When ``include_geometry=True``, the result also has a
+            ``geometry`` column and the native HDF projection.  The
+            ``topology_match_count`` and ``topology_mismatch_count`` metadata
+            distinguish rows that could and could not reuse mesh-face
+            perimeter values.
+
+        Raises
+        ------
+        ValueError
+            If the native dataset has an unsupported schema, contains invalid
+            BC/face identifiers, or (by default) assigns one external face more
+            than once.
+
+        Notes
+        -----
+        ``BC Line ID`` is the zero-based row index into the adjacent
+        ``Attributes`` dataset.  Name, mesh, and type remain nullable when the
+        Attributes dataset or an optional attribute field is unavailable.
+        """
+        if on_duplicate_ownership not in ("raise", "report"):
+            raise ValueError("on_duplicate_ownership must be 'raise' or 'report'")
+        with h5py.File(hdf_path, "r") as hdf_file:
+            if HdfBndry._BC_EXTERNAL_FACES_PATH not in hdf_file:
+                logger.debug(
+                    "Native BC external-face association '%s' not found in %s.",
+                    HdfBndry._BC_EXTERNAL_FACES_PATH,
+                    hdf_path.name,
+                )
+                return HdfBndry._empty_bc_external_faces(
+                    "absent",
+                    include_geometry=include_geometry,
+                    crs=HdfBase.get_projection(hdf_file) if include_geometry else None,
+                    report_ownership=on_duplicate_ownership == "report",
+                )
+
+            native = read_typed(hdf_file[HdfBndry._BC_EXTERNAL_FACES_PATH])
+            if len(native) == 0:
+                return HdfBndry._empty_bc_external_faces(
+                    "empty",
+                    include_geometry=include_geometry,
+                    crs=HdfBase.get_projection(hdf_file) if include_geometry else None,
+                    report_ownership=on_duplicate_ownership == "report",
+                )
+
+            field_names = native.dtype.names
+            if not field_names:
+                raise ValueError(
+                    f"Unsupported unstructured native BC external-face schema in {hdf_path}: "
+                    f"{native.dtype}"
+                )
+
+            bc_id_field = HdfBndry._find_structured_field(
+                field_names,
+                "BC Line ID",
+                "Boundary Condition Line ID",
+                "Boundary Condition ID",
+            )
+            face_id_field = HdfBndry._find_structured_field(
+                field_names,
+                "Face Index",
+                "Face ID",
+            )
+            if face_id_field is None:
+                raise ValueError(
+                    f"Native BC external-face schema in {hdf_path} has no Face Index field; "
+                    f"available fields: {field_names}"
+                )
+
+            optional_fields = {
+                "fp_start_index": HdfBndry._find_structured_field(
+                    field_names, "FP Start Index"
+                ),
+                "fp_end_index": HdfBndry._find_structured_field(
+                    field_names, "FP End Index"
+                ),
+                "station_start": HdfBndry._find_structured_field(
+                    field_names, "Station Start"
+                ),
+                "station_end": HdfBndry._find_structured_field(
+                    field_names, "Station End"
+                ),
+            }
+
+            row_count = len(native)
+            result = pd.DataFrame(
+                {
+                    "bc_line_id": (
+                        pd.array(native[bc_id_field], dtype="Int64")
+                        if bc_id_field is not None
+                        else pd.array([pd.NA] * row_count, dtype="Int64")
+                    ),
+                    "face_id": np.asarray(native[face_id_field], dtype=np.int64),
+                    "fp_start_index": (
+                        pd.array(native[optional_fields["fp_start_index"]], dtype="Int64")
+                        if optional_fields["fp_start_index"] is not None
+                        else pd.array([pd.NA] * row_count, dtype="Int64")
+                    ),
+                    "fp_end_index": (
+                        pd.array(native[optional_fields["fp_end_index"]], dtype="Int64")
+                        if optional_fields["fp_end_index"] is not None
+                        else pd.array([pd.NA] * row_count, dtype="Int64")
+                    ),
+                    "station_start": (
+                        np.asarray(native[optional_fields["station_start"]], dtype=np.float64)
+                        if optional_fields["station_start"] is not None
+                        else np.full(row_count, np.nan, dtype=np.float64)
+                    ),
+                    "station_end": (
+                        np.asarray(native[optional_fields["station_end"]], dtype=np.float64)
+                        if optional_fields["station_end"] is not None
+                        else np.full(row_count, np.nan, dtype=np.float64)
+                    ),
+                }
+            )
+
+            if (result["face_id"] < 0).any():
+                invalid = result.loc[result["face_id"] < 0, "face_id"].tolist()[:10]
+                raise ValueError(
+                    f"Native BC external-face association in {hdf_path} contains negative "
+                    f"face IDs: {invalid}"
+                )
+
+            result["bc_line_name"] = pd.Series(pd.NA, index=result.index, dtype="string")
+            result["mesh_name"] = pd.Series(pd.NA, index=result.index, dtype="string")
+            result["bc_line_type"] = pd.Series(pd.NA, index=result.index, dtype="string")
+
+            if HdfBndry._BC_ATTRIBUTES_PATH in hdf_file:
+                attributes = read_typed(hdf_file[HdfBndry._BC_ATTRIBUTES_PATH])
+                attribute_fields = attributes.dtype.names or ()
+                name_field = HdfBndry._find_structured_field(attribute_fields, "Name")
+                mesh_field = HdfBndry._find_structured_field(
+                    attribute_fields, "SA-2D", "SA/2D", "Mesh Name"
+                )
+                type_field = HdfBndry._find_structured_field(attribute_fields, "Type")
+
+                known_ids = result["bc_line_id"].dropna().astype(np.int64)
+                if len(known_ids) and (
+                    (known_ids < 0).any() or (known_ids >= len(attributes)).any()
+                ):
+                    invalid = known_ids[
+                        (known_ids < 0) | (known_ids >= len(attributes))
+                    ].unique()[:10].tolist()
+                    raise ValueError(
+                        f"Native BC external-face association in {hdf_path} references BC Line "
+                        f"IDs outside Attributes[0:{len(attributes)}]: {invalid}"
+                    )
+
+                valid = result["bc_line_id"].notna()
+                if valid.any():
+                    ids = result.loc[valid, "bc_line_id"].astype(np.int64).to_numpy()
+                    if name_field is not None:
+                        result.loc[valid, "bc_line_name"] = [
+                            HdfBndry._decode_bc_text(value)
+                            for value in attributes[name_field][ids]
+                        ]
+                    if mesh_field is not None:
+                        result.loc[valid, "mesh_name"] = [
+                            HdfBndry._decode_bc_text(value)
+                            for value in attributes[mesh_field][ids]
+                        ]
+                    if type_field is not None:
+                        result.loc[valid, "bc_line_type"] = [
+                            HdfBndry._decode_bc_text(value)
+                            for value in attributes[type_field][ids]
+                        ]
+
+            # Face indexes are mesh-local.  When the native Attributes join
+            # supplies mesh names, audit ownership by (mesh, face); otherwise
+            # the conservative fallback is global face-ID uniqueness.
+            ownership_columns = (
+                ["mesh_name", "face_id"]
+                if result["mesh_name"].notna().all()
+                else ["face_id"]
+            )
+            duplicate_ownership = result.duplicated(
+                subset=ownership_columns,
+                keep=False,
+            )
+            duplicate_keys = result.loc[
+                duplicate_ownership,
+                ownership_columns,
+            ].drop_duplicates()
+            if (
+                validate_unique_faces
+                and on_duplicate_ownership == "raise"
+                and len(duplicate_keys)
+            ):
+                preview = duplicate_keys.head(10).to_dict("records")
+                raise ValueError(
+                    f"Native BC external-face association in {hdf_path} does not have unique "
+                    f"face ownership; duplicate keys: {preview}"
+                )
+
+            result = result[HdfBndry._BC_EXTERNAL_FACE_COLUMNS]
+            geometry_source = None
+            curved_face_count = 0
+            perimeter_value_count = 0
+            topology_match_count = 0
+            topology_mismatch_count = 0
+            if include_geometry:
+                if result["mesh_name"].isna().any():
+                    raise ValueError(
+                        f"Cannot build native BC external-face geometry from {hdf_path} "
+                        "without an SA-2D/mesh association for every row"
+                    )
+                if result[["fp_start_index", "fp_end_index"]].isna().any().any():
+                    raise ValueError(
+                        f"Cannot build native BC external-face geometry from {hdf_path} "
+                        "without FP Start Index and FP End Index for every row"
+                    )
+
+                geometries = pd.Series(index=result.index, dtype="object")
+                geometry_sources: set[str] = set()
+                for mesh_name, mesh_rows in result.groupby("mesh_name", sort=False):
+                    mesh_path = f"Geometry/2D Flow Areas/{mesh_name}"
+                    face_points_path = f"{mesh_path}/Faces FacePoint Indexes"
+                    coordinates_path = f"{mesh_path}/FacePoints Coordinate"
+                    perimeter_info_path = f"{mesh_path}/Faces Perimeter Info"
+                    perimeter_values_path = f"{mesh_path}/Faces Perimeter Values"
+                    if face_points_path not in hdf_file or coordinates_path not in hdf_file:
+                        raise ValueError(
+                            f"Cannot build native BC external-face geometry for mesh "
+                            f"{mesh_name!r} in {hdf_path}; missing {face_points_path!r} "
+                            f"or {coordinates_path!r}"
+                        )
+
+                    face_points_dataset = hdf_file[face_points_path]
+                    coordinates_dataset = hdf_file[coordinates_path]
+                    face_ids = mesh_rows["face_id"].to_numpy(dtype=np.int64)
+                    if (face_ids >= len(face_points_dataset)).any():
+                        invalid = face_ids[face_ids >= len(face_points_dataset)][:10].tolist()
+                        raise ValueError(
+                            f"Native BC external-face association in {hdf_path} references "
+                            f"face IDs outside {face_points_path}[0:{len(face_points_dataset)}]: "
+                            f"{invalid}"
+                        )
+
+                    # h5py point selections must be sorted and unique. Read only
+                    # selected native faces, then restore native-row order. This
+                    # also supports repeated faces in diagnostic mode.
+                    unique_face_ids, inverse_unique_faces = np.unique(
+                        face_ids,
+                        return_inverse=True,
+                    )
+                    selected_face_points = np.asarray(
+                        read_typed(face_points_dataset, unique_face_ids)[inverse_unique_faces],
+                        dtype=np.int64,
+                    )
+
+                    has_perimeter_info = perimeter_info_path in hdf_file
+                    has_perimeter_values = perimeter_values_path in hdf_file
+                    if has_perimeter_info != has_perimeter_values:
+                        raise ValueError(
+                            f"Cannot build complete native BC external-face geometry for mesh "
+                            f"{mesh_name!r} in {hdf_path}; {perimeter_info_path!r} and "
+                            f"{perimeter_values_path!r} must either both exist or both be absent"
+                        )
+                    if has_perimeter_info:
+                        perimeter_info_dataset = hdf_file[perimeter_info_path]
+                        perimeter_values_dataset = hdf_file[perimeter_values_path]
+                        if len(perimeter_info_dataset) != len(face_points_dataset):
+                            raise ValueError(
+                                f"Native mesh topology in {hdf_path} has mismatched face and "
+                                f"perimeter-info counts for mesh {mesh_name!r}"
+                            )
+                        unique_perimeter_info = np.asarray(
+                            read_typed(perimeter_info_dataset, unique_face_ids),
+                            dtype=np.int64,
+                        )
+                        selected_perimeter_info = unique_perimeter_info[
+                            inverse_unique_faces
+                        ]
+                        if (
+                            selected_perimeter_info.ndim != 2
+                            or selected_perimeter_info.shape[1] < 2
+                            or (selected_perimeter_info[:, :2] < 0).any()
+                            or (
+                                selected_perimeter_info[:, 0]
+                                + selected_perimeter_info[:, 1]
+                                > len(perimeter_values_dataset)
+                            ).any()
+                        ):
+                            raise ValueError(
+                                f"Invalid native perimeter ranges in {perimeter_info_path!r} "
+                                f"for selected faces in mesh {mesh_name!r}"
+                            )
+                        perimeter_ranges = selected_perimeter_info[:, :2]
+                        curved_face_count += int(
+                            (unique_perimeter_info[:, 1] > 0).sum()
+                        )
+                        perimeter_value_ids = np.unique(
+                            np.concatenate(
+                                [
+                                    np.arange(start, start + count, dtype=np.int64)
+                                    for start, count in perimeter_ranges
+                                    if count > 0
+                                ]
+                            )
+                            if (perimeter_ranges[:, 1] > 0).any()
+                            else np.array([], dtype=np.int64)
+                        )
+                        selected_perimeter_values = np.asarray(
+                            read_typed(perimeter_values_dataset, perimeter_value_ids),
+                            dtype=np.float64,
+                        )
+                        perimeter_lookup = {
+                            int(value_id): selected_perimeter_values[index]
+                            for index, value_id in enumerate(perimeter_value_ids)
+                        }
+                        perimeter_value_count += len(perimeter_value_ids)
+                        geometry_sources.add("face_endpoints_and_perimeter_values")
+                    else:
+                        perimeter_ranges = np.zeros((len(mesh_rows), 2), dtype=np.int64)
+                        perimeter_lookup = {}
+                        geometry_sources.add("face_endpoints_only")
+
+                    external_face_points = mesh_rows[
+                        ["fp_start_index", "fp_end_index"]
+                    ].to_numpy(dtype=np.int64)
+                    if (
+                        (external_face_points < 0).any()
+                        or (external_face_points >= len(coordinates_dataset)).any()
+                    ):
+                        raise ValueError(
+                            f"Native BC external-face association in {hdf_path} references "
+                            f"face points outside {coordinates_path}[0:{len(coordinates_dataset)}]"
+                        )
+
+                    topology_matches = np.all(
+                        np.sort(selected_face_points, axis=1)
+                        == np.sort(external_face_points, axis=1),
+                        axis=1,
+                    )
+                    mesh_match_count = int(topology_matches.sum())
+                    mesh_mismatch_count = int((~topology_matches).sum())
+                    topology_match_count += mesh_match_count
+                    topology_mismatch_count += mesh_mismatch_count
+                    if mesh_mismatch_count:
+                        geometry_sources.add("external_face_endpoints")
+                        logger.warning(
+                            "Using native External Faces endpoints for %d of %d BC faces in "
+                            "mesh %r because their face IDs do not match current mesh topology "
+                            "in %s.",
+                            mesh_mismatch_count,
+                            len(mesh_rows),
+                            mesh_name,
+                            hdf_path.name,
+                        )
+
+                    point_ids = np.unique(external_face_points)
+                    selected_coordinates = np.asarray(
+                        read_typed(coordinates_dataset, point_ids), dtype=np.float64
+                    )
+                    point_lookup = {
+                        int(point_id): selected_coordinates[index]
+                        for index, point_id in enumerate(point_ids)
+                    }
+                    selected_geometries = []
+                    for row_index, (fp_start, fp_end) in enumerate(external_face_points):
+                        if not topology_matches[row_index]:
+                            selected_geometries.append(
+                                shapely_geometry.LineString(
+                                    [
+                                        point_lookup[int(fp_start)],
+                                        point_lookup[int(fp_end)],
+                                    ]
+                                )
+                            )
+                            continue
+                        native_start, native_end = selected_face_points[row_index]
+                        perimeter_start, perimeter_count = perimeter_ranges[row_index]
+                        intermediate = [
+                            perimeter_lookup[value_id]
+                            for value_id in range(
+                                int(perimeter_start),
+                                int(perimeter_start + perimeter_count),
+                            )
+                        ]
+                        if fp_start == native_start and fp_end == native_end:
+                            ordered_intermediate = intermediate
+                        elif fp_start == native_end and fp_end == native_start:
+                            ordered_intermediate = list(reversed(intermediate))
+                        else:  # Defensive; the unordered equality check above should catch this.
+                            raise ValueError(
+                                f"Cannot orient native face {face_ids[row_index]} in mesh "
+                                f"{mesh_name!r} from its external-face point IDs"
+                            )
+                        selected_geometries.append(
+                            shapely_geometry.LineString(
+                                [
+                                    point_lookup[int(fp_start)],
+                                    *ordered_intermediate,
+                                    point_lookup[int(fp_end)],
+                                ]
+                            )
+                        )
+                    geometries.loc[mesh_rows.index] = selected_geometries
+
+                result = gpd.GeoDataFrame(
+                    result,
+                    geometry=geometries,
+                    crs=HdfBase.get_projection(hdf_file),
+                )
+                geometry_source = "+".join(sorted(geometry_sources))
+            result.attrs.update(
+                {
+                    "association_status": "present",
+                    "dataset_present": True,
+                    "authoritative": True,
+                    "source_dataset": HdfBndry._BC_EXTERNAL_FACES_PATH,
+                    "attributes_dataset": HdfBndry._BC_ATTRIBUTES_PATH,
+                    "face_count": len(result),
+                    "unique_face_count": len(
+                        result[ownership_columns].drop_duplicates()
+                    ),
+                    "face_ownership_unique": len(duplicate_keys) == 0,
+                    "duplicate_face_count": len(duplicate_keys),
+                    "duplicate_face_row_count": int(duplicate_ownership.sum()),
+                    "geometry_source": geometry_source,
+                    "curved_face_count": curved_face_count,
+                    "perimeter_value_count": perimeter_value_count,
+                    "topology_match_count": topology_match_count,
+                    "topology_mismatch_count": topology_mismatch_count,
+                }
+            )
+            if on_duplicate_ownership == "report":
+                HdfBndry._report_bc_face_ownership(result)
+            return result
+
     @staticmethod
     @standardize_input(file_type='plan_hdf')
     def get_bc_lines(hdf_path: Path) -> gpd.GeoDataFrame:
@@ -87,7 +743,7 @@ class HdfBndry:
                 geoms = HdfBase.get_polylines_from_parts(hdf_path, bc_lines_path)
                 
                 # Get attributes
-                attributes = pd.DataFrame(bc_line_data["Attributes"][()])
+                attributes = pd.DataFrame(read_typed(bc_line_data["Attributes"]))
                 
                 # Convert string columns
                 str_columns = ['Name', 'SA-2D', 'Type']
@@ -109,23 +765,29 @@ class HdfBndry:
                 return gdf
 
         except Exception as e:
+            reraise_required(e)
             logger.error(
                 "Error reading boundary condition lines from %s (%s): %s",
                 hdf_path,
                 bc_lines_path,
                 str(e),
             )
-            return gpd.GeoDataFrame()
+            # An absent group returns an empty frame above; a group that exists
+            # but cannot be read is an error, not "no boundary condition lines".
+            raise ValueError(
+                f"Failed to read boundary condition lines from {hdf_path} ({bc_lines_path}): {e}"
+            ) from e
 
     @staticmethod
+    @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_breaklines(hdf_path: Path) -> gpd.GeoDataFrame:
+    def get_breaklines(hdf_path: Union[Path, str]) -> gpd.GeoDataFrame:
         """
         Return 2D mesh area breaklines.
 
         Parameters
         ----------
-        hdf_path : Path
+        hdf_path : Path or str
             Path to the HEC-RAS geometry HDF file.
 
         Returns
@@ -135,9 +797,17 @@ class HdfBndry:
 
         Notes
         -----
-        - Zero-length breaklines are logged and skipped. 
-        - Single-point breaklines are logged and skipped.
-        - These invalid breaklines should be removed in RASMapper to prevent potential issues.
+        Read-only: coordinates retain the source CRS and horizontal units.
+        Missing layers return an empty frame. Records with zero or one point
+        are skipped and retained in ``result.attrs["breakline_diagnostics"]``
+        (an empty list when none are skipped), including all-degenerate layers.
+        Each diagnostic contains the zero-based native ``bl_id``, ``Name``,
+        decoded source ``attributes``, ``point_start``, ``point_count``,
+        exclusive ``point_end``, ``part_start``, ``part_count``, and
+        ``reason_code="BREAKLINE_TOO_FEW_POINTS"``. Persist these attrs explicitly
+        when writing artifacts; tabular writers may not retain them.
+        Negative, out-of-range or truncated spans and read errors remain hard
+        errors; no partial layer is returned for corrupted source records.
         """
         breaklines_path = "Geometry/2D Flow Area Break Lines"
         try:
@@ -148,114 +818,146 @@ class HdfBndry:
                         breaklines_path,
                         hdf_path.name,
                     )
-                    return gpd.GeoDataFrame()
+                    result = gpd.GeoDataFrame()
+                    result.attrs["breakline_diagnostics"] = []
+                    return result
 
                 bl_line_data = hdf_file[breaklines_path]
-                attributes = bl_line_data["Attributes"][()]
-                
+                attributes = read_typed(bl_line_data["Attributes"])
+                source_points = read_typed(bl_line_data["Polyline Points"])
+                diagnostics = []
+
                 # Initialize lists to store valid breakline data
                 valid_ids = []
                 valid_names = []
+                valid_spacing_near = []
+                valid_spacing_far = []
+                valid_near_repeats = []
+                valid_protection_radius = []
                 valid_geoms = []
 
-                # Track invalid breaklines for summary
-                zero_length_count = 0
-                single_point_count = 0
-                other_error_count = 0
-
                 # Process each breakline
-                for idx, (pnt_start, pnt_cnt, part_start, part_cnt) in enumerate(bl_line_data["Polyline Info"][()]):
+                for idx, (pnt_start, pnt_cnt, part_start, part_cnt) in enumerate(read_typed(bl_line_data["Polyline Info"])):
                     name = HdfUtils.convert_ras_string(attributes["Name"][idx])
 
-                    # Check for zero-length breaklines
-                    if pnt_cnt == 0:
-                        zero_length_count += 1
-                        logger.debug(f"Zero-length breakline found (FID: {idx}, Name: {name})")
+                    # Validate the native span before tolerating a degenerate
+                    # feature. Zero points at the end of the array is valid.
+                    if pnt_start < 0 or pnt_cnt < 0 or pnt_start > len(source_points):
+                        raise ValueError(f"Invalid point range for breakline {idx} ({name})")
+                    if pnt_start + pnt_cnt > len(source_points):
+                        raise ValueError(f"Truncated points for breakline {idx} ({name})")
+                    if part_start < 0 or part_cnt < 1:
+                        raise ValueError(f"Invalid parts for breakline {idx} ({name})")
+                    if "Polyline Parts" in bl_line_data:
+                        if part_start + part_cnt > len(bl_line_data["Polyline Parts"]):
+                            raise ValueError(f"Truncated parts for breakline {idx} ({name})")
+                    elif part_cnt != 1:
+                        raise ValueError(f"Missing parts for breakline {idx} ({name})")
+                    if pnt_cnt < 2:
+                        source_attributes = {}
+                        for field in attributes.dtype.names or ():
+                            value = attributes[field][idx]
+                            if isinstance(value, (bytes, str, np.bytes_)):
+                                value = HdfUtils.convert_ras_string(value)
+                            elif isinstance(value, np.generic):
+                                value = value.item()
+                            elif isinstance(value, np.ndarray):
+                                value = value.tolist()
+                            source_attributes[field] = value
+                        diagnostics.append({
+                            "bl_id": idx,
+                            "Name": name,
+                            "attributes": source_attributes,
+                            "point_start": int(pnt_start),
+                            "point_count": int(pnt_cnt),
+                            "point_end": int(pnt_start + pnt_cnt),
+                            "part_start": int(part_start),
+                            "part_count": int(part_cnt),
+                            "reason_code": "BREAKLINE_TOO_FEW_POINTS",
+                        })
+                        logger.warning("Skipping breakline %s (%s): %s points", idx, name, pnt_cnt)
                         continue
 
-                    # Check for single-point breaklines
-                    if pnt_cnt == 1:
-                        single_point_count += 1
-                        logger.debug(f"Single-point breakline found (FID: {idx}, Name: {name})")
-                        continue
-
-                    try:
-                        points = bl_line_data["Polyline Points"][()][pnt_start:pnt_start + pnt_cnt]
-                        
-                        # Additional validation of points array
-                        if len(points) < 2:
-                            single_point_count += 1
-                            logger.debug(f"Invalid point count in breakline (FID: {idx}, Name: {name})")
-                            continue
-
-                        if part_cnt == 1:
-                            geom = LineString(points)
-                        else:
-                            parts = bl_line_data["Polyline Parts"][()][part_start:part_start + part_cnt]
-                            geom = MultiLineString([
-                                points[part_pnt_start:part_pnt_start + part_pnt_cnt]
-                                for part_pnt_start, part_pnt_cnt in parts
-                                if part_pnt_cnt > 1  # Skip single-point parts
-                            ])
-                            # Skip if no valid parts remain
-                            if len(geom.geoms) == 0:
-                                other_error_count += 1
-                                logger.debug(f"No valid parts in multipart breakline (FID: {idx}, Name: {name})")
-                                continue
-
-                        valid_ids.append(idx)
-                        valid_names.append(name)
-                        valid_geoms.append(geom)
-
-                    except Exception as e:
-                        other_error_count += 1
-                        logger.debug(f"Error processing breakline {idx}: {str(e)}")
-                        continue
-
-                # Log summary of invalid breaklines
-                total_invalid = zero_length_count + single_point_count + other_error_count
-                if total_invalid > 0:
-                    logger.debug(
-                        f"Breakline processing summary:\n"
-                        f"- Zero-length breaklines: {zero_length_count}\n"
-                        f"- Single-point breaklines: {single_point_count}\n"
-                        f"- Other invalid breaklines: {other_error_count}\n"
-                        f"Consider removing these invalid breaklines using RASMapper."
+                    points = HdfBase.plan_vertex_ordinates(
+                        source_points[pnt_start:pnt_start + pnt_cnt]
                     )
+
+                    if len(points) != pnt_cnt:
+                        raise ValueError(f"Truncated points for breakline {idx} ({name})")
+
+                    if part_cnt == 1:
+                        geom = shapely_geometry.LineString(points)
+                    else:
+                        parts = read_typed(bl_line_data["Polyline Parts"])[part_start:part_start + part_cnt]
+                        if part_start < 0 or part_cnt < 1 or len(parts) != part_cnt:
+                            raise ValueError(f"Invalid parts for breakline {idx} ({name})")
+                        lines = []
+                        for offset, count in parts:
+                            line = points[offset:offset + count]
+                            if offset < 0 or count < 2 or len(line) != count:
+                                raise ValueError(f"Invalid part for breakline {idx} ({name})")
+                            lines.append(line)
+                        geom = shapely_geometry.MultiLineString(lines)
+
+                    valid_ids.append(idx)
+                    valid_names.append(name)
+                    fields = attributes.dtype.names or ()
+                    valid_spacing_near.append(
+                        float(attributes["Cell Spacing Near"][idx])
+                        if "Cell Spacing Near" in fields
+                        else None
+                    )
+                    valid_spacing_far.append(
+                        float(attributes["Cell Spacing Far"][idx])
+                        if "Cell Spacing Far" in fields
+                        else None
+                    )
+                    valid_near_repeats.append(
+                        int(attributes["Near Repeats"][idx])
+                        if "Near Repeats" in fields
+                        else 0
+                    )
+                    valid_protection_radius.append(
+                        int(attributes["Protection Radius"][idx])
+                        if "Protection Radius" in fields
+                        else 0
+                    )
+                    valid_geoms.append(geom)
 
                 # Create GeoDataFrame with valid breaklines
                 if not valid_ids:
-                    logger.warning(
-                        "No valid breaklines found in %s; skipped %d invalid "
-                        "breaklines (zero_length=%d, single_point=%d, other=%d).",
-                        hdf_path.name,
-                        total_invalid,
-                        zero_length_count,
-                        single_point_count,
-                        other_error_count,
-                    )
-                    return gpd.GeoDataFrame()
+                    result = gpd.GeoDataFrame()
+                    result.attrs["breakline_diagnostics"] = diagnostics
+                    return result
 
-                return gpd.GeoDataFrame(
+                result = gpd.GeoDataFrame(
                     {
                         "bl_id": valid_ids,
                         "Name": valid_names,
+                        "cell_spacing_near": valid_spacing_near,
+                        "cell_spacing_far": valid_spacing_far,
+                        "near_repeats": valid_near_repeats,
+                        "protection_radius": valid_protection_radius,
                         "geometry": valid_geoms
                     },
                     geometry="geometry",
                     crs=HdfBase.get_projection(hdf_file)
                 )
+                result.attrs["breakline_diagnostics"] = diagnostics
+                return result
 
         except Exception as e:
+            reraise_required(e)
             logger.error(
                 "Error reading breaklines from %s (%s): %s",
                 hdf_path,
                 breaklines_path,
                 str(e),
             )
-            return gpd.GeoDataFrame()
+            raise
 
     @staticmethod
+    @log_call
     @standardize_input(file_type='plan_hdf')
     def get_refinement_regions(hdf_path: Path) -> gpd.GeoDataFrame:
         """
@@ -269,7 +971,15 @@ class HdfBndry:
         Returns
         -------
         gpd.GeoDataFrame
-            A GeoDataFrame containing the refinement regions.
+            A GeoDataFrame containing the refinement regions. Missing layers
+            return an empty frame; malformed present layers raise an exception.
+
+        Notes
+        -----
+        Multipart ``Polygon Parts`` offsets are relative to each feature's
+        point slice, as HEC-RAS writes them. Legacy global offsets are
+        accepted only when all of the feature's parts together cover its
+        point slice exactly; otherwise out-of-range parts raise.
         """
         refinement_regions_path = "/Geometry/2D Flow Area Refinement Regions"
         try:
@@ -282,36 +992,62 @@ class HdfBndry:
                     )
                     return gpd.GeoDataFrame()
                 rr_data = hdf_file[refinement_regions_path]
-                rr_ids = range(rr_data["Attributes"][()].shape[0])
-                names = np.vectorize(HdfUtils.convert_ras_string)(rr_data["Attributes"][()]["Name"])
+                attributes = read_typed(rr_data["Attributes"])
+                rr_ids = range(len(attributes))
+                names = [HdfUtils.convert_ras_string(name) for name in attributes["Name"]]
+                polygon_points = read_typed(rr_data["Polygon Points"])
+                polygon_parts = read_typed(rr_data["Polygon Parts"]) if "Polygon Parts" in rr_data else None
                 geoms = list()
-                for pnt_start, pnt_cnt, part_start, part_cnt in rr_data["Polygon Info"][()]:
-                    points = rr_data["Polygon Points"][()][pnt_start : pnt_start + pnt_cnt]
-                    if part_cnt == 1:
-                        geoms.append(Polygon(points))
+                for pnt_start, pnt_cnt, part_start, part_cnt in read_typed(rr_data["Polygon Info"]):
+                    try:
+                        pnt_start, pnt_cnt = map(_nonnegative_index, (pnt_start, pnt_cnt))
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid refinement region point range: {exc}") from exc
+                    points = HdfBase.plan_vertex_ordinates(
+                        polygon_points[pnt_start : pnt_start + pnt_cnt]
+                    )
+                    if pnt_start < 0 or pnt_cnt < 3 or len(points) != pnt_cnt:
+                        raise ValueError("Invalid refinement region point range")
+                    try:
+                        part_start, part_cnt = map(_nonnegative_index, (part_start, part_cnt))
+                        if part_cnt == 0:
+                            raise ValueError("Nonempty refinement region has no parts")
+                        part_ranges = None
+                        if polygon_parts is not None:
+                            if part_start > len(polygon_parts) or part_cnt > len(polygon_parts) - part_start:
+                                raise ValueError("Parts slice is out of bounds")
+                            parts = polygon_parts[part_start:part_start + part_cnt]
+                            part_ranges = resolve_feature_part_ranges(parts, pnt_start, pnt_cnt)
+                            if any(count < 3 for _, count in part_ranges):
+                                raise ValueError("Polygon part requires at least three points")
+                        elif part_cnt > 1:
+                            raise ValueError("Multipart refinement region is missing Polygon Parts")
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid refinement region polygon part: {exc}") from exc
+                    if part_cnt <= 1:
+                        geoms.append(shapely_geometry.Polygon(points))
                     else:
-                        parts = rr_data["Polygon Parts"][()][part_start : part_start + part_cnt]
-                        geoms.append(
-                            MultiPolygon(
-                                list(
-                                    points[part_pnt_start : part_pnt_start + part_pnt_cnt]
-                                    for part_pnt_start, part_pnt_cnt in parts
-                                )
-                            )
-                        )
+                        polygons = []
+                        for offset, part_pnt_cnt in part_ranges:
+                            ring = points[offset : offset + part_pnt_cnt]
+                            if len(ring) != part_pnt_cnt or len(ring) < 3:
+                                raise ValueError("Invalid refinement region polygon part")
+                            polygons.append(shapely_geometry.Polygon(ring))
+                        geoms.append(_assemble_polygon_rings(polygons))
                 return gpd.GeoDataFrame(
                     {"rr_id": rr_ids, "Name": names, "geometry": geoms},
                     geometry="geometry",
                     crs=HdfBase.get_projection(hdf_file),
                 )
         except Exception as e:
+            reraise_required(e)
             logger.error(
                 "Error reading refinement regions from %s (%s): %s",
                 hdf_path,
                 refinement_regions_path,
                 str(e),
             )
-            return gpd.GeoDataFrame()
+            raise
 
     @staticmethod
     @standardize_input(file_type='plan_hdf')
@@ -344,7 +1080,7 @@ class HdfBndry:
                     )
                     return gpd.GeoDataFrame()
                 
-                attributes = hdf_file[attributes_path][()]
+                attributes = read_typed(hdf_file[attributes_path])
                 refline_ids = range(attributes.shape[0])
                 v_conv_str = np.vectorize(HdfUtils.convert_ras_string)
                 names = v_conv_str(attributes["Name"])
@@ -382,13 +1118,18 @@ class HdfBndry:
                 return gdf
                 
         except Exception as e:
+            reraise_required(e)
             logger.error(
                 "Error reading reference lines from %s (%s): %s",
                 hdf_path,
                 reference_lines_path,
                 str(e),
             )
-            return gpd.GeoDataFrame()
+            # An absent group returns an empty frame above; a group that exists
+            # but cannot be read is an error, not "no reference lines".
+            raise ValueError(
+                f"Failed to read reference lines from {hdf_path} ({reference_lines_path}): {e}"
+            ) from e
 
     @staticmethod
     @standardize_input(file_type='plan_hdf')
@@ -422,12 +1163,12 @@ class HdfBndry:
                     return gpd.GeoDataFrame()
                 
                 ref_points_group = hdf_file[reference_points_path]
-                attributes = ref_points_group["Attributes"][:]
+                attributes = read_typed(ref_points_group["Attributes"], slice(None))
                 v_conv_str = np.vectorize(HdfUtils.convert_ras_string)
                 names = v_conv_str(attributes["Name"])
                 mesh_names = v_conv_str(attributes["SA/2D"])
                 cell_id = attributes["Cell Index"]
-                points = ref_points_group["Points"][()]
+                points = read_typed(ref_points_group["Points"])
                 
                 gdf = gpd.GeoDataFrame(
                     {
@@ -435,7 +1176,7 @@ class HdfBndry:
                         "Name": names,
                         "mesh_name": mesh_names,
                         "Cell Index": cell_id,
-                        "geometry": list(map(Point, points)),
+                        "geometry": list(map(shapely_geometry.Point, points)),
                     },
                     geometry="geometry",
                     crs=HdfBase.get_projection(hdf_file),
@@ -448,12 +1189,17 @@ class HdfBndry:
                 return gdf
                 
         except Exception as e:
+            reraise_required(e)
             logger.error(
                 "Error reading reference points from %s (%s): %s",
                 hdf_path,
                 reference_points_path,
                 str(e),
             )
-            return gpd.GeoDataFrame()
+            # An absent group returns an empty frame above; a group that exists
+            # but cannot be read is an error, not "no reference points".
+            raise ValueError(
+                f"Failed to read reference points from {hdf_path} ({reference_points_path}): {e}"
+            ) from e
 
     

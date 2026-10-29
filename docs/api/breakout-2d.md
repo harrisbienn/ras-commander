@@ -1,0 +1,266 @@
+# 2D Breakout Geometry Preparation
+
+`RasBreakout2D` prepares the geometry and project associations for a contained
+breakout of an existing pure-2D, unsteady HEC-RAS model. The API separates the
+repeatable geometry work from unresolved hydraulic boundary-condition design.
+
+The preparation workflow does **not** compute a plan or author a breakout
+boundary condition. It inventories the source boundaries, copies the complete
+unsteady file byte-for-byte, and returns parent-face flux evidence for later
+engineering review.
+
+## Qualify the proposed child domain
+
+```python
+from pathlib import Path
+
+from ras_commander import Breakout2DSpec, RasBreakout2D, RasPrj, init_ras_project
+
+source_ras = RasPrj()
+init_ras_project(
+    Path(r"D:\models\UPGU3"),
+    "6.6",
+    ras_object=source_ras,
+    load_results_summary=False,
+)
+
+spec = Breakout2DSpec(
+    source_plan="08",
+    source_2d_area="UPGU3_2DArea",
+    child_boundary=Path("huc12_121002010305.geojson"),
+    breakout_id="HUC12-121002010305",
+)
+preflight = RasBreakout2D.preflight(spec, ras_object=source_ras)
+preflight.checks
+preflight.feature_actions
+preflight.existing_boundaries
+```
+
+`preflight()` fails closed unless the selected plan is unsteady and pure 2D,
+the source geometry contains exactly one 2D flow area, the named area is
+unique, the child polygon is valid and contained by the
+parent, and no unsupported structure or reference-point edit is required.
+
+SA/2D connections now receive complete-footprint `keep`, `drop` or `block`
+decisions in `feature_actions`. A fully contained internal connection can remain
+in the child, including a control whose From and To are the same retained area.
+Fully external controls are individually reported before removal. Partial or
+unknown physical support still blocks preparation. The single-area breakout
+scope remains unchanged; this is not a multi-area seam authoring workflow.
+
+The default blocks gates and undecoded support records. Set
+`Breakout2DSpec(allow_extended_connection_support=True, ...)` to opt in to
+verified gate opening GIS support, cell-size metadata and the additional empty
+bridge template recognized by `GeomLateral.classify_connections()`. Preflight
+and clone rechecks use the same choice; unrelated callers retain their defaults.
+`feature_actions.gate_group_count` records verified gate groups and is zero for
+other features. This opt-in does not establish native attachment or hydraulic
+acceptance.
+
+Preparation rechecks the approved decisions against the clone, requires fresh
+native HDF refresh for connection edits, and compares the exact retained records
+before and after geometry preparation. `prepared.connection_attachments` reports
+native evidence separately. Rows without both named-end cell/face evidence carry
+`CONNECTION_ATTACHMENT_UNVERIFIED`; successful text retention or preprocessing
+alone cannot establish control qualification.
+
+It classifies child-perimeter segments as inherited parent perimeter or artificial
+cuts. Breaklines, reference lines, and refinement regions are classified as
+keep, clip, or drop against a one-base-cell inward trim plus a small numeric
+round-trip guard. Existing geometry BC lines and unsteady boundary records are
+classified as `preserve`.
+
+For a child that straddles adjacent parents, declare each additional parent's
+geometry HDF in `Breakout2DSpec(contributing_geometry_hdfs=("Adjacent.g01.hdf",))`.
+The default is `()`; relative paths resolve from the caller's current directory.
+Preflight reads their complete native perimeters and checks containment against
+their union with the owner. Each contributor must have exactly one 2D flow area,
+a valid nonempty polygon and the owner's CRS. Contributor paths must end in
+`.gNN.hdf`; `.pNN.hdf` paths are rejected before reading. The manifest records
+each contributor path and SHA-256 captured while reading its perimeter.
+
+This changes only `child_within_parent` to `child_within_parent_union` for that
+preflight. All other checks, owner base spacing, feature actions and perimeter
+segment classification retain their single-parent behavior. The clone still
+contains one 2D flow area. The caller must independently qualify every contributor
+and import its terrain, roughness, features and forcing before remeshing or
+accepting a union child. Passing union containment alone qualifies no combined
+hydraulic model.
+
+## Clone associations and prepare geometry
+
+Initialize a separate, disposable project copy before calling the mutation
+methods:
+
+```python
+working_ras = RasPrj()
+init_ras_project(
+    Path(r"D:\working\UPGU3_breakout"),
+    "6.6",
+    ras_object=working_ras,
+    load_results_summary=False,
+)
+
+clone = RasBreakout2D.clone_plan_components(
+    preflight,
+    ras_object=working_ras,
+    plan_title="HUC12 breakout geometry prep",
+    plan_short_id="HUC12_PREP",
+    geometry_title="HUC12 breakout geometry",
+)
+
+prepared = RasBreakout2D.prepare_cloned_geometry(
+    preflight,
+    clone,
+    ras_object=working_ras,
+    refresh_hdf=True,
+    remesh=True,
+    compute_property_tables=False,
+    timeout=1200,
+)
+
+assert clone.boundaries_unchanged
+assert prepared.boundaries_unchanged
+```
+
+For a cookie-cut bootstrap, pass the parent's selected physical cell centres as
+`computation_points` (an N-by-2 XY array in the geometry's CRS and horizontal
+units). Use `refresh_hdf=True`, `refresh_method="rasexe"`, `remesh=False` and
+`anchor_grid_to_parent=False` together. Preparation writes that set through
+`GeomMesh.write_computation_points` instead of generating a regular grid. It
+returns the text-writing result in `prepared.computation_points_result` and
+then runs the normal native geometry preprocessor. No seeds are added, removed
+or snapped; native fixed-width text serialization still applies. Every supplied
+point must be unique, finite and strictly inside the child perimeter.
+The native text round trip must preserve uniqueness and strict containment too;
+field overflow is rejected. The writer preserves numbered `.bak` files and
+atomically replaces the owned geometry text after all checks pass.
+
+This is an explicit-point authoring primitive, not a claim of exact parent
+mesh reproduction. After compilation, the caller must check cell count, centre
+mapping, boundary faces and property tables. Native failure requires an explicit
+repair plan; the API does not silently generate a replacement point set. No
+hydraulic simulation is launched by preparation.
+
+The clone operation creates new geometry, unsteady, and plan files; associates
+the cloned plan with the new `g##` and `u##`; makes that plan current; and
+registers the cloned geometry as a RASMapper geometry layer. It verifies both
+plan associations by readback and proves the complete unsteady clone is
+byte-identical with SHA-256. Before cloning, it also requires a separate
+working project and verifies the working plan, geometry text, geometry HDF, and
+unsteady source files against the qualified source with SHA-256.
+
+Geometry preparation edits only the cloned geometry. It replaces the 2D
+perimeter, trims mesh-owned features, performs the exact text-to-HDF refresh,
+replaces refinement regions, regenerates computation cells, and audits domain
+containment. The exact import transaction also protects and restores every
+non-target geometry HDF because RASMapper can update older registered
+geometries while opening a project. HEC-RAS may be opened for the exact
+geometry import, but the hydraulic solver is never invoked. Install the
+declared `gui` and `mesh` optional dependency groups when enabling the exact
+refresh and remesh steps.
+
+For headless refresh, set `refresh_method="rasexe"` and
+`require_complete_products=True` to require qualified geometry completion.
+The latter defaults to False for upstream compatibility and propagates to the
+initial preprocessor call, numeric-repair retry, and mesh-repair preprocessing.
+These completion checks do not establish hydraulic acceptance.
+
+## Review parent-face flux locations
+
+```python
+flux = RasBreakout2D.review_parent_boundary_flux(
+    preflight,
+    minimum_peak_flow=100.0,
+    minimum_volume_fraction=0.0001,
+)
+
+flux.faces       # every reviewed parent face and significance metrics
+flux.zones       # adjacent, same-direction candidate locations
+flux.face_flow_outward  # positive leaves the child; negative enters it
+```
+
+The review prefers stored parent Face Flow. When native Face Flow is
+unavailable, it derives normal flow from face-normal velocity and the
+face-area-versus-stage relationship. The result orients every series outward
+from the proposed child and groups adjacent significant faces that share the
+same dominant direction. A zone is review evidence only: it has no assigned
+HEC-RAS boundary type and does not modify a geometry or unsteady file.
+
+## Upper Guadalupe 3 qualification
+
+The example notebook
+[`959_ebfe_2d_breakout_geometry_preparation.ipynb`](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/959_ebfe_2d_breakout_geometry_preparation.ipynb)
+uses plan 08 and HUC12 `121002010305` as a real-data qualification case. The
+read-only preflight identified a 200-foot base cell, a contained 24.73-square-
+mile child polygon, and 1,701 reviewed feature actions:
+
+| Feature | Action | Count |
+| --- | --- | ---: |
+| Geometry BC lines | preserve | 4 |
+| Unsteady boundary records | preserve | 4 |
+| Breaklines | keep / clip / drop | 132 / 10 / 1,534 |
+| Reference lines | keep / clip / drop | 1 / 1 / 13 |
+| 2D mesh area | replace | 1 |
+| Refinement regions | drop | 1 |
+
+The existing `u01` inventory contains `Inflow_from_UPGU2` (Flow Hydrograph),
+`Outflow_to_UPGU4` (Normal Depth), `BC_1` (Normal Depth), and `BC_2` (Normal
+Depth). Those records are parent-model inputs. Preserving them proves source
+fidelity; it does not make them suitable for the breakout.
+
+At the demonstration thresholds above, the already-computed parent result
+yielded 1,051 child-partition faces, 51 significant faces, and 22 combined
+same-direction candidate zones. No boundary condition was created or changed,
+and no hydraulic plan was rerun.
+
+For rapid visual review, the notebook also shades the full parent with the
+terrain-derived minimum elevation at each parent mesh cell, outlines a
+review-scale p08 maximum-inundation boundary derived from wet parent cell
+centers (`maximum depth > 0.1 ft`), and provides overall and detail maps of
+candidate flux zones with outward-direction arrows. These are review figures
+derived from existing HDF data, not new model results.
+
+## Next steps: author and validate boundary conditions
+
+`RasBreakout2D` deliberately stops at geometry preparation; it does not infer
+hydraulic forcing from parent face flow. The executed Austin Bayou SH 35
+[example notebook](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/959_ebfe_2d_breakout_geometry_preparation.ipynb)
+continues from a reviewed compact child and demonstrates the separate APIs for
+resetting its two geometry-backed boundary locations, writing a wide external
+flow boundary, auditing native external-face ownership, and classifying
+intersecting NextGen flowpaths. It explicitly selects a 1.5-mile reach from
+the longer NextGen edge, derives a minimum domain envelope from connected wet
+parent-result samples and a flat-ended reach corridor, and proves that the
+implemented 2D domain contains both the complete selected reach and that
+hydraulic evidence envelope. It then sums parent face flux at both child
+cuts, derives an upstream flow envelope and preliminary downstream stage-flow
+relationship, creates and computes one plan per 1,000-cfs ladder step, and
+retains a comparable maximum-inundation map for every result. Each 48-hour
+plan ramps to its target in four hours and holds a 44-hour plateau. The
+notebook maps the selected parent faces with peak face-flux magnitude and
+direction arrows, plots the imposed hydrographs, and reports final 12-hour
+water-surface stability diagnostics with the computation summary.
+
+That reviewed downstream workflow must:
+
+1. decide which artificial-cut candidate zones need hydraulic forcing;
+2. select the appropriate type for each location without inferring it solely
+   from the direction or magnitude of parent Face Flow;
+3. source and time-align any parent flow or stage series;
+4. offset and trim geometry BC lines so adjacent records cannot bind the same
+   face; and
+5. run and validate the breakout against the parent using a common terrain and
+   aligned raster products where the meshes differ.
+
+::: ras_commander.RasBreakout2D.RasBreakout2D
+    options:
+      show_source: false
+      members:
+        - normalize_child_boundary
+        - classify_boundary_segments
+        - preflight
+        - clone_plan_components
+        - prepare_cloned_geometry
+        - select_parent_boundary_faces
+        - review_parent_boundary_flux

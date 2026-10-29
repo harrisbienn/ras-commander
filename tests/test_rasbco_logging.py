@@ -1,4 +1,5 @@
 import logging
+import importlib
 from pathlib import Path
 
 from ras_commander.RasBco import BcoMonitor
@@ -104,6 +105,43 @@ def test_monitor_timeout_warning_has_signal_and_debug_path(tmp_path, caplog):
     assert str(tmp_path / "TestProject.bco07") in debug_text
 
 
+def test_monitor_timeout_uses_monotonic_deadline_and_bounds_final_sleep(
+    tmp_path,
+    monkeypatch,
+):
+    rasbco_module = importlib.import_module("ras_commander.RasBco")
+    clock = {"monotonic": 100.0, "wall": 1_000.0}
+    sleeps = []
+
+    monkeypatch.setattr(
+        rasbco_module.time,
+        "monotonic",
+        lambda: clock["monotonic"],
+    )
+    monkeypatch.setattr(
+        rasbco_module.time,
+        "time",
+        lambda: clock["wall"],
+    )
+
+    def oversleep(seconds):
+        sleeps.append(seconds)
+        clock["monotonic"] += seconds + 5.0
+        clock["wall"] -= 3_600.0
+
+    monkeypatch.setattr(rasbco_module.time, "sleep", oversleep)
+    monitor = BcoMonitor(
+        project_path=tmp_path,
+        plan_number="07",
+        project_name="TestProject",
+        check_interval=10.0,
+        max_wait_seconds=2.0,
+    )
+
+    assert not monitor.monitor_until_signal(_FakeProcess(returncode=None))
+    assert sleeps == [2.0]
+
+
 def test_callback_error_warns_once_then_debugs_repeats(tmp_path, caplog):
     bco_file = tmp_path / "TestProject.bco07"
     bco_file.write_text("first\nsecond\n", encoding="utf-8")
@@ -125,3 +163,30 @@ def test_callback_error_warns_once_then_debugs_repeats(tmp_path, caplog):
     ]
     assert "Repeated callback error while monitoring" in debug_text
     assert str(bco_file) in debug_text
+
+
+def test_monitor_accepts_job_scoped_alternate_signal(tmp_path):
+    monitor = BcoMonitor(
+        project_path=tmp_path,
+        plan_number="07",
+        project_name="TestProject",
+        alternate_signal_condition=lambda: True,
+        alternate_signal_description="owned RasUnsteady.exe startup",
+    )
+
+    assert monitor.monitor_until_signal(_FakeProcess(returncode=None))
+    assert monitor.signal_source == "alternate"
+    assert monitor.blocked_reason is None
+
+
+def test_monitor_stops_on_blocking_condition(tmp_path):
+    monitor = BcoMonitor(
+        project_path=tmp_path,
+        plan_number="07",
+        project_name="TestProject",
+        blocking_condition=lambda: "legal dialog requires review",
+    )
+
+    assert not monitor.monitor_until_signal(_FakeProcess(returncode=None))
+    assert monitor.blocked_reason == "legal dialog requires review"
+    assert monitor.signal_source is None

@@ -11,20 +11,68 @@ This file is the canonical local instruction file for the `ras_commander/` packa
 ## Core Module Groups
 
 - Project management: `RasPrj`, `init_ras_project()`
+- Network conflation: `RasNetworkConflation`, `NetworkConflationResult`, and `NetworkAdapter` are the generic network-to-RAS API; keep NWM/NextGen behavior in their adapters rather than the core workflow.
 - Plan execution: `RasCmdr`
-- Plan and model files: `RasPlan`, `RasMap`, `RasControl`, `RasUnsteady` (includes BC CRUD: `delete_boundary()`; IC method selection: `get_initial_flow_method()`, `set_initial_flow_method()`, `get_prior_ws_filename()`, `set_prior_ws_filename()`; IC table: `get_initial_conditions()`, `set_initial_conditions()`, `validate_initial_flow_stations()`; Storage Area IC: `get_initial_storage_elevations()`, `set_initial_storage_elevation()`, `get_min_storage_elevations()`; IC from Output: `set_ic_from_output_profile()`; Non-Newtonian: `get_non_newtonian_method()`, `set_non_newtonian_method()`, `get_non_newtonian_concentration()`, `set_non_newtonian_concentration()`, `get_non_newtonian_shear()`, `set_non_newtonian_shear()`, `get_non_newtonian_herschel_bulkley()`, `set_non_newtonian_herschel_bulkley()`, `get_non_newtonian_clastic()`, `set_non_newtonian_clastic()`; Gate Openings: `get_gate_openings()`, `set_gate_openings()`; Groundwater Interflow: `get_groundwater_interflow()`, `set_groundwater_interflow()`; Navigation Dam: `get_navigation_dam()`, `set_navigation_dam()`; Rule Operations: `get_rules_bc()`, `set_rules_bc()`; Sediment Output: `get_sediment_output_variables()`, `set_sediment_output_variables()` — request optional per-cell 2D sediment outputs such as active-layer gradation, read back via `HdfResultsSediment`)
+- Plan and model files: `RasPlan`, `RasMap`, `RasControl` (legacy COM execution, including exact Controller identity, blocking batch compute, and owned-process cleanup), `RasUnsteady` (includes BC CRUD: `delete_boundary()`; IC method selection: `get_initial_flow_method()`, `set_initial_flow_method()`, `get_prior_ws_filename()`, `set_prior_ws_filename()`; IC table: `get_initial_conditions()`, `set_initial_conditions()`, `validate_initial_flow_stations()`; Storage Area IC: `get_initial_storage_elevations()`, `set_initial_storage_elevation()`, `get_min_storage_elevations()`; IC from Output: `set_ic_from_output_profile()`; Non-Newtonian: `get_non_newtonian_method()`, `set_non_newtonian_method()`, `get_non_newtonian_concentration()`, `set_non_newtonian_concentration()`, `get_non_newtonian_shear()`, `set_non_newtonian_shear()`, `get_non_newtonian_herschel_bulkley()`, `set_non_newtonian_herschel_bulkley()`, `get_non_newtonian_clastic()`, `set_non_newtonian_clastic()`; Gate Openings: `get_gate_openings()`, `set_gate_openings()`; Groundwater Interflow: `get_groundwater_interflow()`, `set_groundwater_interflow()`; Navigation Dam: `get_navigation_dam()`, `set_navigation_dam()`; Rule Operations: `get_rules_bc()`, `set_rules_bc()`; Sediment Output: `get_sediment_output_variables()`, `set_sediment_output_variables()` — request optional per-cell 2D sediment outputs such as active-layer gradation, read back via `HdfResultsSediment`)
 - Validation framework: `RasValidation`
 - Uncertainty / ensembles: `RasPermutation` (parameter sweeps; `execute_and_summarize(workers=)` for distributed execution) and `RasMonteCarlo` (Monte Carlo uncertainty: `generate_samples()` LHS/truncnorm with a single threaded `default_rng`; `run_ensemble(workers=)` distributes plans across a remote fleet when workers are provided, falls back to local `compute_parallel()` otherwise; returns a `status_histogram` and excludes `completed_with_errors` unless `include_error_runs=True`; statistics entry points guard on `min_valid_fraction` (default 0.95); `convergence()` running-statistic stabilization check; `prediction_intervals()`/`confidence_intervals(interval_type=...)`; `make_*_apply_fn` for Manning's n / breach / flow-multiplier perturbation. Flow multiplier is a uniform peak+volume ordinate scaler, not an AEP sample. Morris/Sobol sensitivity is out of scope in this version.)
 - RASMapper geometry completion (pythonnet, in-process, Windows): `RasGeometryCompute` drives RasMapperLib's `RASGeometry` directly — `generate_edge_lines()`, `generate_interpolation_surface()`, `generate_flow_paths()` (each mutates the geometry HDF in place and self-saves), `compute_geometry()` (the whole pipeline; does NOT include flow paths), `validate_geometry()` / `is_valid_geometry()` (per-feature diagnostics from `ValidateGeometry`, returned as a GeoDataFrame with severity / River / Reach / RS / message), and `audit_reach_lengths()` (copies the whole project, recomputes XS reach/flow lengths from the flow paths, and returns a per-XS before/after diff — flow paths compute the LOB/channel/ROB reach lengths a 1D unsteady model requires, and they go stale when cut lines move). `generate_flow_paths()` defaults to skip-if-exists and backs up to a dated `.geojson.bak` before any `overwrite=True`; `audit_reach_lengths()` never modifies the original and leaves existing (possibly hand-edited) flow paths untouched by default. Prefer this over GUI automation and the CLI on Windows.
 - RasProcess.exe CLI wrapper: `RasProcess` (stored maps; geometry association; `compute_geometry()` runs HEC-RAS's headless `CompleteGeometry` pipeline via `RasProcess.exe`). `compute_geometry()` is the same pipeline as `RasGeometryCompute.compute_geometry()` but as a subprocess; it is the supported path for **Linux/Wine**. On Windows prefer `RasGeometryCompute`. (`RasProcess.complete_geometry()` is a deprecated alias for `compute_geometry()`.)
-- HDF access: `Hdf*` classes and `ras_commander/hdf/`
+- HDF access: `Hdf*` classes and `ras_commander/hdf/` (native engine backend, its environment variables `RAS_COMMANDER_FAST_HDF`, `RAS_COMMANDER_HDF_SESSION_CACHE`, `RAS_COMMANDER_FAST_TEXT` and the session rules: see `ras_commander/hdf/AGENTS.md`, "Native Backend")
 - USGS IC generation: `usgs/initial_conditions.py` (`generate_ic_from_usgs()`: auto-discover gauges, match to XS, generate IC table from USGS snapshot)
-- Domain subpackages: `geom/`, `remote/`, `usgs/`, `check/`, `dss/`, `fixit/`, `precip/`, `gui/`, `terrain/`
+- Domain subpackages: `geom/`, `remote/`, `usgs/`, `check/`, `dss/`, `fixit/`, `precip/`, `gui/`, `terrain/`, `subdomain/`
+- Gridded precipitation: `RasPrecipGrid` normalizes projected raster inputs;
+  `PrecipCapabilities` and `RasUnsteady.get_gridded_precipitation_capabilities()`
+  expose version/route evidence. Use `set_gridded_precipitation_geotiff()` or
+  `set_gridded_precipitation_grib()` for durable NetCDF plus native-HDF imports;
+  use `RasPreprocess` and final plan HDF results to verify solver forcing.
+- Terrain derivatives: `RasTerrain.export_rasmapper_terrain()` is the production
+  path for a bounded, single-GeoTIFF export of an exact registered RAS Mapper
+  terrain. It preserves native source order, stitches, masks, and optional
+  vector modifications, returns a `TerrainExportResult`, and is qualified on
+  Windows and Wine for HEC-RAS 6.4.1, 6.5, 6.6, and 7.0.1. Keep
+  `RasTerrainMod.compute_modified_terrain_raster()` is a deprecated row-sampled
+  compatibility path scheduled for removal in 1.1; do not use it for new work
+  or as the production consolidation fallback.
+- Terrain delineation: `terrain.RasTauDem.delineate()` runs the external TauDEM 5
+  D8 tools and returns stream links and catchments (`taudem_streams`,
+  `taudem_catchments`). TauDEM is GPL-3 and only ever runs as a separate
+  process: never import, link, vendor or install it. Keep `RasTauDem` lazily
+  exported so `import ras_commander.terrain` does not load geopandas.
 
 ## Coding Rules
 
+- `RasPlan` additional-HDF-output writers accept catalogue UI labels and the
+  baseline 2D result names `Water Surface` and `Face Velocity`. Enabling either
+  baseline name succeeds as a no-op, logs at INFO that it is always written for
+  computed 2D results, and preserves existing plan text. These names remain
+  outside the additional-output catalogue. For additional-output labels,
+  known short aliases normalize with warnings and unknown labels raise before
+  writing. Batch/profile enabling prevalidates the entire request. Existing
+  matching short records are rewritten to the full label; removal matches both
+  forms and still permits unknown literal tokens for cleanup. The 14
+  spiral/curvature labels in `HDF_OUTPUT_VARIABLE_MIN_VERSIONS` require a plan
+  Program Version of 7.0+ (unknown versions warn) and active secondary flow.
+  The enabling writers (`add_/set_/enable_hdf_output_variable(s)`,
+  `apply_hdf_output_profile`, `use_optimal_hdf_settings`) accept an opt-in,
+  keyword-only `target_ras_version` (`"7.0"`, `"7.0.1"`, `"70"`, or a
+  `Ras.exe` path whose parent folder is a version such as `7.0` or
+  `6.7 Beta 5`; other folder names such as `x86` do not parse) that replaces
+  the declared version as the gate, because shipped plans
+  declare 5.x/6.x even when 7.0+ runs them. `RasCmdr.compute_plan` passes the
+  executing engine version automatically, but only when it is newer than the
+  declared version, so it never rejects what the declared gate accepted.
+  `HDF_OUTPUT_VARIABLE_DATASETS` is a partial, observed one-to-many map of Base
+  Output mesh dataset basenames, not a promise of presence or compatible time
+  axes. The node-velocity label is retained with a warning: the 6.6/7.0.1 pilot
+  produced no dataset and its working token remains unresolved. Do not infer
+  mappings for unobserved conditional/spiral outputs from their UI labels.
+
 - Prefer the existing static-class pattern. Most `Ras*` and `Hdf*` classes should be called directly, not instantiated.
 - Use DataFrame-backed project metadata first. Prefer `ras.plan_df`, `ras.geom_df`, `ras.flow_df`, `ras.unsteady_df`, `ras.boundaries_df`, and related helpers over ad hoc filesystem scanning.
+- `rasmap_df` is always one row; use `rasmap_status` (or the shared schema
+  health helper), never row count, `.empty`, or non-`None`, to decide whether
+  parsed values are usable.
 - Use `pathlib.Path` consistently for file paths.
 - Keep imports ordered `stdlib -> third-party -> local`.
 - Public functions should use the repo logging pattern with `get_logger()` and `@log_call`.
@@ -48,6 +96,7 @@ This file is the canonical local instruction file for the `ras_commander/` packa
 ## Execution Rules
 
 - Preserve originals when practical. Prefer `dest_folder=` for plan execution and isolated working directories for derived artifacts.
+- Copied project folders (`compute_plan`/`compute_parallel` `dest_folder`, parallel worker folders, `compute_test_mode`, permutation batches, local/Docker/PsExec remote staging) and in-place `RasPlan` refreshes re-initialize against the source project's own `.prj` file name via the module-level `ras_commander.RasPrj._matching_copied_prj_file()` (also reachable as the `RasPrj` static alias; call the module-level function so code paths that substitute the `RasPrj` class keep working). `DockerWorker` also passes `PROJECT_NAME` to the container, and `run_ras.sh` uses `${PROJECT_NAME}.prj` when it exists; images built before this change ignore it and still take the first `.prj`, so rebuild the image for multi-project folders. This only changes behavior when the folder holds several `.prj` files; single-project folders still use the normal `find_ras_prj()` folder search. New code that re-initializes a copied project must do the same instead of initializing by folder.
 - Be conservative with `max_workers * num_cores` when parallelizing runs.
 - Remote execution details live in [ras_commander/remote/AGENTS.md](remote/AGENTS.md).
 - RAS `.prj`, `.p##`, `.u##`, and related ASCII mutators must preserve the file's single newline convention. Fail closed on mixed LF/CRLF input instead of writing a hybrid file.
@@ -76,8 +125,13 @@ This file is the canonical local instruction file for the `ras_commander/` packa
 - USGS workflows: [ras_commander/usgs/AGENTS.md](usgs/AGENTS.md)
 - QA and repair flows: [ras_commander/check/AGENTS.md](check/AGENTS.md), [ras_commander/fixit/AGENTS.md](fixit/AGENTS.md)
 - DSS and precipitation helpers: [ras_commander/dss/AGENTS.md](dss/AGENTS.md), [ras_commander/precip/AGENTS.md](precip/AGENTS.md)
+- Optional ras2fim-2D FIM mapping (`RasFim`): [ras_commander/fim/AGENTS.md](fim/AGENTS.md)
 
 ## Update Discipline
 
 - Shared library rules belong here or in deeper package `AGENTS.md` files.
 - Keep `CLAUDE.md` in this directory as a thin loader only.
+
+RasExamples validates its cached CSV against the selected ZIP central-directory
+index, rather than treating a newer CSV timestamp as archive identity. Switching
+example versions or loading an obsolete cache refreshes the index automatically.

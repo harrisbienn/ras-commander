@@ -15,19 +15,27 @@ The Linux binaries cannot produce the .tmp.hdf or .b## files needed to begin
 execution. This module automates the Windows-side preprocessing step.
 
 Classes:
-    RasPreprocess - Static class for Windows preprocessing operations.
+    RasPreprocess: Static class for Windows preprocessing operations.
 """
 
+import hashlib
+import ntpath
+import os
 import re
 import shutil
 import subprocess
+import sys
 import time
-from pathlib import Path
-from typing import Optional, Union
-
 from numbers import Number
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from .ComputeResults import PreprocessResult
+from ._legal_dialogs import (
+    TCU_BLOCKING_ERROR,
+    TCU_DIALOG_TITLE,
+    legal_dialog_blocking_reason,
+)
+from .ComputeResults import GeometryPreprocessResult, PreprocessResult
 from .Decorators import log_call
 from .LoggingConfig import get_logger
 from .RasBco import BcoMonitor
@@ -43,7 +51,7 @@ class RasPreprocess:
 
     Automates Phase 1 of the two-phase Linux execution workflow:
     1. Launches HEC-RAS on Windows
-    2. Monitors the .bco log for "Starting Unsteady Flow Computations"
+    2. Monitors the .bco log or owned process tree for compute-engine startup
     3. Terminates HEC-RAS at that point (preprocessing complete)
     4. Verifies .tmp.hdf, .b##, .x## files were generated
 
@@ -57,6 +65,51 @@ class RasPreprocess:
         ...     print(f"Ready for Linux in {result.elapsed_seconds:.1f}s")
     """
 
+    _TCU_DIALOG_TITLE = TCU_DIALOG_TITLE
+    _TCU_BLOCKING_ERROR = TCU_BLOCKING_ERROR
+    _TCU_SUPERVISION_ERROR = (
+        "HEC-RAS legal-dialog supervision could not establish the launched "
+        "process tree. ras-commander refused to continue without a scoped "
+        "first-run TCU check."
+    )
+    _UNSTEADY_PROCESS_NAMES = frozenset(
+        {
+            "rasunsteady",
+            "rasunsteady.exe",
+            "rasunsteady64",
+            "rasunsteady64.exe",
+        }
+    )
+    _GRIDDED_PRECIPITATION_GROUP = "Event Conditions/Meteorology/Precipitation"
+    _GRIDDED_PRECIPITATION_INTERPOLATION_DATASETS = (
+        "Cell Indexes",
+        "Cell Info",
+        "Cell Weights",
+        "Face Indexes",
+        "Face Info",
+        "Face Weights",
+    )
+    _GRIDDED_PRECIPITATION_STABLE_SECONDS = 2.0
+
+    @staticmethod
+    def _ras_compute_command_line(
+        ras_exe: Union[str, Path],
+        project_file: Union[str, Path],
+        plan_file: Union[str, Path],
+    ) -> str:
+        """Build the fully quoted command line required by ``Ras.exe -c``.
+
+        HEC-RAS parses the optional plan path from the raw Windows command
+        line and requires it to be quoted even when the path has no spaces.
+        Passing an argument vector through ``subprocess`` is therefore not
+        equivalent to the documented command-line contract.
+        """
+        values = tuple(str(value) for value in (ras_exe, project_file, plan_file))
+        if any('"' in value for value in values):
+            raise ValueError("HEC-RAS command paths cannot contain a double quote")
+        executable, project, plan = values
+        return f'"{executable}" -c "{project}" "{plan}"'
+
     @staticmethod
     @log_call
     def preprocess_plan(
@@ -65,6 +118,11 @@ class RasPreprocess:
         max_wait: int = 300,
         clear_existing: bool = True,
         fix_line_endings: bool = True,
+        require_linux_solver_ready: bool = True,
+        *,
+        accept_tcu: bool = False,
+        precipitation_repair_attempts: int = 6,
+        precipitation_repair_timeout: Optional[int] = None,
     ) -> PreprocessResult:
         """
         Preprocess a plan on Windows for Linux execution.
@@ -72,21 +130,67 @@ class RasPreprocess:
         Runs HEC-RAS with early termination to generate .tmp.hdf, .b##, and .x##
         files required by the Linux RasUnsteady binary. The process is killed when
         the .bco log indicates preprocessing is complete ("Starting Unsteady Flow
-        Computations" signal).
+        Computations" signal), or when an owned ``RasUnsteady.exe`` descendant has
+        started and all three prerequisite files are non-empty. The process-tree
+        fallback supports releases that create an empty ``.bco`` file.
+
+        Set require_linux_solver_ready=False for native Windows computation:
+        that mode stops after the observed event writer exits, checks file
+        quiescence after owned cleanup, and validates materialized meteorology.
+        The default additionally requires Linux-specific geometry input tables.
+
+        After owned writers stop, success also requires Event Conditions to
+        report ``Completed Successfully=True``. Enabled point or gridded rain
+        requires a non-empty two-dimensional precipitation ``Values`` dataset.
+        Missing completion evidence is rejected, including when copying a fresh
+        final HDF. Failure retains artifact paths and readiness-signal details.
+
+        HEC-RAS's own event-condition writer, ``RasProcess.exe
+        CompletePreProcess``, can intermittently write no point precipitation
+        for identical inputs. It reports "No valid precipitation time-series
+        data found for this time-window" and "Error processing Precipitation
+        data, exiting...", and Ras.exe then exits 0 before the unsteady
+        computation. This was observed in 8 of 47 processes (17%) with HEC-RAS
+        6.6 under Wine, and also with 6.4.1; it is not caused by the
+        early-stop logic. When a point-precipitation plan fails Event
+        Conditions validation and the temporary HDF, ``.b##`` and ``.x##`` are
+        all present, this method re-runs only ``RasProcess.exe
+        CompletePreProcess <project>.rasmap <plan>.tmp.hdf`` on the same
+        temporary HDF, from the project folder, and re-validates after each
+        attempt. A repaired file matched a first-try success exactly. Gridded
+        precipitation is not repaired this way.
+
+        With HEC-RAS before 6.3, fails without launching HEC-RAS when the plan's
+        geometry HDF references a land-cover, infiltration, or sediment file that
+        does not exist. Those releases would otherwise skip the geometry and
+        write no 2D mesh.
 
         Args:
             plan_number: Plan number to preprocess (e.g., "01", 1).
-            ras_object: Optional RasPrj instance. If None, uses global ras.
+            ras_object (RasPrj, optional): Optional RasPrj instance. If None, uses global ras.
             max_wait: Maximum seconds to wait for preprocessing (default 300).
             clear_existing: Delete stale preprocessing files before running (default True).
             fix_line_endings: Convert .x file CRLF to LF for Linux (default True).
+            accept_tcu: Explicitly authorize accepting an exact owned TCU wizard
+                during this launch. False by default; acceptance failures block
+                preprocessing and receipts are retained in the result.
+            precipitation_repair_attempts: Maximum ``CompletePreProcess``
+                re-runs used to complete point precipitation (default 6; 0
+                disables the repair). Repairs stop early on a timeout, a
+                legal-dialog block, a launch failure, or surviving processes.
+            precipitation_repair_timeout: Seconds allowed for each repair
+                attempt. Defaults to ``max_wait``, which already bounds the
+                full preprocessing run that includes this step.
 
         Returns:
             PreprocessResult: Result with success flag, file paths, and timing.
                 Bool-compatible: ``if preprocess_plan("01"):`` works.
+                ``precipitation_repair_attempts`` records each repair attempt,
+                and ``signal_source`` is ``"completepreprocess_repair"`` when
+                a repair completed the temporary HDF.
 
-        Raises:
-            No exceptions raised — errors are captured in PreprocessResult.error.
+        Note:
+            Errors are captured in PreprocessResult.error.
 
         Example:
             >>> result = RasPreprocess.preprocess_plan("01")
@@ -95,7 +199,19 @@ class RasPreprocess:
             ...     print(f".b file: {result.b_file_path}")
             ...     print(f".x file: {result.x_file_path}")
         """
+        if not isinstance(require_linux_solver_ready, bool):
+            raise ValueError("require_linux_solver_ready must be a bool")
+        if not isinstance(accept_tcu, bool):
+            raise ValueError("accept_tcu must be a bool")
         start_time = time.time()
+        started_monotonic = time.monotonic() if accept_tcu else 0.0
+        tcu_receipts = []
+
+        def make_result(**values):
+            if accept_tcu:
+                return PreprocessResult(**values, tcu_acceptance_receipts=list(tcu_receipts))
+            return PreprocessResult(**values)
+
         ras_obj = ras_object if ras_object is not None else ras
 
         # Normalize plan number
@@ -107,7 +223,7 @@ class RasPreprocess:
         try:
             ras_obj.check_initialized()
         except Exception as e:
-            return PreprocessResult(
+            return make_result(
                 success=False, plan_number=plan_num,
                 error=f"Project not initialized: {e}",
                 elapsed_seconds=time.time() - start_time,
@@ -133,7 +249,7 @@ class RasPreprocess:
             if plan_path:
                 geometry_number = RasPreprocess._extract_geometry_number(Path(plan_path))
             if geometry_number is None:
-                return PreprocessResult(
+                return make_result(
                     success=False, plan_number=plan_num,
                     error=f"Could not determine geometry number for plan {plan_num}",
                     elapsed_seconds=time.time() - start_time,
@@ -148,10 +264,23 @@ class RasPreprocess:
         x_file = project_folder / f"{project_name}.x{geometry_number}"
         plan_file = project_folder / f"{project_name}.p{plan_num}"
         prj_file = project_folder / f"{project_name}.prj"
+        precipitation_mode = (
+            RasPreprocess._plan_precipitation_mode(
+                plan_file,
+                project_folder,
+                project_name,
+            )
+        )
+        requires_gridded_precipitation = precipitation_mode == "gridded"
+
+        hdf_state_before = None
+        if hdf_file.is_file():
+            hdf_stat = hdf_file.stat()
+            hdf_state_before = (hdf_stat.st_size, hdf_stat.st_mtime_ns)
 
         # Validate plan file exists
         if not plan_file.exists():
-            return PreprocessResult(
+            return make_result(
                 success=False, plan_number=plan_num,
                 geometry_number=geometry_number,
                 error=f"Plan file not found: {plan_file}",
@@ -160,7 +289,7 @@ class RasPreprocess:
 
         # Validate project file exists
         if not prj_file.exists():
-            return PreprocessResult(
+            return make_result(
                 success=False, plan_number=plan_num,
                 geometry_number=geometry_number,
                 error=f"Project file not found: {prj_file}",
@@ -170,10 +299,40 @@ class RasPreprocess:
         # Get HEC-RAS executable
         ras_exe = ras_obj.ras_exe_path
         if not ras_exe or not Path(ras_exe).exists():
-            return PreprocessResult(
+            return make_result(
                 success=False, plan_number=plan_num,
                 geometry_number=geometry_number,
                 error=f"HEC-RAS executable not found: {ras_exe}",
+                elapsed_seconds=time.time() - start_time,
+            )
+
+        # Before 6.3, HEC-RAS skips the geometry without an error when a
+        # referenced land-classification file is missing, leaving no 2D mesh
+        # in the plan HDF. Refuse to run rather than report that as success.
+        if RasPreprocess._skips_geometry_without_land_classification(ras_exe):
+            geom_hdf = project_folder / f"{project_name}.g{geometry_number}.hdf"
+            missing_files = RasPreprocess._missing_land_classification_files(geom_hdf)
+            if missing_files:
+                return make_result(
+                    success=False, plan_number=plan_num,
+                    geometry_number=geometry_number,
+                    error=(
+                        f"Geometry g{geometry_number} references files that do not "
+                        f"exist: {'; '.join(missing_files)}. HEC-RAS "
+                        f"{Path(ras_exe).parent.name} skips the geometry when they "
+                        "are missing. Restore them or update the geometry's "
+                        "associations before preprocessing."
+                    ),
+                    elapsed_seconds=time.time() - start_time,
+                )
+
+        supervision_error = RasPreprocess._tcu_supervision_availability_error()
+        if supervision_error:
+            return make_result(
+                success=False,
+                plan_number=plan_num,
+                geometry_number=geometry_number,
+                error=supervision_error,
                 elapsed_seconds=time.time() - start_time,
             )
 
@@ -183,22 +342,116 @@ class RasPreprocess:
                 project_folder, project_name, plan_num, geometry_number
             )
 
+        artifact_baseline = {
+            path: RasPreprocess._artifact_state(path)
+            for path in (tmp_hdf, b_file, x_file, hdf_file)
+        }
+
         # Enable detailed logging to create .bco file
         BcoMonitor.enable_detailed_logging(plan_file)
 
-        # Build command: RAS.exe -c project.prj plan.p##
-        cmd = f'"{ras_exe}" -c "{prj_file}" "{plan_file}"'
+        # Keep a Python launcher alive while the GUI-subsystem Ras.exe runs.
+        # This provides a stable job-owned ancestry under native Windows and
+        # Windows Python hosted by Wine.
+        launcher = (
+            "import subprocess,sys; "
+            "ras_exe,command_line=sys.argv[1:3]; "
+            "raise SystemExit(subprocess.call(command_line, "
+            "executable=ras_exe, shell=False))"
+        )
+        try:
+            compute_command_line = RasPreprocess._ras_compute_command_line(
+                ras_exe,
+                prj_file,
+                plan_file,
+            )
+        except ValueError as e:
+            return make_result(
+                success=False,
+                plan_number=plan_num,
+                geometry_number=geometry_number,
+                error=f"Could not launch HEC-RAS preprocessing: {e}",
+                elapsed_seconds=time.time() - start_time,
+            )
+        cmd = [
+            sys.executable,
+            "-c",
+            launcher,
+            str(ras_exe),
+            compute_command_line,
+        ]
         logger.info("Starting HEC-RAS preprocessing for plan %s", plan_num)
         logger.debug(f"Command: {cmd}")
 
         # Launch HEC-RAS
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(project_folder),
-            shell=True,
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=str(project_folder),
+                shell=False,
+            )
+        except OSError as e:
+            return make_result(
+                success=False,
+                plan_number=plan_num,
+                geometry_number=geometry_number,
+                error=f"Could not launch HEC-RAS preprocessing: {e}",
+                elapsed_seconds=time.time() - start_time,
+            )
+
+        launch_create_time = None
+        if accept_tcu:
+            try:
+                import psutil
+
+                launch_create_time = float(psutil.Process(process.pid).create_time())
+            except Exception as exc:
+                # A missing identity never authorizes assent. Normal scoped
+                # supervision remains active if no TCU dialog is encountered.
+                logger.warning("Could not capture explicit TCU launch identity: %s", exc)
+        tcu_acceptance_state = {}
+
+        gridded_stability_state: Dict[str, object] = {}
+        solver_started = lambda: RasPreprocess._unsteady_compute_started(
+            process.pid,
+            tmp_hdf,
+            b_file,
+            x_file,
+            artifact_baseline=artifact_baseline,
         )
+        if requires_gridded_precipitation:
+            alternate_signal_condition = lambda: (
+                RasPreprocess._completepreprocess_handoff_ready(
+                    tmp_hdf,
+                    b_file,
+                    x_file,
+                    gridded_stability_state,
+                    started_at=start_time,
+                    artifact_baseline=artifact_baseline,
+                    solver_started=solver_started,
+                    defer_stat_quiescence=not require_linux_solver_ready,
+                )
+            )
+            alternate_signal_description = (
+                "an exited native writer or a witnessed owned solver start; "
+                "stopping before post-cleanup artifact quiescence"
+            )
+        else:
+            alternate_signal_condition = lambda: (
+                RasPreprocess._unsteady_compute_started(
+                    process.pid,
+                    tmp_hdf,
+                    b_file,
+                    x_file,
+                    artifact_baseline=artifact_baseline,
+                )
+            )
+            alternate_signal_description = (
+                "owned RasUnsteady.exe startup with complete preprocessing "
+                "artifacts"
+            )
 
         # Monitor .bco file for preprocessing completion signal
         monitor = BcoMonitor(
@@ -207,27 +460,203 @@ class RasPreprocess:
             project_name=project_name,
             signal_string="Starting Unsteady Flow Computations",
             max_wait_seconds=max_wait,
+            blocking_condition=lambda: (
+                RasPreprocess._preprocessing_tcu_probe(
+                    process, accept_tcu=accept_tcu,
+                    launch_create_time=launch_create_time, ras_exe=ras_exe,
+                    deadline=started_monotonic + float(max_wait),
+                    receipts=tcu_receipts, acceptance_state=tcu_acceptance_state,
+                )
+            ),
+            alternate_signal_condition=alternate_signal_condition,
+            alternate_signal_description=alternate_signal_description,
         )
 
         signal_detected = monitor.monitor_until_signal(process)
+        blocked_reason = getattr(monitor, "blocked_reason", None)
+        monitor_source = getattr(monitor, "signal_source", None)
+        signal_source = (
+            (
+                "completepreprocess_writer_quiescent"
+                if requires_gridded_precipitation
+                else "owned_process_artifacts"
+            )
+            if monitor_source == "alternate"
+            else monitor_source
+        )
+        if signal_detected and signal_source is None:
+            signal_source = "bco"
+
+        if blocked_reason:
+            if process.poll() is None:
+                RasPreprocess._terminate_process_tree(process)
+            return make_result(
+                success=False,
+                plan_number=plan_num,
+                geometry_number=geometry_number,
+                signal_source="blocked_legal_dialog",
+                error=blocked_reason,
+                elapsed_seconds=time.time() - start_time,
+            )
+
+        # The BCO marker is written before the owned RasUnsteady process is
+        # guaranteed to have started. That distinction matters for gridded
+        # precipitation: the BCO marker is telemetry, not proof that it is
+        # safe to open or stop around the temporary HDF.  A native
+        # CompletePreProcess writer can continue after it.  Keep polling only
+        # process metadata and filesystem stat state until an observed writer
+        # exits; no HDF inspection occurs in this active-engine loop.
+        if (
+            signal_detected
+            and signal_source == "bco"
+            and requires_gridded_precipitation
+            and process.poll() is None
+        ):
+            readiness_deadline = start_time + float(max_wait)
+            # A fast launcher can exit during the required writer/stat quiet
+            # period. Keep checking the observed writer's quiescence after
+            # that exit; launcher lifetime is not the readiness criterion.
+            while time.time() < readiness_deadline:
+                if RasPreprocess._completepreprocess_handoff_ready(
+                    tmp_hdf,
+                    b_file,
+                    x_file,
+                    gridded_stability_state,
+                    started_at=start_time,
+                    artifact_baseline=artifact_baseline,
+                    solver_started=solver_started,
+                    allow_completed_hdf=process.poll() is not None,
+                    defer_stat_quiescence=True,
+                ):
+                    signal_source = "bco_completepreprocess_writer_quiescent"
+                    logger.info(
+                        "Observed CompletePreProcess writer exited; stopping "
+                        "before post-cleanup artifact quiescence"
+                    )
+                    break
+                time.sleep(0.1)
+
+            if signal_source == "bco":
+                if process.poll() is None:
+                    RasPreprocess._terminate_process_tree(process)
+                return make_result(
+                    success=False,
+                    plan_number=plan_num,
+                    geometry_number=geometry_number,
+                    signal_source="timeout",
+                    timed_out=True,
+                    error=(
+                        "HEC-RAS reported the BCO computation-start marker, but an "
+                        "exact launch-owned CompletePreProcess writer was not "
+                        "observed to exit with quiescent artifacts before the "
+                        f"preprocessing timeout ({int(max_wait)} seconds)."
+                    ),
+                    elapsed_seconds=time.time() - start_time,
+                )
 
         # Terminate process tree
-        if process.poll() is None:
-            logger.debug("Preprocessing signal detected; terminating HEC-RAS")
+        process_was_running = process.poll() is None
+        if process_was_running:
             RasPreprocess._terminate_process_tree(process)
+            if not signal_detected:
+                return make_result(
+                    success=False,
+                    plan_number=plan_num,
+                    geometry_number=geometry_number,
+                    signal_source="timeout",
+                    timed_out=True,
+                    error=(
+                        "Preprocessing timed out after "
+                        f"{int(max_wait)} seconds before a readiness signal"
+                    ),
+                    elapsed_seconds=time.time() - start_time,
+                )
+            logger.debug("Preprocessing signal detected; terminating HEC-RAS")
         elif signal_detected:
             logger.debug("Preprocessing complete; HEC-RAS process already exited")
         else:
             logger.warning(f"Process exited with code {process.returncode} before signal detected")
+            signal_source = "natural_completion"
+            if process.returncode not in (0, None):
+                return make_result(
+                    success=False,
+                    plan_number=plan_num,
+                    geometry_number=geometry_number,
+                    signal_source=signal_source,
+                    error=(
+                        "HEC-RAS exited with code "
+                        f"{process.returncode} before a readiness signal"
+                    ),
+                    elapsed_seconds=time.time() - start_time,
+                )
 
-        # If process completed fully and .hdf exists but no .tmp.hdf, copy it
-        if not tmp_hdf.exists() and hdf_file.exists() and hdf_file.stat().st_size > 0:
+        # Ras.exe is a GUI-subsystem launcher. On some HEC-RAS 7.x runs the
+        # Python-owned launcher exits after spawning CompletePreProcess even
+        # though an exact-plan Ras.exe/RasProcess.exe tree is still alive. In
+        # that state ``process.poll()`` cannot prove quiescence, and the next
+        # compute correctly refuses to replace artifacts that may still be
+        # open. Clean only processes from this launch window whose command
+        # lines contain the exact project+plan pair or the exact temporary HDF.
+        stopped_residue, surviving_residue = (
+            RasPreprocess._terminate_exact_preprocess_residue(
+                project_file=prj_file,
+                plan_file=plan_file,
+                tmp_hdf=tmp_hdf,
+                started_at=start_time,
+            )
+        )
+        if stopped_residue:
+            logger.info(
+                "Stopped detached HEC-RAS preprocessing residue for plan %s: %s",
+                plan_num,
+                ", ".join(str(pid) for pid in stopped_residue),
+            )
+        if surviving_residue:
+            return make_result(
+                success=False,
+                plan_number=plan_num,
+                geometry_number=geometry_number,
+                signal_source=signal_source,
+                error=(
+                    "Exact-plan HEC-RAS preprocessing processes remained active "
+                    "after cleanup: "
+                    + ", ".join(str(pid) for pid in surviving_residue)
+                ),
+                elapsed_seconds=time.time() - start_time,
+            )
+
+        if requires_gridded_precipitation and not RasPreprocess._wait_stopped_artifacts_quiet(
+            (tmp_hdf if tmp_hdf.is_file() else hdf_file, b_file, x_file),
+        ):
+            return make_result(
+                success=False, plan_number=plan_num, geometry_number=geometry_number,
+                signal_source=signal_source,
+                error="Stopped preprocessing artifacts did not become quiescent before HDF validation",
+                elapsed_seconds=time.time() - start_time,
+            )
+
+        # If the process completed fully and wrote a new/changed final HDF but
+        # no .tmp.hdf, use that fresh file as the Linux preprocessing input.
+        # Never mistake an unchanged pre-existing final result for new output.
+        full_result_copied = False
+        hdf_state_after = None
+        if hdf_file.is_file():
+            hdf_stat = hdf_file.stat()
+            hdf_state_after = (hdf_stat.st_size, hdf_stat.st_mtime_ns)
+        if (
+            not tmp_hdf.exists()
+            and hdf_state_after is not None
+            and hdf_state_after[0] > 0
+            and hdf_state_after != hdf_state_before
+        ):
             logger.warning(
                 "Full simulation completed before early termination; copying %s to %s",
                 hdf_file.name,
                 tmp_hdf.name,
             )
             shutil.copy2(hdf_file, tmp_hdf)
+            full_result_copied = True
+            signal_source = "full_result_copy"
 
         # Verify all three prerequisite files exist and are non-empty
         missing = []
@@ -239,11 +668,152 @@ class RasPreprocess:
             missing.append(f".x{geometry_number}")
 
         if missing:
-            return PreprocessResult(
+            return make_result(
                 success=False, plan_number=plan_num,
                 geometry_number=geometry_number,
+                signal_source=signal_source,
+                full_result_copied=full_result_copied,
                 error=f"Preprocessing did not generate: {', '.join(missing)}",
                 elapsed_seconds=time.time() - start_time,
+            )
+
+        if requires_gridded_precipitation:
+            materialized, detail = (
+                RasPreprocess._validate_materialized_gridded_precipitation(
+                    tmp_hdf
+                )
+            )
+            if not materialized:
+                return make_result(
+                    success=False,
+                    plan_number=plan_num,
+                    geometry_number=geometry_number,
+                    tmp_hdf_path=tmp_hdf,
+                    b_file_path=b_file,
+                    x_file_path=x_file,
+                    signal_source=signal_source,
+                    full_result_copied=full_result_copied,
+                    error=(
+                        "Gridded precipitation is configured, but HEC-RAS "
+                        "preprocessing did not create structurally materialized "
+                        f"precipitation in {tmp_hdf.name}: {detail}. Imported "
+                        "Raster Data alone is not solver-ready."
+                    ),
+                    elapsed_seconds=time.time() - start_time,
+                )
+            if require_linux_solver_ready:
+                solver_ready, detail = (
+                    RasPreprocess._validate_completed_gridded_preprocessing(
+                        tmp_hdf
+                    )
+                )
+                if not solver_ready:
+                    return make_result(
+                        success=False,
+                        plan_number=plan_num,
+                        geometry_number=geometry_number,
+                        tmp_hdf_path=tmp_hdf,
+                        b_file_path=b_file,
+                        x_file_path=x_file,
+                        signal_source=signal_source,
+                        full_result_copied=full_result_copied,
+                        error=(
+                            "Gridded precipitation is configured, but HEC-RAS "
+                            "preprocessing did not create a completed Linux "
+                            f"solver-ready temporary HDF in {tmp_hdf.name}: {detail}. "
+                            "Imported Raster Data or partial interpolation mappings "
+                            "alone are not solver-ready."
+                        ),
+                        elapsed_seconds=time.time() - start_time,
+                    )
+
+        # Read only after owned writers have stopped, including natural exits.
+        # Non-empty prerequisite files alone do not prove completed event data.
+        try:
+            import h5py
+            from ._preprocess_validation import _event_condition_errors
+            from ._preprocess_validation import _hdf_ras_major_version
+
+            with h5py.File(tmp_hdf, "r") as hdf:
+                event_errors = _event_condition_errors(hdf, precipitation_mode)
+                ras_major = _hdf_ras_major_version(hdf)
+            hdf_readable = True
+            compatibility_errors = []
+            if ras_major is not None and ras_major < 6:
+                c_file = project_folder / f"{project_name}.c{geometry_number}"
+                if not c_file.is_file() or c_file.stat().st_size == 0:
+                    compatibility_errors.append(
+                        f"HEC-RAS {ras_major}.x preprocessing did not write {c_file.name}"
+                    )
+        except Exception as exc:
+            from .fast_hdf import reraise_required
+
+            reraise_required(exc)
+            event_errors = [f"could not validate Event Conditions: {exc}"]
+            hdf_readable = False
+            compatibility_errors = []
+
+        repair_attempts: List[Dict[str, Any]] = []
+        repair_note = None
+        if (
+            event_errors
+            and precipitation_mode == "point"
+            and int(precipitation_repair_attempts or 0) > 0
+            and hdf_readable
+            and not full_result_copied
+            and RasPreprocess._preprocessing_artifacts_ready(tmp_hdf, b_file, x_file)
+        ):
+            repaired, repair_attempts, repair_errors, repair_note = (
+                RasPreprocess._repair_point_precipitation(
+                    ras_exe=Path(ras_exe),
+                    project_folder=project_folder,
+                    project_name=project_name,
+                    prj_file=prj_file,
+                    plan_file=plan_file,
+                    tmp_hdf=tmp_hdf,
+                    precipitation_mode=precipitation_mode,
+                    max_attempts=int(precipitation_repair_attempts),
+                    timeout_seconds=(
+                        max_wait
+                        if precipitation_repair_timeout is None
+                        else precipitation_repair_timeout
+                    ),
+                )
+            )
+            if repaired:
+                logger.info(
+                    "Point precipitation for plan %s completed by "
+                    "CompletePreProcess repair attempt %d (initial signal: %s)",
+                    plan_num,
+                    len(repair_attempts),
+                    signal_source,
+                )
+                event_errors = []
+                signal_source = "completepreprocess_repair"
+            elif repair_attempts:
+                event_errors = repair_errors or event_errors
+
+        validation_errors = [*event_errors, *compatibility_errors]
+        if validation_errors:
+            error = "Preprocessing is incomplete: " + "; ".join(validation_errors)
+            if repair_attempts:
+                error += ". " + RasPreprocess._describe_failed_repair(
+                    repair_attempts, repair_note
+                )
+            elif repair_note:
+                error += f". Point-precipitation repair not attempted: {repair_note}"
+            return make_result(
+                success=False,
+                plan_number=plan_num,
+                geometry_number=geometry_number,
+                tmp_hdf_path=tmp_hdf,
+                b_file_path=b_file,
+                x_file_path=x_file,
+                signal_source=signal_source,
+                full_result_copied=full_result_copied,
+                error=error,
+                elapsed_seconds=time.time() - start_time,
+                precipitation_repair_attempts=repair_attempts,
             )
 
         # Fix line endings on .x file for Linux compatibility
@@ -267,7 +837,7 @@ class RasPreprocess:
             x_file,
         )
 
-        return PreprocessResult(
+        return make_result(
             success=True,
             plan_number=plan_num,
             geometry_number=geometry_number,
@@ -275,6 +845,449 @@ class RasPreprocess:
             b_file_path=b_file,
             x_file_path=x_file,
             elapsed_seconds=elapsed,
+            signal_source=signal_source,
+            full_result_copied=full_result_copied,
+            precipitation_repair_attempts=repair_attempts,
+        )
+
+    @staticmethod
+    def _read_event_condition_errors(
+        tmp_hdf: Path,
+        precipitation_mode: Optional[str],
+    ) -> Tuple[List[str], bool]:
+        """Validate Event Conditions in a writer-free temporary HDF.
+
+        Returns the problems and whether the HDF could be opened at all.
+        """
+        try:
+            import h5py
+            from ._preprocess_validation import _event_condition_errors
+
+            with h5py.File(tmp_hdf, "r") as hdf:
+                return list(_event_condition_errors(hdf, precipitation_mode)), True
+        except Exception as exc:
+            from .fast_hdf import reraise_required
+
+            reraise_required(exc)
+            return [f"could not validate Event Conditions: {exc}"], False
+
+    @staticmethod
+    def _repair_point_precipitation(
+        *,
+        ras_exe: Path,
+        project_folder: Path,
+        project_name: str,
+        prj_file: Path,
+        plan_file: Path,
+        tmp_hdf: Path,
+        precipitation_mode: str,
+        max_attempts: int,
+        timeout_seconds: float,
+    ) -> Tuple[bool, List[Dict[str, Any]], List[str], Optional[str]]:
+        """Re-run ``RasProcess.exe CompletePreProcess`` until Event Conditions validate.
+
+        HEC-RAS's ``PointPrecipitationLayer`` can write no point precipitation
+        for identical inputs ("No valid precipitation time-series data found
+        for this time-window"). A fresh ``CompletePreProcess`` process on the
+        same temporary HDF writes it on a later attempt. The gauge DSS paths
+        in the HDF are relative (``.\\Hydrology\\<file>.dss``) and resolve
+        against the process working directory, so each attempt runs from the
+        project folder.
+
+        Returns ``(repaired, attempts, last_validation_errors, note)``. ``note``
+        explains why no attempt ran, or why attempts stopped before
+        ``max_attempts``.
+        """
+        rasprocess = Path(ras_exe).parent / "RasProcess.exe"
+        rasmap = Path(project_folder) / f"{project_name}.rasmap"
+        if not rasprocess.is_file():
+            return False, [], [], f"{rasprocess.name} not found beside {Path(ras_exe).name}"
+        if not rasmap.is_file():
+            return False, [], [], f"project file {rasmap.name} not found"
+
+        attempts: List[Dict[str, Any]] = []
+        errors: List[str] = []
+        for attempt in range(1, int(max_attempts) + 1):
+            logger.warning(
+                "Event Conditions incomplete in %s; re-running RasProcess.exe "
+                "CompletePreProcess (attempt %d of %d)",
+                tmp_hdf.name,
+                attempt,
+                max_attempts,
+            )
+            attempt_started = time.time()
+            run = RasPreprocess._run_completepreprocess(
+                rasprocess,
+                rasmap,
+                tmp_hdf,
+                working_dir=Path(project_folder),
+                timeout_seconds=timeout_seconds,
+            )
+            stop_reason = run["error"]
+            _stopped, surviving = RasPreprocess._terminate_exact_preprocess_residue(
+                project_file=prj_file,
+                plan_file=plan_file,
+                tmp_hdf=tmp_hdf,
+                started_at=attempt_started,
+            )
+            if surviving:
+                stop_reason = (
+                    "CompletePreProcess processes remained active after cleanup: "
+                    + ", ".join(str(pid) for pid in surviving)
+                )
+                errors = [stop_reason]
+            else:
+                errors, _readable = RasPreprocess._read_event_condition_errors(
+                    tmp_hdf, precipitation_mode
+                )
+            output = run["output"]
+            record = {
+                "attempt": attempt,
+                "return_code": run["return_code"],
+                "elapsed_seconds": round(time.time() - attempt_started, 1),
+                "no_valid_precipitation": (
+                    "no valid precipitation" in output.casefold()
+                ),
+                "validation_errors": list(errors),
+                "timed_out": run["timed_out"],
+                "error": stop_reason,
+            }
+            attempts.append(record)
+            if stop_reason is None and not errors and run["return_code"] == 0:
+                return True, attempts, [], None
+            if stop_reason is not None:
+                return False, attempts, errors, stop_reason
+        return False, attempts, errors, None
+
+    @staticmethod
+    def _run_completepreprocess(
+        rasprocess: Path,
+        rasmap: Path,
+        tmp_hdf: Path,
+        *,
+        working_dir: Path,
+        timeout_seconds: float,
+    ) -> Dict[str, Any]:
+        """Run one owned ``RasProcess.exe CompletePreProcess`` to completion.
+
+        Uses an argument vector, file-backed output (no pipe can fill while
+        polling) and the same scoped legal-dialog check and process-tree
+        termination as the Ras.exe launch. ``preprocess_plan`` already requires
+        Windows-hosted Python, including Windows Python under Wine, so
+        ``RasProcess.exe`` is launched directly.
+        """
+        import tempfile
+
+        command = [str(rasprocess), "CompletePreProcess", str(rasmap), str(tmp_hdf)]
+        result: Dict[str, Any] = {
+            "return_code": None,
+            "output": "",
+            "timed_out": False,
+            "error": None,
+        }
+        with tempfile.TemporaryFile(
+            mode="w+", encoding="utf-8", errors="replace"
+        ) as output_file:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(working_dir),
+                    stdout=output_file,
+                    stderr=subprocess.STDOUT,
+                    shell=False,
+                )
+            except OSError as exc:
+                result["error"] = f"could not launch {Path(rasprocess).name}: {exc}"
+                return result
+
+            deadline = time.monotonic() + max(float(timeout_seconds), 1.0)
+            while process.poll() is None:
+                blocked = RasPreprocess._detect_first_run_tcu_dialog(process.pid)
+                if blocked and process.poll() is None:
+                    RasPreprocess._terminate_process_tree(process)
+                    result["error"] = blocked
+                    break
+                if time.monotonic() >= deadline:
+                    RasPreprocess._terminate_process_tree(process)
+                    result["timed_out"] = True
+                    result["error"] = (
+                        "CompletePreProcess timed out after "
+                        f"{int(timeout_seconds)} seconds"
+                    )
+                    break
+                time.sleep(0.5)
+
+            result["return_code"] = process.poll()
+            try:
+                output_file.seek(0)
+                result["output"] = output_file.read()
+            except (OSError, ValueError):
+                pass
+        return result
+
+    @staticmethod
+    def _describe_failed_repair(
+        attempts: List[Dict[str, Any]],
+        stop_note: Optional[str],
+    ) -> str:
+        """Summarize unsuccessful CompletePreProcess repair attempts for an error."""
+        details = []
+        for record in attempts:
+            detail = f"attempt {record['attempt']}: exit {record['return_code']}"
+            if record.get("no_valid_precipitation"):
+                detail += ", 'No valid precipitation' reported"
+            if record.get("error"):
+                detail += f", {record['error']}"
+            details.append(detail)
+        summary = (
+            f"Re-running RasProcess.exe CompletePreProcess {len(attempts)} "
+            f"time(s) did not complete point precipitation ({'; '.join(details)})"
+        )
+        if stop_note:
+            summary += f". Repair stopped early: {stop_note}"
+        return summary
+
+    @staticmethod
+    @log_call
+    def run_ras_geom_preprocess(
+        plan_number: Union[str, Number],
+        ras_object=None,
+        input_hdf_path: Optional[Union[str, Path]] = None,
+        x_file_path: Optional[Union[str, Path]] = None,
+        executable_path: Optional[Union[str, Path]] = None,
+        timeout_sec: int = 300,
+        require_hdf_change: bool = False,
+    ) -> GeometryPreprocessResult:
+        """Run vendor ``RasGeomPreprocess.exe`` for one staged plan.
+
+        :meth:`preprocess_plan` creates the plan ``*.tmp.hdf`` and geometry
+        ``.x##`` inputs. This method executes the matching standalone geometry
+        preprocessor using an argument vector, enforces a bounded timeout, and
+        records executable and before/after HDF fingerprints. It is intended for
+        Windows Python, including Windows Python hosted by Wine.
+
+        Args:
+            plan_number: Plan number (for example ``"06"``).
+            ras_object (RasPrj, optional): Initialized :class:`RasPrj`; defaults to the global project.
+            input_hdf_path: Optional explicit plan ``*.tmp.hdf`` input.
+            x_file_path: Optional explicit project ``.x##`` file.
+            executable_path: Optional explicit ``RasGeomPreprocess.exe`` path.
+                The default is the ``x64`` directory beside ``Ras.exe``.
+            timeout_sec: Maximum execution time in seconds.
+            require_hdf_change: Require the input HDF fingerprint to change.
+                Leave False for idempotent reruns; qualification of a fresh input
+                should set this to True.
+
+        Returns:
+            GeometryPreprocessResult: Bool-compatible execution evidence.
+        """
+        start_time = time.time()
+        ras_obj = ras_object if ras_object is not None else ras
+
+        if isinstance(plan_number, Number):
+            plan_num = f"{int(plan_number):02d}"
+        else:
+            plan_num = str(plan_number).zfill(2)
+
+        try:
+            ras_obj.check_initialized()
+        except Exception as e:
+            return GeometryPreprocessResult(
+                success=False,
+                plan_number=plan_num,
+                error=f"Project not initialized: {e}",
+                elapsed_seconds=time.time() - start_time,
+            )
+
+        project_folder = Path(ras_obj.project_folder)
+        project_name = ras_obj.project_name
+        plan_path = project_folder / f"{project_name}.p{plan_num}"
+        geometry_number = None
+        try:
+            plan_row = ras_obj.plan_df[ras_obj.plan_df["plan_number"] == plan_num]
+            if not plan_row.empty and "Geom File" in plan_row.columns:
+                match = re.search(r"(\d+)", str(plan_row["Geom File"].iloc[0]))
+                if match:
+                    geometry_number = match.group(1)
+        except Exception:
+            pass
+        if geometry_number is None and plan_path.is_file():
+            geometry_number = RasPreprocess._extract_geometry_number(plan_path)
+        if geometry_number is None:
+            return GeometryPreprocessResult(
+                success=False,
+                plan_number=plan_num,
+                error=f"Could not determine geometry number for plan {plan_num}",
+                elapsed_seconds=time.time() - start_time,
+            )
+
+        input_hdf = (
+            Path(input_hdf_path)
+            if input_hdf_path is not None
+            else project_folder / f"{project_name}.p{plan_num}.tmp.hdf"
+        )
+        x_file = (
+            Path(x_file_path)
+            if x_file_path is not None
+            else project_folder / f"{project_name}.x{geometry_number}"
+        )
+        if executable_path is None:
+            ras_exe_path = Path(str(getattr(ras_obj, "ras_exe_path", "")))
+            executable = ras_exe_path.parent / "x64" / "RasGeomPreprocess.exe"
+        else:
+            executable = Path(executable_path)
+
+        missing = [
+            str(path)
+            for path in (executable, input_hdf, x_file)
+            if not path.is_file() or path.stat().st_size == 0
+        ]
+        if missing:
+            return GeometryPreprocessResult(
+                success=False,
+                plan_number=plan_num,
+                geometry_number=geometry_number,
+                executable_path=executable,
+                input_hdf_path=input_hdf,
+                x_file_path=x_file,
+                error=(
+                    "Missing or empty geometry-preprocessor input: "
+                    + ", ".join(missing)
+                ),
+                elapsed_seconds=time.time() - start_time,
+            )
+
+        expected_x_name = f"{project_name}.x{geometry_number}".casefold()
+        try:
+            same_parent = x_file.parent.resolve() == input_hdf.parent.resolve()
+        except OSError:
+            same_parent = x_file.parent.absolute() == input_hdf.parent.absolute()
+        if not same_parent or x_file.name.casefold() != expected_x_name:
+            return GeometryPreprocessResult(
+                success=False,
+                plan_number=plan_num,
+                geometry_number=geometry_number,
+                executable_path=executable,
+                input_hdf_path=input_hdf,
+                x_file_path=x_file,
+                error=(
+                    "RasGeomPreprocess requires the project execution file "
+                    f"{project_name}.x{geometry_number} beside the input HDF"
+                ),
+                elapsed_seconds=time.time() - start_time,
+            )
+
+        executable_sha256 = RasPreprocess._file_sha256(executable)
+        before_sha256 = RasPreprocess._file_sha256(input_hdf)
+        command = [str(executable), str(input_hdf), f"x{geometry_number}"]
+        command_text = subprocess.list2cmdline(command)
+        process = None
+        stdout = ""
+        stderr = ""
+        timed_out = False
+        launch_error = None
+
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(input_hdf.parent),
+                shell=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            try:
+                stdout, stderr = process.communicate(timeout=int(timeout_sec))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                RasPreprocess._terminate_process_tree(process)
+                try:
+                    stdout, stderr = process.communicate(timeout=2)
+                except Exception:
+                    stdout, stderr = "", ""
+        except OSError as e:
+            launch_error = str(e)
+
+        after_sha256 = (
+            RasPreprocess._file_sha256(input_hdf)
+            if input_hdf.is_file() and input_hdf.stat().st_size > 0
+            else None
+        )
+        output_changed = bool(
+            before_sha256 and after_sha256 and before_sha256 != after_sha256
+        )
+        return_code = process.returncode if process is not None else None
+
+        hdf_readable = False
+        geometry_group_present = False
+        hdf_error = None
+        if after_sha256 is not None:
+            try:
+                import h5py
+
+                with h5py.File(input_hdf, "r") as handle:
+                    hdf_readable = True
+                    geometry_group_present = "Geometry" in handle
+            except Exception as e:
+                hdf_error = str(e)
+
+        errors = []
+        if launch_error:
+            errors.append(f"Could not launch RasGeomPreprocess: {launch_error}")
+        if timed_out:
+            errors.append(
+                f"RasGeomPreprocess timed out after {int(timeout_sec)} seconds"
+            )
+        if return_code is None:
+            errors.append("RasGeomPreprocess did not report a final return code")
+        elif return_code != 0:
+            errors.append(f"RasGeomPreprocess exited with code {return_code}")
+        if after_sha256 is None:
+            errors.append("RasGeomPreprocess did not leave a non-empty input HDF")
+        elif not hdf_readable:
+            errors.append(f"RasGeomPreprocess output HDF is unreadable: {hdf_error}")
+        elif not geometry_group_present:
+            errors.append("RasGeomPreprocess output HDF has no Geometry group")
+        if require_hdf_change and not output_changed:
+            errors.append("RasGeomPreprocess did not change the input HDF fingerprint")
+
+        combined_output = "\n".join(item for item in (stdout, stderr) if item)
+        from .results import ResultsParser
+
+        parsed = ResultsParser.parse_compute_messages(combined_output)
+        operational_error_count = len(errors)
+        if parsed["has_errors"]:
+            errors.append(
+                "RasGeomPreprocess reported an error: "
+                f"{parsed['first_error_line']}"
+            )
+
+        return GeometryPreprocessResult(
+            success=not errors,
+            plan_number=plan_num,
+            geometry_number=geometry_number,
+            elapsed_seconds=time.time() - start_time,
+            command=command_text,
+            return_code=return_code,
+            executable_path=executable,
+            executable_sha256=executable_sha256,
+            input_hdf_path=input_hdf,
+            x_file_path=x_file,
+            input_hdf_sha256_before=before_sha256,
+            input_hdf_sha256_after=after_sha256,
+            output_changed=output_changed,
+            hdf_readable=hdf_readable,
+            geometry_group_present=geometry_group_present,
+            timed_out=timed_out,
+            stdout=stdout or "",
+            stderr=stderr or "",
+            artifact_paths=[input_hdf, x_file],
+            error_count=operational_error_count + parsed["error_count"],
+            warning_count=parsed["warning_count"],
+            first_error_line=parsed["first_error_line"],
+            error="; ".join(errors) if errors else None,
         )
 
     @staticmethod
@@ -291,7 +1304,7 @@ class RasPreprocess:
 
         Args:
             plan_number: Plan number to check (e.g., "01", 1).
-            ras_object: Optional RasPrj instance. If None, uses global ras.
+            ras_object (RasPrj, optional): Optional RasPrj instance. If None, uses global ras.
 
         Returns:
             bool: True if all three files exist and are non-empty.
@@ -374,6 +1387,916 @@ class RasPreprocess:
         return None
 
     @staticmethod
+    def _file_sha256(path: Path) -> str:
+        """Return a streaming SHA-256 digest for a preprocessing artifact."""
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _artifact_state(path: Path) -> Optional[Tuple[int, int]]:
+        """Return a size/mtime fingerprint, or None when an artifact is absent."""
+        try:
+            stat = Path(path).stat()
+        except OSError:
+            return None
+        return stat.st_size, stat.st_mtime_ns
+
+    @staticmethod
+    def _normalized_preprocess_path(value: object) -> str:
+        """Normalize a command-line path for exact process ownership checks."""
+        text = str(value).strip().strip('"')
+        try:
+            return os.path.normcase(os.path.abspath(text))
+        except (OSError, ValueError):
+            return os.path.normcase(text)
+
+    @staticmethod
+    def _is_exact_complete_preprocess_process(
+        info: Dict[str, object],
+        tmp_hdf: Path,
+        started_at: float,
+    ) -> bool:
+        """Match this launch's event writer, including older runtime verbs."""
+        try:
+            if float(info.get("create_time") or 0.0) < float(started_at) - 2.0:
+                return False
+            if str(info.get("name") or "").casefold() != "rasprocess.exe":
+                return False
+            arguments = tuple(info.get("cmdline") or ())
+        except (TypeError, ValueError):
+            return False
+        return (
+            bool({"completepreprocess", "completeeventconditions"} & {
+                str(argument).strip().casefold() for argument in arguments
+            })
+            and RasPreprocess._normalized_preprocess_path(tmp_hdf)
+            in {
+                RasPreprocess._normalized_preprocess_path(argument)
+                for argument in arguments
+            }
+        )
+
+    @staticmethod
+    def _preprocess_process_inventory() -> Optional[List[Tuple[object, Dict[str, object]]]]:
+        """Inspect RAS candidates without querying unrelated command lines.
+
+        ``None`` means ownership could not be established. Callers must refuse
+        handoff and artifact inspection in that case. A process which vanished
+        while being queried is harmless; an unreadable name or RAS candidate
+        is not evidence of absence.
+        """
+        try:
+            import psutil
+
+            candidates = []
+            # On Wine, prefetching every process's command line can raise
+            # OSError(87) in the iterator itself, before its body runs.
+            for candidate in psutil.process_iter(["pid", "name"]):
+                try:
+                    info = dict(candidate.info)
+                    name = info.get("name")
+                    if not isinstance(name, str) or not name.strip():
+                        # Windows kernel minimal processes ("Secure System" under
+                        # virtualization-based security, "Memory Compression")
+                        # report no image name. Their parent is the kernel
+                        # (PID 0 or 4); they cannot be a RAS engine.
+                        if os.name == "nt" and candidate.ppid() in (0, 4):
+                            continue
+                        from ._process_inspection import _recover_empty_process_name
+
+                        name, recovered_created = _recover_empty_process_name(
+                            candidate, int(info["pid"]), psutil,
+                        )
+                        info.update(name=name, create_time=recovered_created)
+                    if name.casefold() not in {"ras.exe", "rasprocess.exe"}:
+                        continue
+                    # Reuse explicitly cached fields when available. Normally
+                    # process_iter above supplies only PID and name.
+                    arguments = (
+                        info["cmdline"] if "cmdline" in info else candidate.cmdline()
+                    )
+                    created = float(
+                        info["create_time"]
+                        if "create_time" in info else candidate.create_time()
+                    )
+                    pid = int(info["pid"])
+                    if (
+                        pid <= 0 or not 0.0 < created < float("inf")
+                        or not isinstance(arguments, (list, tuple))
+                        or not arguments
+                        or any(not isinstance(argument, str) for argument in arguments)
+                    ):
+                        raise ValueError("RAS process identity is incomplete")
+                    info.update(cmdline=arguments, create_time=created, pid=pid)
+                    candidates.append((candidate, info))
+                except psutil.NoSuchProcess:
+                    continue
+            return candidates
+        except Exception as exc:
+            logger.warning("Could not establish preprocessing process ownership: %s", exc)
+            return None
+
+    @staticmethod
+    def _active_complete_preprocess_writers(
+        tmp_hdf: Path,
+        started_at: float,
+    ) -> Tuple[int, ...]:
+        """Return exact launch-owned native event-writer PIDs.
+
+        HDF size/mtime stability alone cannot prove that the detached Windows
+        writer is done.  This intentionally excludes similarly named RAS
+        processes and only reports a process with the exact temporary HDF,
+        ``CompletePreProcess`` or ``CompleteEventConditions`` action, and
+        launch-window creation time. CompleteGeometry is not an event writer.
+        """
+        processes = RasPreprocess._preprocess_process_inventory()
+        if processes is None:
+            return (-1,)
+        writers = []
+        for _candidate, info in processes:
+            if RasPreprocess._is_exact_complete_preprocess_process(
+                info, tmp_hdf, started_at,
+            ):
+                writers.append(int(info["pid"]))
+        return tuple(sorted(set(writers)))
+
+    @staticmethod
+    def _detect_first_run_tcu_dialog(
+        root_pid: Optional[int] = None,
+    ) -> Optional[str]:
+        """Return a diagnostic for a TCU modal in one launched process tree."""
+        try:
+            titles = RasPreprocess._get_visible_window_titles(root_pid=root_pid)
+        except Exception as e:
+            return f"{RasPreprocess._TCU_SUPERVISION_ERROR} Detail: {e}"
+        for title in titles:
+            reason = legal_dialog_blocking_reason(title=title)
+            if reason:
+                return reason
+        return None
+
+    _LAND_CLASSIFICATION_ASSOCIATIONS = (
+        ("landcover", "land cover (Manning's n)"),
+        ("infiltration", "infiltration"),
+        ("sediment_soils", "sediment bed material"),
+    )
+
+    @staticmethod
+    def _skips_geometry_without_land_classification(ras_exe: Union[str, Path]) -> bool:
+        """Return whether this HEC-RAS release skips the geometry when a
+        referenced land-classification file is missing.
+
+        6.0-6.2 do; 6.3 and later still preprocess the mesh. The release is read
+        from the install folder name (e.g. ``...\\HEC-RAS\\6.2\\Ras.exe``); when it
+        cannot be determined, the check is applied.
+        """
+        match = re.search(r"(\d+)\.(\d+)", Path(str(ras_exe)).parent.name)
+        if match is None:
+            return True
+        return (int(match.group(1)), int(match.group(2))) < (6, 3)
+
+    @staticmethod
+    def _missing_land_classification_files(geom_hdf: Path) -> List[str]:
+        """Describe land-classification files the geometry HDF references but that do not exist.
+
+        Returns an empty list when the geometry HDF is absent or unreadable;
+        HEC-RAS then compiles the geometry from text and this check does not apply.
+        """
+        if not geom_hdf.is_file():
+            return []
+        try:
+            from ._geometry_association import read_geometry_association
+
+            association = read_geometry_association(geom_hdf)
+        except Exception as exc:
+            from .fast_hdf import reraise_required
+
+            # Required-native mode must not pass the pre-launch guard on a refusal.
+            reraise_required(exc)
+            logger.debug(f"Could not read associations from {geom_hdf.name}: {exc}")
+            return []
+
+        missing = []
+        for key, label in RasPreprocess._LAND_CLASSIFICATION_ASSOCIATIONS:
+            resolved = association.get(f"{key}_hdf_path")
+            if resolved and not Path(resolved).is_file():
+                raw = association.get(f"{key}_raw_filename")
+                missing.append(f"{label} '{raw}' (resolved to {resolved})")
+        return missing
+
+    @staticmethod
+    def _owned_tcu_ras_process(
+        launcher_pid: int,
+        launcher_create_time: float,
+        ras_exe: Union[str, Path],
+    ) -> Tuple[int, float]:
+        """Select one witnessed exact-runtime descendant of the Python launcher."""
+        import psutil
+
+        root = psutil.Process(launcher_pid)
+        if float(root.create_time()) != launcher_create_time:
+            raise RuntimeError("Preprocessing launcher PID was reused")
+        expected_name = ntpath.basename(str(ras_exe)).casefold()
+        normalize = lambda value: ntpath.normcase(ntpath.normpath(str(value)))
+        expected_exe = normalize(ras_exe)
+        matches = []
+        for candidate in root.children(recursive=True):
+            try:
+                name = candidate.name()
+                if not isinstance(name, str) or not name:
+                    raise RuntimeError("A launcher descendant name is unavailable")
+                if name.casefold() != expected_name:
+                    continue
+                created = float(candidate.create_time())
+                if not launcher_create_time <= created < float("inf"):
+                    raise RuntimeError("RAS descendant creation time is inconsistent")
+                fresh = psutil.Process(candidate.pid)
+                if float(fresh.create_time()) != created:
+                    raise RuntimeError("RAS descendant PID was reused")
+                if normalize(fresh.exe()) != expected_exe:
+                    continue
+                # children() witnesses ancestry; a second live parent-chain
+                # query must still bind the exact child to this exact launcher.
+                if not any(
+                    parent.pid == launcher_pid
+                    and float(parent.create_time()) == launcher_create_time
+                    for parent in fresh.parents()
+                ):
+                    raise RuntimeError("RAS descendant ancestry changed")
+                if float(psutil.Process(candidate.pid).create_time()) != created:
+                    raise RuntimeError("RAS descendant PID changed during ancestry inspection")
+                matches.append((int(candidate.pid), created))
+            except psutil.NoSuchProcess:
+                continue
+        if float(psutil.Process(launcher_pid).create_time()) != launcher_create_time:
+            raise RuntimeError("Preprocessing launcher identity changed")
+        if len(matches) != 1:
+            raise RuntimeError("Expected exactly one witnessed exact-runtime RAS descendant")
+        return matches[0]
+
+    @staticmethod
+    def _preprocessing_tcu_probe(
+        process,
+        *,
+        accept_tcu: bool,
+        launch_create_time: Optional[float],
+        ras_exe: Union[str, Path],
+        deadline: float,
+        receipts: list,
+        acceptance_state: dict,
+    ) -> Optional[str]:
+        """Keep default blocking; allow one explicitly authorized owned action."""
+        reason = RasPreprocess._detect_running_tcu_dialog(process)
+        if not accept_tcu or reason != RasPreprocess._TCU_BLOCKING_ERROR:
+            return reason
+        if acceptance_state.get("attempted"):
+            return reason + " The TCU dialog remained after explicit acceptance."
+        acceptance_state["attempted"] = True
+        audit = {
+            "preprocess_launcher_pid": process.pid,
+            "preprocess_launcher_create_time": launch_create_time,
+            "executable": str(ras_exe), "operator_acceptance": True,
+        }
+        try:
+            if launch_create_time is None or not 0 < launch_create_time < float("inf"):
+                raise RuntimeError("Exact preprocessing launcher creation time is unavailable")
+            remaining = float(deadline) - time.monotonic()
+            if not 0 < remaining < float("inf"):
+                raise TimeoutError("No bounded preprocessing time remains for TCU acceptance")
+            from .RasTcu import RasTcu
+
+            ras_pid, ras_created = RasPreprocess._owned_tcu_ras_process(
+                process.pid, launch_create_time, ras_exe,
+            )
+            # Scope inspection consumes time too; never extend the caller's
+            # preprocessing limit to make room for a legal-dialog action.
+            remaining = float(deadline) - time.monotonic()
+            if not 0 < remaining < float("inf"):
+                raise TimeoutError("Preprocessing time expired during TCU ownership inspection")
+            audit.update(ras_pid=ras_pid, ras_create_time=ras_created)
+            audit["requested_timeout_seconds"] = remaining
+            receipt = RasTcu.accept_running_terms(
+                ras_pid, expected_create_time=ras_created,
+                ras_version=str(ras_exe), operator_acceptance=True, timeout=remaining,
+            )
+            if not isinstance(receipt, dict):
+                raise RuntimeError("Owned TCU acceptance returned no action receipt")
+            audit.update(receipt)
+            if receipt.get("dialog_closed") is not True:
+                raise RuntimeError("Owned TCU wizard closure was not verified")
+            audit["success"] = True
+            receipts.append(audit)
+            logger.info("Explicit preprocessing TCU acceptance receipt: %s", audit)
+            return None
+        except Exception as exc:
+            audit.update(success=False, error=str(exc))
+            receipts.append(audit)
+            logger.warning("Explicit preprocessing TCU acceptance failed: %s", audit)
+            return reason + f" Explicit owned TCU acceptance failed: {exc}"
+
+    @staticmethod
+    def _detect_running_tcu_dialog(process) -> Optional[str]:
+        """Retain scoped supervision while the owned launcher is alive.
+
+        The launcher can exit between BcoMonitor's poll and window enumeration.
+        A scope-query failure in that race is not evidence of a legal dialog.
+        Natural-exit cleanup and artifact validation still run; live query
+        failures and any actually detected legal dialog remain blocking.
+        """
+        if process.poll() is not None:
+            return None
+        reason = RasPreprocess._detect_first_run_tcu_dialog(process.pid)
+        if (
+            reason and reason.startswith(RasPreprocess._TCU_SUPERVISION_ERROR)
+            and process.poll() is not None
+        ):
+            logger.debug("Preprocessing launcher exited during scoped TCU inspection")
+            return None
+        return reason
+
+    @staticmethod
+    def _tcu_supervision_availability_error() -> Optional[str]:
+        """Return a prelaunch diagnostic when scoped TCU detection is unavailable."""
+        if os.name != "nt":
+            return (
+                f"{RasPreprocess._TCU_SUPERVISION_ERROR} "
+                "A Windows-hosted Python process is required for this Ras.exe path."
+            )
+        try:
+            import psutil  # noqa: F401
+        except Exception as e:
+            return (
+                f"{RasPreprocess._TCU_SUPERVISION_ERROR} "
+                f"psutil is unavailable: {e}"
+            )
+        return None
+
+    @staticmethod
+    def _get_visible_window_titles(
+        root_pid: Optional[int] = None,
+    ) -> List[str]:
+        """Enumerate visible titles, optionally scoped to one process tree."""
+        if os.name != "nt":
+            return []
+
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            allowed_pids = None
+            if root_pid is not None:
+                allowed_pids = {int(root_pid)}
+                try:
+                    import psutil
+
+                    root = psutil.Process(int(root_pid))
+                    allowed_pids.update(
+                        child.pid for child in root.children(recursive=True)
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        "Could not enumerate descendants for TCU window scope "
+                        f"PID {root_pid}: {e}"
+                    ) from e
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            enum_windows_proc = ctypes.WINFUNCTYPE(
+                wintypes.BOOL,
+                wintypes.HWND,
+                wintypes.LPARAM,
+            )
+            user32.EnumWindows.argtypes = [enum_windows_proc, wintypes.LPARAM]
+            user32.EnumWindows.restype = wintypes.BOOL
+            user32.IsWindowVisible.argtypes = [wintypes.HWND]
+            user32.IsWindowVisible.restype = wintypes.BOOL
+            user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+            user32.GetWindowTextLengthW.restype = ctypes.c_int
+            user32.GetWindowTextW.argtypes = [
+                wintypes.HWND,
+                wintypes.LPWSTR,
+                ctypes.c_int,
+            ]
+            user32.GetWindowTextW.restype = ctypes.c_int
+            user32.GetWindowThreadProcessId.argtypes = [
+                wintypes.HWND,
+                ctypes.POINTER(wintypes.DWORD),
+            ]
+            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+            titles: List[str] = []
+
+            @enum_windows_proc
+            def collect_title(hwnd, _lparam):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                if allowed_pids is not None:
+                    window_pid = wintypes.DWORD()
+                    user32.GetWindowThreadProcessId(
+                        hwnd,
+                        ctypes.byref(window_pid),
+                    )
+                    if int(window_pid.value) not in allowed_pids:
+                        return True
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length <= 0:
+                    return True
+                buffer = ctypes.create_unicode_buffer(length + 1)
+                if user32.GetWindowTextW(hwnd, buffer, length + 1):
+                    title = buffer.value.strip()
+                    if title:
+                        titles.append(title)
+                return True
+
+            user32.EnumWindows(collect_title, 0)
+            return titles
+        except Exception as e:
+            if root_pid is not None:
+                raise RuntimeError(
+                    f"Could not enumerate scoped visible window titles: {e}"
+                ) from e
+            logger.debug(f"Could not enumerate visible window titles: {e}")
+            return []
+
+    @staticmethod
+    def _plan_uses_gridded_precipitation(
+        plan_file: Path,
+        project_folder: Path,
+        project_name: str,
+    ) -> bool:
+        """Return whether a plan's active unsteady file enables gridded rain."""
+        return RasPreprocess._plan_precipitation_mode(
+            plan_file, project_folder, project_name
+        ) == "gridded"
+
+    @staticmethod
+    def _plan_precipitation_mode(
+        plan_file: Path,
+        project_folder: Path,
+        project_name: str,
+    ) -> Optional[str]:
+        """Read enabled rainfall mode, 'none' when disabled, or None if unavailable.
+
+        This is intentionally read from the text inputs that HEC-RAS consumes,
+        rather than inferred from an existing sidecar or temporary HDF. A stale
+        HDF can be the artifact that preprocessing is supposed to replace.
+        """
+        try:
+            plan_text = Path(plan_file).read_text(
+                encoding="utf-8",
+                errors="ignore",
+            )
+            match = re.search(
+                r"^Flow File\s*=\s*[uU](\d{1,2})\s*$",
+                plan_text,
+                flags=re.MULTILINE,
+            )
+            if match is None:
+                return None
+            unsteady_number = match.group(1).zfill(2)
+            unsteady_file = (
+                Path(project_folder)
+                / f"{project_name}.u{unsteady_number}"
+            )
+            if not unsteady_file.is_file():
+                return None
+
+            precipitation_mode = ""
+            met_mode = ""
+            with unsteady_file.open(
+                "r",
+                encoding="utf-8",
+                errors="ignore",
+            ) as handle:
+                for line in handle:
+                    stripped = line.strip()
+                    if stripped.startswith("Precipitation Mode="):
+                        precipitation_mode = stripped.split("=", 1)[1].strip()
+                    elif stripped.startswith("Met BC=Precipitation|Mode="):
+                        met_mode = stripped.split("=", 2)[-1].strip()
+            if precipitation_mode.casefold() == "enable":
+                return met_mode.casefold() or None
+            return "none" if precipitation_mode else None
+        except OSError as exc:
+            logger.debug(
+                "Could not inspect precipitation mode for %s: %s",
+                Path(plan_file).name,
+                exc,
+            )
+            return None
+
+    @staticmethod
+    def _validate_materialized_gridded_precipitation(
+        tmp_hdf: Path,
+    ) -> Tuple[bool, str]:
+        """Check a completed temporary HDF's gridded-rainfall structure.
+
+        This inexpensive predicate is deliberately *not* a solver-readiness
+        check, but it still opens the HDF.  Call it only after all owned native
+        writers are stopped and the file is quiescent.  ``check_solver_ready``
+        performs the final completed-file numerical checks afterward.
+        """
+        precipitation = RasPreprocess._GRIDDED_PRECIPITATION_GROUP
+        values_path = f"{precipitation}/Values"
+        timestamp_path = f"{precipitation}/Timestamp"
+        try:
+            import h5py
+
+            from .fast_hdf import read_typed
+
+            with h5py.File(tmp_hdf, "r") as hdf:
+                missing = [
+                    path
+                    for path in (values_path, timestamp_path)
+                    if path not in hdf
+                ]
+                if missing:
+                    return False, "missing " + ", ".join(missing)
+                values = hdf[values_path]
+                timestamps = hdf[timestamp_path]
+                if values.ndim != 2 or not all(values.shape):
+                    return False, f"invalid Values shape {values.shape}"
+                if timestamps.ndim != 1 or not timestamps.shape[0]:
+                    return False, f"invalid Timestamp shape {timestamps.shape}"
+                if values.shape[0] != timestamps.shape[0]:
+                    return (
+                        False,
+                        "Values and Timestamp lengths differ "
+                        f"({values.shape[0]} != {timestamps.shape[0]})",
+                    )
+
+                areas_path = "Geometry/2D Flow Areas"
+                areas_group = hdf.get(areas_path)
+                if areas_group is None:
+                    return True, "ready (no 2D flow areas)"
+                attributes = areas_group.get("Attributes")
+                if (
+                    attributes is not None
+                    and attributes.dtype.names
+                    and "Name" in attributes.dtype.names
+                ):
+                    area_names = []
+                    for name in read_typed(attributes)["Name"]:
+                        if isinstance(name, bytes):
+                            name = name.decode("utf-8", "replace")
+                        name = str(name).strip()
+                        if name:
+                            area_names.append(name)
+                else:
+                    area_names = [
+                        name
+                        for name, node in areas_group.items()
+                        if isinstance(node, h5py.Group)
+                    ]
+
+                missing_interpolation = []
+                for area_name in area_names:
+                    area_path = f"{precipitation}/2D Flow Areas/{area_name}"
+                    area_group = hdf.get(area_path)
+                    if area_group is None:
+                        missing_interpolation.append(f"{area_path}/")
+                        continue
+                    for dataset_name in (
+                        RasPreprocess._GRIDDED_PRECIPITATION_INTERPOLATION_DATASETS
+                    ):
+                        dataset_path = f"{area_path}/{dataset_name}"
+                        dataset = hdf.get(dataset_path)
+                        if (
+                            dataset is None
+                            or not getattr(dataset, "shape", None)
+                            or dataset.shape[0] == 0
+                        ):
+                            missing_interpolation.append(dataset_path)
+                if missing_interpolation:
+                    return (
+                        False,
+                        "missing or empty gridded interpolation dataset(s): "
+                        + ", ".join(missing_interpolation),
+                    )
+        except Exception as exc:
+            from .fast_hdf import reraise_required
+
+            reraise_required(exc)
+            return False, f"could not inspect {Path(tmp_hdf).name}: {exc}"
+        return True, "ready"
+
+    @staticmethod
+    def _wait_stopped_artifacts_quiet(paths: Tuple[Path, ...], timeout: float = 10.0) -> bool:
+        """Wait for file metadata to settle after exact owned-process cleanup."""
+        deadline = time.monotonic() + timeout
+        previous = None
+        stable_since = time.monotonic()
+        while time.monotonic() < deadline:
+            current = tuple(RasPreprocess._artifact_state(path) for path in paths)
+            now = time.monotonic()
+            if current != previous:
+                previous, stable_since = current, now
+            elif now - stable_since >= RasPreprocess._GRIDDED_PRECIPITATION_STABLE_SECONDS:
+                return True
+            time.sleep(0.1)
+        return False
+
+    @staticmethod
+    def _completepreprocess_handoff_ready(
+        tmp_hdf: Path,
+        b_file: Path,
+        x_file: Path,
+        stability_state: Dict[str, object],
+        *,
+        started_at: float,
+        artifact_baseline: Optional[
+            Dict[Path, Optional[Tuple[int, int]]]
+        ] = None,
+        solver_started: Optional[Callable[[], bool]] = None,
+        allow_completed_hdf: bool = False,
+        defer_stat_quiescence: bool = False,
+    ) -> bool:
+        """Return when an observed native writer has ended and artifacts are quiet.
+
+        Also return once no writer is active and ``solver_started`` reports this
+        launch's own unsteady solver running: HEC-RAS starts the solver only
+        after preprocessing has written the event conditions, and the solver's
+        own writes would otherwise keep the artifacts from ever going quiet.
+        Some releases (6.1) run no separate writer at all.
+
+        This is an active-engine predicate.  It intentionally never opens the
+        temporary HDF: HDF5 readers can deny Windows writer access.  The caller
+        must stop its owned process tree and run completed-file structural and
+        solver-readiness validation separately after this method returns true.
+        """
+        writers = RasPreprocess._active_complete_preprocess_writers(
+            tmp_hdf,
+            started_at,
+        )
+        if writers:
+            if writers == (-1,):
+                logger.warning(
+                    "Could not enumerate CompletePreProcess writers; refusing "
+                    "gridded-preprocessing handoff for this poll"
+                )
+                # A failed current query cannot authorize handoff, but does
+                # not invalidate a previously observed exact writer. Require
+                # a later successful inventory and new quiescence checks.
+                for key in (
+                    "active_completepreprocess_pids", "writer_absent_since",
+                    "fingerprint", "observed_at",
+                ):
+                    stability_state.pop(key, None)
+                return False
+            if stability_state.get("active_completepreprocess_pids") != writers:
+                logger.info(
+                    "Waiting for exact CompletePreProcess writer(s) before "
+                    "stopping gridded preprocessing: %s",
+                    ", ".join(str(pid) for pid in writers),
+                )
+            stability_state["completepreprocess_seen"] = True
+            stability_state["active_completepreprocess_pids"] = writers
+            stability_state.pop("writer_absent_since", None)
+            stability_state.pop("fingerprint", None)
+            stability_state.pop("observed_at", None)
+            return False
+
+        # HEC-RAS starts its unsteady solver only after preprocessing; with no
+        # writer running (a successful scan), the solver's start is the handoff.
+        # Some releases (6.1) never run a separate CompletePreProcess writer.
+        # Completed-file validation still requires the materialized precipitation.
+        if solver_started is not None and solver_started():
+            stability_state.pop("active_completepreprocess_pids", None)
+            stability_state["writer_observation"] = (
+                "solver_started" if stability_state.get("completepreprocess_seen")
+                else "solver_started_no_writer_observed")
+            logger.info(
+                "No CompletePreProcess writer is active and the owned unsteady "
+                "solver started; stopping before it advances"
+            )
+            return True
+
+        # The narrow process matcher may not have observed a writer yet.  That
+        # absence is not evidence that no writer can still start, so it cannot
+        # authorize an early stop or any HDF read.
+        if not stability_state.get("completepreprocess_seen"):
+            stability_state.pop("active_completepreprocess_pids", None)
+            stability_state.pop("writer_absent_since", None)
+            stability_state.pop("fingerprint", None)
+            stability_state.pop("observed_at", None)
+            return False
+
+        readiness_hdf = tmp_hdf
+        if allow_completed_hdf and not tmp_hdf.is_file():
+            # A completed native run may consume/rename .tmp.hdf before the
+            # quiet period ends. Only a changed final file from this launch
+            # can serve as the existing post-stop full-result-copy fallback.
+            final_hdf = tmp_hdf.with_name(tmp_hdf.name.replace(".tmp.hdf", ".hdf"))
+            final_state = RasPreprocess._artifact_state(final_hdf)
+            before = (artifact_baseline or {}).get(final_hdf)
+            if final_state is not None and final_state != before:
+                readiness_hdf = final_hdf
+
+        if not RasPreprocess._preprocessing_artifacts_ready(
+            readiness_hdf,
+            b_file,
+            x_file,
+            artifact_baseline=artifact_baseline,
+        ):
+            stability_state.pop("writer_absent_since", None)
+            stability_state.pop("fingerprint", None)
+            stability_state.pop("observed_at", None)
+            return False
+
+        if defer_stat_quiescence:
+            # Stop the owned launcher before it consumes .tmp.hdf for the
+            # solver. The native writer has already exited. Stat quiescence
+            # is checked after all owned processes stop and before HDF reads.
+            stability_state["writer_observation"] = "writer_exited"
+            return True
+
+        now = time.monotonic()
+        stability_state.pop("active_completepreprocess_pids", None)
+        if "writer_absent_since" not in stability_state:
+            stability_state["writer_absent_since"] = now
+            stability_state["writer_observation"] = "writer_quiescent"
+            logger.info(
+                "Observed CompletePreProcess writer is no longer active; "
+                "requiring %.1fs writer/stat quiescence",
+                RasPreprocess._GRIDDED_PRECIPITATION_STABLE_SECONDS,
+            )
+            return False
+        writer_absent_since = stability_state["writer_absent_since"]
+        if (
+            not isinstance(writer_absent_since, Number)
+            or now - float(writer_absent_since)
+            < RasPreprocess._GRIDDED_PRECIPITATION_STABLE_SECONDS
+        ):
+            return False
+        current = (str(readiness_hdf), RasPreprocess._artifact_state(readiness_hdf))
+        if stability_state.get("fingerprint") != current:
+            stability_state["fingerprint"] = current
+            stability_state["observed_at"] = now
+            return False
+        observed_at = stability_state.get("observed_at")
+        return (
+            isinstance(observed_at, Number)
+            and now - float(observed_at)
+            >= RasPreprocess._GRIDDED_PRECIPITATION_STABLE_SECONDS
+        )
+
+    @staticmethod
+    def _validate_completed_gridded_preprocessing(
+        tmp_hdf: Path,
+    ) -> Tuple[bool, str]:
+        """Run the expensive Linux input gate once after the writer is stopped."""
+        before = RasPreprocess._artifact_state(tmp_hdf)
+        if before is None:
+            return False, f"missing {Path(tmp_hdf).name}"
+        try:
+            # This check reads property-table chunks to reject NaNs and also
+            # verifies Geometry/GeomPreprocess.  Do not call it while the
+            # Windows engine may still be writing the temporary HDF.
+            from .RasApptainer import check_solver_ready
+
+            problems = check_solver_ready(tmp_hdf, geom_preprocess=False)
+        except Exception as exc:
+            return False, f"could not validate completed {Path(tmp_hdf).name}: {exc}"
+        after = RasPreprocess._artifact_state(tmp_hdf)
+        if after != before:
+            return False, f"{Path(tmp_hdf).name} changed during solver-readiness validation"
+        if problems:
+            return False, "; ".join(problems)
+        return True, "ready"
+
+    @staticmethod
+    def _preprocessing_artifacts_ready(
+        tmp_hdf: Path,
+        b_file: Path,
+        x_file: Path,
+        artifact_baseline: Optional[
+            Dict[Path, Optional[Tuple[int, int]]]
+        ] = None,
+    ) -> bool:
+        """Return whether all preprocessing artifacts exist and are fresh."""
+        artifacts = (Path(tmp_hdf), Path(b_file), Path(x_file))
+        if any(
+            not path.is_file() or path.stat().st_size == 0
+            for path in artifacts
+        ):
+            return False
+        if artifact_baseline is not None:
+            for path in artifacts:
+                before = artifact_baseline.get(path)
+                if (
+                    before is not None
+                    and RasPreprocess._artifact_state(path) == before
+                ):
+                    return False
+        return True
+
+    @staticmethod
+    def _materialized_gridded_precipitation_ready(
+        tmp_hdf: Path,
+        b_file: Path,
+        x_file: Path,
+        artifact_baseline: Optional[
+            Dict[Path, Optional[Tuple[int, int]]]
+        ] = None,
+    ) -> bool:
+        """Inspect a completed, writer-free HDF for gridded-rain structure.
+
+        This is not safe while an owned HEC-RAS process may be writing the
+        temporary HDF.  Active preprocessing uses
+        :meth:`_completepreprocess_handoff_ready` instead.
+        """
+        if not RasPreprocess._preprocessing_artifacts_ready(
+            tmp_hdf,
+            b_file,
+            x_file,
+            artifact_baseline=artifact_baseline,
+        ):
+            return False
+        materialized, _detail = (
+            RasPreprocess._validate_materialized_gridded_precipitation(
+                tmp_hdf
+            )
+        )
+        return materialized
+
+    @staticmethod
+    def _preprocessing_ready(
+        root_pid: int,
+        tmp_hdf: Path,
+        b_file: Path,
+        x_file: Path,
+        artifact_baseline: Optional[
+            Dict[Path, Optional[Tuple[int, int]]]
+        ] = None,
+        require_materialized_gridded_precipitation: bool = False,
+    ) -> bool:
+        """Return whether owned preprocessing reached a safe handoff point.
+
+        With gridded precipitation this method deliberately does not inspect
+        the HDF while the owned process may still write it.  It therefore
+        refuses the materialized-rain option; callers must use the dedicated
+        CompletePreProcess lifecycle handoff and validate only after cleanup.
+        """
+        if not RasPreprocess._unsteady_compute_started(
+            root_pid,
+            tmp_hdf,
+            b_file,
+            x_file,
+            artifact_baseline=artifact_baseline,
+        ):
+            return False
+        if not require_materialized_gridded_precipitation:
+            return True
+        return False
+
+    @staticmethod
+    def _unsteady_compute_started(
+        root_pid: int,
+        tmp_hdf: Path,
+        b_file: Path,
+        x_file: Path,
+        artifact_baseline: Optional[
+            Dict[Path, Optional[Tuple[int, int]]]
+        ] = None,
+    ) -> bool:
+        """Return True when this launch owns a ready unsteady compute process."""
+        if not RasPreprocess._preprocessing_artifacts_ready(
+            tmp_hdf,
+            b_file,
+            x_file,
+            artifact_baseline=artifact_baseline,
+        ):
+            return False
+
+        try:
+            import psutil
+
+            descendants = psutil.Process(int(root_pid)).children(recursive=True)
+        except Exception:
+            return False
+
+        for child in descendants:
+            candidates = []
+            try:
+                candidates.append(child.name())
+            except Exception:
+                pass
+            try:
+                command = child.cmdline()
+                if command:
+                    candidates.append(Path(command[0]).name)
+            except Exception:
+                pass
+            if any(
+                str(candidate).casefold() in RasPreprocess._UNSTEADY_PROCESS_NAMES
+                for candidate in candidates
+            ):
+                return True
+        return False
+
+    @staticmethod
     def _terminate_process_tree(process: subprocess.Popen) -> None:
         """
         Kill a process and all its children.
@@ -386,26 +2309,220 @@ class RasPreprocess:
         """
         try:
             import psutil
-            parent = psutil.Process(process.pid)
-            children = parent.children(recursive=True)
-
-            # Kill children first, then parent
-            for child in children:
-                try:
-                    child.kill()
-                except psutil.NoSuchProcess:
-                    pass
-
-            parent.kill()
-            process.wait(timeout=10)
-            logger.debug("HEC-RAS process tree terminated")
         except Exception as e:
-            logger.warning(f"psutil termination failed ({e}), falling back to process.kill()")
+            logger.warning(
+                f"psutil unavailable ({e}); falling back to process.kill()"
+            )
             try:
                 process.kill()
                 process.wait(timeout=10)
             except Exception:
                 pass
+            return
+
+        try:
+            parent = psutil.Process(process.pid)
+            children = parent.children(recursive=True)
+
+            # Kill children first, then parent
+            for child in reversed(children):
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+
+            try:
+                parent.kill()
+            except psutil.NoSuchProcess:
+                pass
+
+            _, survivors = psutil.wait_procs(
+                [*children, parent],
+                timeout=10,
+            )
+            for survivor in survivors:
+                try:
+                    survivor.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            if survivors:
+                _, survivors = psutil.wait_procs(survivors, timeout=2)
+            if survivors:
+                logger.warning(
+                    "Owned HEC-RAS processes survived termination: %s",
+                    ", ".join(str(item.pid) for item in survivors),
+                )
+            try:
+                process.wait(timeout=2)
+            except Exception:
+                pass
+            logger.debug("HEC-RAS process tree terminated")
+        except psutil.NoSuchProcess:
+            # GUI-subsystem Ras.exe can detach its exact-plan replacement and
+            # allow the Python-owned launcher to exit before readiness is
+            # observed. The exact-plan residue cleanup immediately following
+            # this call handles that scoped handoff.
+            try:
+                process.wait(timeout=2)
+            except Exception:
+                pass
+            logger.debug(
+                "HEC-RAS launcher exited before process-tree termination"
+            )
+        except Exception as e:
+            # GUI-subsystem launchers can disappear between psutil discovery
+            # and termination. A successful direct fallback is an expected
+            # cleanup race, not a user-actionable preprocessing warning.
+            logger.debug(
+                "psutil process-tree termination was unavailable (%s); "
+                "falling back to process.kill()",
+                e,
+            )
+            try:
+                process.kill()
+                process.wait(timeout=10)
+            except Exception as fallback_error:
+                logger.warning(
+                    "Unable to terminate the owned HEC-RAS launcher after "
+                    "psutil fallback: %s",
+                    fallback_error,
+                )
+
+    @staticmethod
+    def _terminate_exact_preprocess_residue(
+        project_file: Path,
+        plan_file: Path,
+        tmp_hdf: Path,
+        started_at: float,
+        timeout_seconds: float = 10.0,
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+        """Stop detached processes proven to belong to one preprocess launch.
+
+        ``Ras.exe`` can return control to its parent while a replacement
+        ``Ras.exe`` and ``RasProcess.exe CompletePreProcess`` continue in the
+        background. Process ancestry is no longer sufficient after that
+        handoff, so matching is deliberately narrow:
+
+        * ``Ras.exe`` must contain the exact project and plan path arguments.
+        * ``RasProcess.exe`` must request ``CompletePreProcess`` for the exact
+          temporary plan HDF.
+        * the process must have started within this preprocessing launch.
+
+        Descendants of those exact roots are included, then children are
+        terminated before parents. The returned tuples contain stopped and
+        surviving PIDs respectively.
+        """
+        try:
+            import psutil
+        except Exception as exc:
+            logger.warning(
+                "Could not inspect detached preprocessing processes: %s",
+                exc,
+            )
+            return (), (-1,)
+
+        exact_project = RasPreprocess._normalized_preprocess_path(project_file)
+        exact_plan = RasPreprocess._normalized_preprocess_path(plan_file)
+        earliest_create_time = float(started_at) - 2.0
+        roots = []
+
+        processes = RasPreprocess._preprocess_process_inventory()
+        if processes is None:
+            return (), (-1,)
+        for candidate, info in processes:
+            name = str(info["name"]).casefold()
+            if float(info["create_time"]) < earliest_create_time:
+                continue
+            normalized_arguments = {
+                RasPreprocess._normalized_preprocess_path(argument)
+                for argument in info["cmdline"]
+            }
+
+            ras_launcher = (
+                name == "ras.exe"
+                and exact_project in normalized_arguments
+                and exact_plan in normalized_arguments
+            )
+            complete_preprocess = RasPreprocess._is_exact_complete_preprocess_process(
+                info,
+                tmp_hdf,
+                started_at,
+            )
+            if ras_launcher or complete_preprocess:
+                roots.append(candidate)
+
+        targets = {}
+        for root in roots:
+            try:
+                root_created = float(root.create_time())
+                targets[(int(root.pid), root_created)] = root
+                for child in root.children(recursive=True):
+                    child_created = float(child.create_time())
+                    if child_created >= earliest_create_time:
+                        targets[(int(child.pid), child_created)] = child
+            except psutil.NoSuchProcess:
+                continue
+            except (psutil.AccessDenied, OSError):
+                return (), (-1,)
+
+        if not targets:
+            return (), ()
+
+        ordered = sorted(
+            targets.items(),
+            key=lambda item: item[1].pid,
+            reverse=True,
+        )
+        requested = []
+        stopped = []
+        for (pid, create_time), target in ordered:
+            try:
+                if abs(float(target.create_time()) - create_time) > 1e-6:
+                    continue
+                target.terminate()
+                requested.append(target)
+            except psutil.NoSuchProcess:
+                stopped.append(pid)
+            except psutil.AccessDenied:
+                logger.warning(
+                    "Access denied while stopping preprocessing PID %s",
+                    pid,
+                )
+
+        alive = []
+        if requested:
+            gone, alive = psutil.wait_procs(
+                requested,
+                timeout=max(0.1, float(timeout_seconds)),
+            )
+            stopped.extend(int(item.pid) for item in gone)
+
+        for target in alive:
+            try:
+                target.kill()
+            except psutil.NoSuchProcess:
+                stopped.append(int(target.pid))
+            except psutil.AccessDenied:
+                logger.warning(
+                    "Access denied while killing preprocessing PID %s",
+                    target.pid,
+                )
+
+        if alive:
+            gone, alive = psutil.wait_procs(alive, timeout=2.0)
+            stopped.extend(int(item.pid) for item in gone)
+
+        survivors = []
+        for target in alive:
+            try:
+                if target.is_running():
+                    survivors.append(int(target.pid))
+                else:
+                    stopped.append(int(target.pid))
+            except psutil.NoSuchProcess:
+                stopped.append(int(target.pid))
+
+        return tuple(sorted(set(stopped))), tuple(sorted(set(survivors)))
 
     @staticmethod
     def _clear_preprocessing_files(
@@ -417,7 +2534,8 @@ class RasPreprocess:
         """
         Delete stale preprocessing files to force regeneration.
 
-        Removes .tmp.hdf, .hdf, .b##, .x##, and .bco## files.
+        Removes .tmp.hdf, .b##, .x##, and .bco## files. Final plan HDF and
+        legacy .O## results are deliberately preserved.
 
         Args:
             project_folder: Path to the project folder.
@@ -426,7 +2544,6 @@ class RasPreprocess:
             geom_num: Geometry number (e.g., "04").
         """
         patterns = [
-            f"{project_name}.p{plan_num}.hdf",
             f"{project_name}.p{plan_num}.tmp.hdf",
             f"{project_name}.b{plan_num}",
             f"{project_name}.x{geom_num}",

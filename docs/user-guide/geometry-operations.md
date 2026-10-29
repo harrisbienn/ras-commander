@@ -9,7 +9,7 @@ RAS Commander provides comprehensive geometry parsing and modification for HEC-R
 | `RasGeometry` | 1D geometry parsing (cross sections, storage areas, connections) |
 | `RasGeometryUtils` | Parsing utilities (fixed-width, count interpretation) |
 | `RasStruct` | Inline structure parsing (bridges, culverts, weirs) |
-| `RasGeo` | 2D Manning's n land cover operations |
+| `GeomLandCover` | 2D Manning's n tables and region overrides in text geometry |
 | `HdfHydraulicTables` | Cross section property tables (HTAB) from HDF |
 
 ## Cross Sections
@@ -180,19 +180,182 @@ all_culverts = RasStruct.get_all_culverts("01", river, reach, station)
 
 ## 2D Manning's n (Land Cover)
 
+`GeomLandCover` edits the geometry text (`.g##`). Work in a copied project and
+resolve the geometry referenced by the selected plan. This example changes an
+existing base override table and reads it back; the 10% factor only illustrates
+the writer mechanics.
+
 ```python
-from ras_commander import RasGeo
+from pathlib import Path
+from ras_commander import GeomLandCover, ras
+
+plan_row = ras.plan_df.loc[ras.plan_df['plan_number'] == '01'].iloc[0]
+geom_path = Path(ras.geom_df.loc[
+    ras.geom_df['geom_number'] == plan_row['geometry_number'], 'full_path'
+].iloc[0])
 
 # Get base Manning's n table
-base_n = RasGeo.get_base_mannings_table("01")
+base_n = GeomLandCover.get_base_mannings_n(geom_path)
 print(base_n)
+if base_n.empty:
+    raise ValueError("Selected geometry has no existing base Manning's n table")
 
-# Get regional overrides
-regional = RasGeo.get_regional_mannings("01", "2D Flow Area")
+# Read all regional overrides; select a Region Name from this table if needed
+regional = GeomLandCover.get_region_mannings_n(geom_path)
+print(regional)
 
-# Update Manning's n
-RasGeo.set_base_mannings_table("01", updated_table)
+# Preserve the existing class names and Table Number while changing values
+updated_table = base_n.copy()
+updated_table['Base Mannings n Value'] *= 1.10
+GeomLandCover.set_base_mannings_n(geom_path, updated_table)
+readback = GeomLandCover.get_base_mannings_n(geom_path)
+print(readback)
 ```
+
+The layers have different owners and evidence:
+
+| Layer | API / evidence |
+|---|---|
+| Land-cover raster sidecar class values | `HdfLandCover.get_landcover_raster_map()` and native `set_landcover_mannings_n()` |
+| Geometry base overrides | `GeomLandCover.get_base_mannings_n()` / `set_base_mannings_n()`; the setter requires the existing class-name set |
+| Geometry regional overrides and polygons | `GeomLandCover.get_region_mannings_n()` / `set_region_mannings_n()` and `set_mannings_region_polygons()` |
+| Geometry-to-sidecar association | `RasMap.list_geometry_associations()` / `validate_geometry_associations()` |
+| Preprocessed cell/face values used by the solver | Recompute native property tables, then inspect with `HdfLandCover.audit_final_mannings_n()` |
+
+Text readback establishes the stored override, not its effect on solver-owned
+arrays. An absent/broken land-cover association can leave the 2D area's scalar
+default in every cell even when preprocessing reports success. Follow the
+[association and property-table guidance](../api/geometry.md#geommesh), then use
+the controlled [land-cover authoring example](../notebooks/212_landcover_mannings_n_write.md)
+or [region polygon example](../notebooks/233_mannings_region_polygon_authoring.md)
+for readback, recomputation, and final-value evidence. Existing deprecated
+`RasGeo` wrappers remain compatibility interfaces; new examples use `GeomLandCover`.
+
+## Rebuilding a copied 2D geometry from text
+
+For a task-local breakout model, initialize the copied project with the HEC-RAS
+version that will perform the work. An existing geometry HDF remains
+authoritative in RAS Mapper, so opening and saving it does **not** import an
+externally edited `.g##` perimeter or breakline collection. Use the exact,
+transactional import workflow instead:
+
+```python
+from pathlib import Path
+from ras_commander import (
+    GeomMesh,
+    GeomReferenceFeatures,
+    GeomStorage,
+    init_ras_project,
+)
+from ras_commander.gui.workflows import MeshRegenerationWorkflow
+
+ras = init_ras_project(
+    Path(r"C:\tasks\breakout\Model.prj"),
+    "6.6",
+    ras_object="new",
+    load_results_summary=False,
+)
+
+# The caller has already edited only the task-local cloned g03 text.
+GeomStorage.set_2d_flow_area_perimeter(
+    ras.project_folder / "Model.g03",
+    "Breakout Area",
+    reduced_domain_polygon,
+)
+GeomStorage.replace_breaklines(
+    ras.project_folder / "Model.g03",
+    "Breakout Area",
+    retained_and_clipped_breaklines,
+    expected_existing_names=source_breakline_names,
+)
+
+# Remove parent reference lines outside the reduced domain and replace the
+# retained collection in one guarded text mutation.
+GeomReferenceFeatures.replace_reference_lines(
+    ras.project_folder / "Model.g03",
+    "Breakout Area",
+    retained_reference_lines,
+    expected_existing_names=source_reference_line_names,
+)
+
+refresh = MeshRegenerationWorkflow.refresh_geometry_hdf_from_text(
+    geom_number="03",
+    geometry_name="Breakout Geometry",
+    flow_area_name="Breakout Area",
+    ras_object=ras,
+)
+if not refresh.success:
+    raise refresh.error
+
+# HDF-only collections are replaced after RAS Mapper imports the text.
+GeomMesh.replace_refinement_regions(
+    "03",
+    retained_refinement_regions,
+    expected_existing_names=source_refinement_names,
+    ras_object=ras,
+)
+
+# The admissible feature envelope is smaller than the new domain: the exact
+# compiled perimeter buffered inward by one full base-cell spacing.
+containment = GeomMesh.audit_domain_containment(
+    "03",
+    mesh_name="Breakout Area",
+    ras_object=ras,
+)
+if not containment.ok:
+    raise ValueError(containment.violations)
+
+mesh = GeomMesh.generate(
+    "03",
+    mesh_name="Breakout Area",
+    ras_object=ras,
+    hecras_dir=Path(ras.ras_exe_path).parent,
+)
+if not mesh.ok:
+    raise RuntimeError(mesh.error_message)
+
+GeomMesh.compute_property_tables(
+    "03",
+    mesh_name="Breakout Area",
+    ras_object=ras,
+)
+```
+
+The import defaults to the geometry referenced by the sole current plan when
+`geom_number` is omitted. If both number and name are supplied, they must
+identify the same unique RAS Mapper layer. Only that HDF is displaced; failure
+restores it, non-target geometry HDFs must retain their size and modification
+time, and the post-save perimeter must match the text geometrically. The GUI
+process tree is supervised from the owned `Ras.exe` PID and no global process
+cleanup is performed. Terrain, land-cover, infiltration, and sediment
+associations are captured before the import and restored and validated on the
+replacement HDF. A missing associated artifact or failed restoration rolls the
+transaction back.
+
+The containment buffer is **inward**, not outward. With a 200-foot base mesh,
+the eligible feature envelope is the new perimeter eroded by 200 feet.
+Breaklines, refinement regions, and structures must be wholly inside that
+envelope before meshing begins. Do not apply this gate to BC lines: inflow and
+outflow lines belong on the perimeter and instead need exact 2D-area
+association, external-face coverage, endpoint clearance, and mutual-overlap
+checks. Reference lines are result-extraction features rather than meshing
+constraints; remove any parent line that no longer intersects the reduced
+domain so HEC-RAS cannot fail during results processing.
+
+`HdfBndry.get_breaklines()` exposes `cell_spacing_near`,
+`cell_spacing_far`, `near_repeats`, and `protection_radius` so a clipped
+collection can preserve the parent BLE meshing controls. Multipart intersections
+must be emitted as uniquely named single-part breaklines because the text format
+stores one polyline per breakline block.
+
+Treat the resulting compiled geometry and property tables as reusable run
+inputs. A compute may still perform ordinary plan preparation, but do not clear
+geometry-preprocessor artifacts for every hydrograph or rating-curve ordinate.
+On a real 200,226-cell HEC-RAS 6.6 qualification model, a two-hour Diffusion
+Wave solve used about 9 seconds while complete plan preparation and results
+processing used about 44 minutes. The operational optimization is therefore to
+prepare and certify each immutable reduced geometry once, then reuse it across
+the flow series unless geometry-owned inputs change.
 
 ## Hydraulic Tables (HTAB)
 
@@ -217,14 +380,14 @@ This enables rating curve generation without re-running HEC-RAS.
 Clear `.c##` files to force HEC-RAS to recalculate hydraulic tables:
 
 ```python
-from ras_commander import RasGeo, RasPlan
+from ras_commander import GeomPreprocessor, RasPlan
 
 # Clear for specific plan
 plan_path = RasPlan.get_plan_path("01")
-RasGeo.clear_geompre_files(plan_path)
+GeomPreprocessor.clear_geompre_files(plan_path)
 
 # Or clear for all plans
-RasGeo.clear_geompre_files()
+GeomPreprocessor.clear_geompre_files()
 ```
 
 ## File Format Notes
@@ -248,7 +411,7 @@ The `RasGeometryUtils` class handles these formats internally.
 ## Example: Modify Cross Section Elevations
 
 ```python
-from ras_commander import RasGeometry, RasGeo, RasCmdr, init_ras_project
+from ras_commander import GeomPreprocessor, RasGeometry, RasCmdr, init_ras_project
 import pandas as pd
 
 init_ras_project("/path/to/project", "6.5")
@@ -264,6 +427,6 @@ sta_elev['elevation'] = sta_elev['elevation'] - 2.0
 RasGeometry.set_station_elevation("01", river, reach, station, sta_elev)
 
 # Clear preprocessor and recompute
-RasGeo.clear_geompre_files()
+GeomPreprocessor.clear_geompre_files()
 success = RasCmdr.compute_plan("01", dest_folder="./modified_run")
 ```

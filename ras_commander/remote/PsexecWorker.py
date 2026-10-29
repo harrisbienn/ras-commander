@@ -13,6 +13,7 @@ import time
 import uuid
 import urllib.request
 import zipfile
+from copy import copy
 from dataclasses import dataclass, field
 from numbers import Integral, Real
 from pathlib import Path
@@ -24,11 +25,16 @@ from .Utils import (
     clear_worker_plan_hdf_artifacts,
     convert_unc_to_local_path,
     copy_geometry_outputs_back,
-    copy_plan_hdf_back,
 )
 from ..LoggingConfig import get_logger
+from ..ExecutionArtifacts import (
+    finalize_plan_execution_artifacts,
+    get_plan_result_artifact_paths,
+    infer_execution_result_format,
+)
 from ..RasCurrency import RasCurrency
 from ..RasPlan import RasPlan
+from ..RasPrj import _matching_copied_prj_file
 from ..RasUtils import RasUtils
 from ..geom import GeomPreprocessor
 
@@ -112,7 +118,7 @@ class PsexecWorker(RasWorker):
             hostname="WORKSTATION-01",
             share_path=r"\\\\WORKSTATION-01\\RasRemote",
             worker_folder=r"C:\\RasRemote",
-            credentials={"username": "DOMAIN\\\\user", "password": "SecurePass123"},
+            credentials={"username": "DOMAIN\\\\user", "password": "YOUR_PASSWORD"},
             ras_exe_path=r"C:\\Program Files\\HEC\\HEC-RAS\\6.3\\RAS.exe",
             session_id=2,
             process_priority="low",
@@ -407,7 +413,7 @@ def execute_psexec_plan(
         ras_obj: RAS project object
         num_cores: Number of cores
         clear_geompre: Clear geompre files (.c## only)
-        force_geompre: Force full geometry reprocessing (clears .g##.hdf AND .c##)
+        force_geompre: Clear staged geometry caches in place and force execution
         force_rerun: Force execution even if results are current
         sub_worker_id: Sub-worker ID for parallel execution (default 1)
         autoclean: Delete temporary worker folder after execution (default True).
@@ -419,6 +425,11 @@ def execute_psexec_plan(
 
     Returns:
         bool: True if successful
+
+    Notes:
+        PsExec supports the Ras.exe command-line interface in HEC-RAS 5.x
+        and later. HEC-RAS 4.x requires controller-based execution and is
+        rejected before staging; it is not a supported PsExec runtime.
     """
     if isinstance(num_cores, bool) or not isinstance(num_cores, Integral) or num_cores < 1:
         raise ValueError("num_cores must be an integer greater than or equal to 1")
@@ -433,10 +444,31 @@ def execute_psexec_plan(
 
     project_folder = Path(ras_obj.project_folder)
     project_name = ras_obj.project_name
+    execution_engine = type(
+        "PsexecExecutionEngine",
+        (),
+        {"ras_version": None, "ras_exe_path": worker.ras_exe_path},
+    )()
+    output_format = infer_execution_result_format(execution_engine)
+    from ..RasCmdr import RasCmdr
 
-    # Step 0a: Check if results are current (skip if so, unless force_rerun=True)
-    if not force_rerun:
-        is_current, reason = RasCurrency.are_plan_results_current(plan_number, ras_obj)
+    if output_format == "legacy":
+        logger.error(
+            "PsExec cannot execute HEC-RAS versions before 5.0: %s. "
+            "HEC-RAS 4.x requires COM controller execution; no worker "
+            "project has been staged.",
+            worker.ras_exe_path,
+        )
+        return False
+
+    # Step 0a: force_geompre implies execution because the currency check cannot
+    # see changes to cached geometry-HDF tables or their land-cover sidecars.
+    if not force_rerun and not force_geompre:
+        is_current, reason = RasCurrency._are_plan_results_current_for_execution(
+            plan_number,
+            ras_obj,
+            output_format=output_format,
+        )
         if is_current:
             logger.debug(
                 "Skipping remote execution of plan %s: %s",
@@ -446,44 +478,6 @@ def execute_psexec_plan(
             return True
         else:
             logger.debug(f"Plan {plan_number} needs execution: {reason}")
-
-    input_files = RasCurrency.get_plan_input_files(plan_number, ras_obj)
-    plan_path = input_files.get("plan") or project_folder / f"{project_name}.p{plan_number}"
-
-    # Step 0b: Handle geometry preprocessor clearing before copying to remote.
-    # This must run on the source project so the staged worker copy cannot
-    # inherit stale per-cell Manning's n or other cached geometry products.
-    if force_geompre:
-        try:
-            if not RasCurrency.clear_geom_hdf(plan_number, ras_obj):
-                logger.error(f"Could not clear geometry HDF for plan {plan_number}")
-                return False
-            GeomPreprocessor.clear_geompre_files(plan_path, ras_object=ras_obj)
-            logger.debug(
-                "Force-cleared geometry preprocessor products for plan %s "
-                "before remote execution",
-                plan_number,
-            )
-        except Exception as e:
-            logger.error(
-                f"Error force-clearing geometry preprocessor products for "
-                f"plan {plan_number}: {e}"
-            )
-            return False
-    elif clear_geompre:
-        try:
-            GeomPreprocessor.clear_geompre_files(plan_path, ras_object=ras_obj)
-            logger.debug(
-                "Cleared geometry preprocessor products for plan %s "
-                "before remote execution",
-                plan_number,
-            )
-        except Exception as e:
-            logger.error(
-                f"Error clearing geometry preprocessor products for "
-                f"plan {plan_number}: {e}"
-            )
-            return False
 
     # Step 1: Authenticate to network share
     if worker.credentials:
@@ -503,6 +497,8 @@ def execute_psexec_plan(
     worker_temp_folder = Path(worker.share_path) / f"{project_name}_{plan_number}_SW{sub_worker_id}_{uuid.uuid4().hex[:8]}"
     worker_temp_folder.mkdir(parents=True, exist_ok=True)
     logger.debug(f"Created worker folder: {worker_temp_folder}")
+    psexec_launch_attempted = False
+    worker_results_published = False
 
     try:
         # Step 2: Copy project to worker folder
@@ -514,11 +510,45 @@ def execute_psexec_plan(
         shutil.copytree(project_folder, worker_temp_folder / project_name, dirs_exist_ok=True, ignore=RasUtils.ignore_windows_reserved)
 
         worker_project_path = worker_temp_folder / project_name
-        hdf_file = worker_project_path / RasCurrency.get_plan_hdf_path(plan_number, ras_obj).name
         clear_worker_plan_hdf_artifacts(worker_project_path, plan_number, ras_obj)
+        worker_artifacts = get_plan_result_artifact_paths(
+            plan_number,
+            ras_object=ras_obj,
+            project_folder=worker_project_path,
+            project_name=project_name,
+        )
+        result_file = (
+            worker_artifacts.hdf
+            if output_format == "hdf"
+            else worker_artifacts.legacy_output
+        )
+        tmp_result_file = (
+            worker_project_path / f"{project_name}.p{plan_number}.tmp.hdf"
+        )
 
-        prj_file = list(worker_project_path.glob("*.prj"))[0]
+        prj_file = (
+            _matching_copied_prj_file(worker_project_path, getattr(ras_obj, "prj_file", None))
+            or list(worker_project_path.glob("*.prj"))[0]
+        )
         plan_file = worker_project_path / f"{project_name}.p{plan_number}"
+
+        # Clear only the staged worker copy. Mutating the source before staging
+        # destroys its land-cover association and makes failed remote runs alter
+        # the caller project. clear_geompre_files() clears .c## plus the cached
+        # in-HDF tables in place, preserving the staged association for rebuild.
+        if force_geompre or clear_geompre:
+            try:
+                GeomPreprocessor.clear_geompre_files(plan_file, ras_object=ras_obj)
+                logger.debug(
+                    "Cleared staged geometry preprocessor products for plan %s",
+                    plan_number,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error clearing staged geometry preprocessor products for "
+                    f"plan {plan_number}: {e}"
+                )
+                return False
 
         RasPlan.set_num_cores(
             plan_file,
@@ -539,11 +569,20 @@ def execute_psexec_plan(
         logger.debug(f"Enabled Write Detailed= 1 for plan {plan_number}")
 
         # Step 3: Generate batch file
+        if RasCmdr._uses_legacy_project_cli(execution_engine):
+            # HEC-RAS 5.x selects the plan from the project file. Use the
+            # established project API on a shallow metadata copy so only
+            # the staged project is edited.
+            staged_ras = copy(ras_obj)
+            staged_ras.prj_file = prj_file
+            staged_ras.set_current_plan(plan_number)
         prj_file_local = convert_unc_to_local_path(str(prj_file), worker.share_path, worker.worker_folder)
         plan_file_local = convert_unc_to_local_path(str(plan_file), worker.share_path, worker.worker_folder)
 
         batch_file = worker_temp_folder / f"run_plan_{plan_number}.bat"
-        batch_content = f'"{worker.ras_exe_path}" -c "{prj_file_local}" "{plan_file_local}"'
+        batch_content = RasCmdr._build_compute_command(
+            execution_engine, prj_file_local, plan_file_local
+        )
         batch_file.write_text(batch_content)
         logger.debug(f"Created batch file: {batch_file}")
         logger.debug(f"Batch file content: {batch_content}")
@@ -601,51 +640,146 @@ def execute_psexec_plan(
             cmd_display,
         )
 
-        # Step 5: Execute PsExec command
-        result = subprocess.run(
-            psexec_cmd,
-            capture_output=True,
-            text=True,
-            timeout=worker.max_runtime_minutes * 60
+        # Step 5: Execute PsExec command. Ras.exe can return before its solver
+        # child has finished, so normalization belongs after the result wait
+        # and verification phase, not merely after the PsExec parent returns.
+        result_complete = False
+        execution_deadline = (
+            time.monotonic() + worker.max_runtime_minutes * 60
         )
-
-        if result.returncode != 0:
-            logger.error(f"PsExec failed with return code {result.returncode}")
-            _log_psexec_output(worker, result)
-            return False
-
-        # Step 6: Check for HDF file
-        max_wait = 60
-        wait_interval = 5
-        elapsed = 0
-
-        while not hdf_file.exists() and elapsed < max_wait:
-            time.sleep(wait_interval)
-            elapsed += wait_interval
-            logger.debug(f"Waiting for HDF file... ({elapsed}s)")
-
-        if not hdf_file.exists():
-            logger.error(f"HDF file not created: {hdf_file}")
-            _log_psexec_output(worker, result)
-            logger.error(
-                "Ensure session_id is set correctly (typically 2) and remote machine is configured. "
-                "See: https://rascommander.info/ras/user-guide/remote-execution/"
+        try:
+            psexec_launch_attempted = True
+            result = subprocess.run(
+                psexec_cmd,
+                capture_output=True,
+                text=True,
+                timeout=worker.max_runtime_minutes * 60
             )
-            return False
+            if result.returncode != 0:
+                logger.error(f"PsExec failed with return code {result.returncode}")
+                _log_psexec_output(worker, result)
+                return False
 
-        if not RasCurrency.check_plan_hdf_complete(hdf_file):
-            logger.error(f"HDF file is incomplete: {hdf_file}")
-            return False
+            # Step 6: Wait for a complete result, not only the first appearance
+            # of its pathname. This covers a solver child that outlives Ras.exe.
+            def _result_is_complete() -> bool:
+                if not result_file.is_file():
+                    return False
+                if output_format == "hdf":
+                    return (
+                        RasCurrency.check_plan_hdf_complete(result_file)
+                        and not tmp_result_file.exists()
+                    )
+
+                from ..RasCmdr import RasCmdr
+
+                return RasCmdr._verify_legacy_result(
+                    plan_number,
+                    ras_obj,
+                    check_errors=True,
+                    project_folder=worker_project_path,
+                    project_name=project_name,
+                )
+
+            wait_interval = 5
+            wait_started = time.monotonic()
+            result_complete = _result_is_complete()
+            while not result_complete and time.monotonic() < execution_deadline:
+                remaining = execution_deadline - time.monotonic()
+                time.sleep(min(wait_interval, max(0.0, remaining)))
+                elapsed = time.monotonic() - wait_started
+                logger.debug(
+                    "Waiting for complete %s result... (%.0fs)",
+                    output_format,
+                    elapsed,
+                )
+                result_complete = _result_is_complete()
+
+            if not result_complete:
+                if result_file.is_file():
+                    logger.error(
+                        "%s result did not become complete: %s",
+                        output_format,
+                        result_file,
+                    )
+                else:
+                    logger.error(
+                        "%s result not created: %s",
+                        output_format,
+                        result_file,
+                    )
+                _log_psexec_output(worker, result)
+                logger.error(
+                    "Ensure session_id is set correctly (typically 2) and remote machine is configured. "
+                    "See: https://rascommander.info/ras/user-guide/remote-execution/"
+                )
+                return False
+        finally:
+            if result_complete:
+                # Run only after result waiting/verification confirms the
+                # asynchronous solver reached a completed output state.
+                finalize_plan_execution_artifacts(
+                    plan_number,
+                    output_format=output_format,
+                    ras_object=ras_obj,
+                    project_folder=worker_project_path,
+                    project_name=project_name,
+                )
+            else:
+                logger.error(
+                    "PsExec solver completion was not confirmed for plan %s; "
+                    "leaving the staged project and opposing artifacts intact "
+                    "to avoid racing an active remote calculation.",
+                    plan_number,
+                )
 
         logger.debug(
-            "HDF file created successfully for plan %s: %s",
+            "%s result created successfully for plan %s: %s",
+            output_format,
             plan_number,
-            hdf_file,
+            result_file,
         )
 
         # Step 7: Copy results back
-        if copy_plan_hdf_back(worker_project_path, plan_number, ras_obj) is None:
+        # Every staged sidecar was removed before launch. Publish only the
+        # exact allowlist now present with its verified result. An empty set
+        # also clears stale destination messages from earlier executions.
+        lease, lock_evidence = RasCmdr._acquire_destination_promotion_lock(
+            project_folder=project_folder, project_name=project_name
+        )
+        if lease is None:
+            logger.error("PsExec result publication is locked: %s", lock_evidence)
             return False
+        try:
+            allowed, gate_evidence = RasCmdr._destination_promotion_process_gate(
+                [plan_number], project_folder=project_folder,
+                project_name=project_name,
+            )
+            if not allowed:
+                logger.error("PsExec destination is not quiescent: %s", gate_evidence)
+                return False
+            published, publication_evidence = RasCmdr._publish_plan_artifacts_transaction(
+                plan_number,
+                source_primary=result_file,
+                source_sidecars=[
+                    path for path in worker_artifacts.message_sidecars
+                    if path.is_file()
+                ],
+                geometry_source=None,
+                output_format=output_format,
+                ras_object=ras_obj,
+                destination_folder=project_folder,
+                project_name=project_name,
+            )
+            if not published:
+                logger.error(
+                    "PsExec result publication failed; preserving worker evidence: %s",
+                    publication_evidence,
+                )
+                return False
+        finally:
+            if not RasCmdr._release_destination_promotion_lock(lease):
+                logger.warning("Could not release PsExec publication lock: %s", lease["path"])
 
         if copy_geometry_outputs:
             try:
@@ -659,6 +793,8 @@ def execute_psexec_plan(
             except FileNotFoundError as e:
                 logger.error(f"Geometry output copyback failed for plan {plan_number}: {e}")
                 return False
+
+        worker_results_published = True
 
         # Step 8: Cleanup (if autoclean enabled)
         if autoclean:
@@ -675,23 +811,25 @@ def execute_psexec_plan(
         return True
 
     except Exception as e:
-        # Exception messages (including TimeoutExpired/OSError) can embed argv.
-        # Keep useful context without formatting the exception or its traceback.
+        # Subprocess exceptions may contain the command line and credentials.
         logger.error(
             "Error in PsExec execution on %s, plan %s: %s",
             worker.hostname, plan_number, type(e).__name__,
         )
         if isinstance(e, subprocess.TimeoutExpired):
-            logger.error("PsExec exceeded the configured timeout of %s minutes", worker.max_runtime_minutes)
-        if autoclean:
+            logger.error("PsExec exceeded the configured runtime limit")
+        if autoclean and (
+            not psexec_launch_attempted or worker_results_published
+        ):
             try:
                 if worker_temp_folder.exists():
                     shutil.rmtree(worker_temp_folder, ignore_errors=True)
-            except OSError:
+            except BaseException:
                 pass
         else:
             logger.info(
-                "Preserving PsExec worker folder for plan %s for debugging; "
+                "Preserving PsExec worker folder for plan %s because result "
+                "publication was not confirmed or debugging was requested; "
                 "enable DEBUG logging for the path",
                 plan_number,
             )

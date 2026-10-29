@@ -23,6 +23,7 @@ from typing import Union, Optional, Any, Dict, List, Tuple
 
 import pandas as pd
 
+from .._ras_text import _write_ras_text
 from ..LoggingConfig import get_logger
 from ..Decorators import log_call
 

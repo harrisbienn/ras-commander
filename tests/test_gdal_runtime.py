@@ -6,13 +6,22 @@ from pathlib import Path
 from subprocess import CompletedProcess
 
 import pytest
+import rasterio
 from rasterio._env import PROJDataFinder, set_proj_data_search_path
 
 from ras_commander import _gdal_runtime
 from ras_commander.geom.GeomMesh import GeomMesh
 
 geom_mesh_module = importlib.import_module("ras_commander.geom.GeomMesh")
-RASTERIO_PROJ_DATA = PROJDataFinder().search()
+clr_bootstrap = importlib.import_module("ras_commander.dotnet.clr_bootstrap")
+_PACKAGED_RASTERIO_PROJ_DATA = (
+    Path(rasterio.__file__).resolve().parent / "proj_data"
+)
+RASTERIO_PROJ_DATA = (
+    str(_PACKAGED_RASTERIO_PROJ_DATA)
+    if (_PACKAGED_RASTERIO_PROJ_DATA / "proj.db").is_file()
+    else PROJDataFinder().search()
+)
 
 
 @pytest.fixture(autouse=True)
@@ -21,6 +30,7 @@ def _restore_rasterio_proj_search_path():
     environment_names = ("PATH", "GDAL_DATA", "PROJ_LIB", "PROJ_DATA")
     original_environment = {name: os.environ.get(name) for name in environment_names}
     original_sys_path = list(sys.path)
+    set_proj_data_search_path(RASTERIO_PROJ_DATA)
     yield
     for name, value in original_environment.items():
         if value is None:
@@ -222,9 +232,83 @@ def test_geom_mesh_load_dlls_stops_before_rasmapper_when_bridge_fails(monkeypatc
     assert add_reference_calls == []
 
 
+def test_clr_bootstrap_accepts_already_imported_pythonnet_module(
+    monkeypatch,
+    tmp_path,
+):
+    install = tmp_path / "HEC-RAS" / "7.0"
+    install.mkdir(parents=True)
+    (install / "RasMapperLib.dll").touch()
+    references = []
+
+    class ImportedClr:
+        __spec__ = None
+
+        @staticmethod
+        def AddReference(path):
+            references.append(Path(path).name)
+
+    monkeypatch.setitem(sys.modules, "clr", ImportedClr)
+    monkeypatch.setattr(clr_bootstrap, "_CLR_LOADED", False)
+    monkeypatch.setattr(clr_bootstrap, "_CLR_INSTALL_ROOT", None)
+    monkeypatch.setattr(
+        clr_bootstrap,
+        "configure_rasmapper_gdal_bridge",
+        lambda path: None,
+    )
+
+    clr_bootstrap.load_clr(install)
+
+    assert references == [
+        "Utility.Core.dll",
+        "Geospatial.Core.dll",
+        "H5Assist.dll",
+        "RasMapperLib.dll",
+    ]
+
+
 def test_resolve_hecras_gdal_paths_reports_missing_bin64(tmp_path):
     hecras_dir = tmp_path / "HEC-RAS" / "7.0"
     (hecras_dir / "GDAL" / "common" / "data").mkdir(parents=True)
 
     with pytest.raises(FileNotFoundError, match="bin64"):
         _gdal_runtime.resolve_hecras_gdal_paths(hecras_dir)
+
+
+def test_untraversable_gdal_bridge_is_reported_unusable(tmp_path, monkeypatch):
+    """WinError 448 (untrusted mount point) means "not usable", not a crash."""
+    from pathlib import Path
+
+    python_dir = tmp_path / "python"
+    python_dir.mkdir()
+
+    def refuse(self):
+        raise OSError(
+            448,
+            "The path cannot be traversed because it contains an untrusted mount point",
+        )
+
+    monkeypatch.setattr(Path, "is_dir", refuse)
+    assert _gdal_runtime.python_gdal_bridge_is_usable(python_dir) is False
+
+
+def test_configure_rasmapper_gdal_bridge_rejects_false_success(monkeypatch, tmp_path):
+    hecras_dir = _make_hecras_gdal_tree(tmp_path)
+    python_dir = tmp_path / "wine-python"
+    python_dir.mkdir()
+
+    monkeypatch.setattr(os, "add_dll_directory", lambda path: object(), raising=False)
+    monkeypatch.setattr(_gdal_runtime.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        _gdal_runtime.subprocess,
+        "run",
+        lambda cmd, **kwargs: CompletedProcess(cmd, 0, "reported success", ""),
+    )
+
+    with pytest.raises(RuntimeError, match="Could not initialize the GDAL bridge"):
+        _gdal_runtime.configure_rasmapper_gdal_bridge(
+            hecras_dir,
+            python_dir=python_dir,
+        )
+
+    assert not _gdal_runtime.python_gdal_bridge_is_usable(python_dir)

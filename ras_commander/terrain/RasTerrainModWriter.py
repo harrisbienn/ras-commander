@@ -22,14 +22,19 @@ Requirements:
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
+
+if TYPE_CHECKING:
+    import geopandas as gpd
 import xml.etree.ElementTree as ET
 
 import numpy as np
 import pandas as pd
 
+from .._ras_text import _write_ras_xml
 from ..Decorators import log_call
 from ..LoggingConfig import get_logger
+from ..fast_hdf import read_attr, read_attrs, read_typed
 
 logger = get_logger(__name__)
 
@@ -574,7 +579,7 @@ class RasTerrainModWriter:
                         key: RasTerrainModWriter._decode_hdf_scalar(value)
                         for key, value in zip(
                             mod_grp["Attributes"].dtype.names,
-                            mod_grp["Attributes"][0],
+                            read_typed(mod_grp["Attributes"], 0),
                         )
                     }
 
@@ -587,12 +592,12 @@ class RasTerrainModWriter:
                     {
                         "name": mod_name,
                         "type": RasTerrainModWriter._decode_hdf_scalar(
-                            mod_grp.attrs.get("Type", "")
+                            read_attr(mod_grp, "Type", "")
                         ),
                         "subtype": RasTerrainModWriter._decode_hdf_scalar(
-                            mod_grp.attrs.get("Subtype", "")
+                            read_attr(mod_grp, "Subtype", "")
                         ),
-                        "priority": int(mod_grp.attrs.get("Priority", 0)),
+                        "priority": int(read_attr(mod_grp, "Priority", 0)),
                         "modification_type": modification_type,
                         "modification_mode": RasTerrainModWriter._mode_name(
                             modification_type
@@ -619,6 +624,133 @@ class RasTerrainModWriter:
                 )
 
         return pd.DataFrame(rows)
+
+    @staticmethod
+    @log_call
+    def export_modification_features(
+        source_terrain_hdf_path: str | Path,
+        source_rasmap_path: str | Path,
+        output_dir: str | Path,
+        feature_indexes: dict[str, list[int]],
+    ) -> list[dict[str, object]]:
+        """Export complete selected native line/polygon records without terrain grids.
+
+        Source registration prefers a unique resolved path; a unique basename
+        fallback permits caller-verified stale delivered layouts. Ambiguity fails.
+        Reads the immutable source HDF and Mapper; creates a new boundary-input
+        folder containing ``modifications.hdf`` and ``modifications.rasmap``.
+        Preserves coordinates, native parameters, priorities and enabled flags;
+        no CRS, unit or elevation conversion occurs. Existing destinations and
+        unsupported layouts fail. Caller must supply complete spatial support
+        and qualify native replay. This bundle is not an executable RAS terrain.
+
+        Args:
+            source_terrain_hdf_path: Verified immutable native terrain/modification HDF.
+            source_rasmap_path: Mapper registering the source modification groups.
+            output_dir: New folder for the HDF/XML boundary bundle.
+            feature_indexes: Group names mapped to unique zero-based native rows.
+
+        Returns:
+            Retained row identities, counts and registration matching decisions,
+            plus geometry_type (Polygon or Polyline native storage layout).
+
+        Raises:
+            ValueError: Unsupported records, invalid selection or existing output.
+        """
+        from .._terrain_modification_subset import export_features
+
+        return export_features(source_terrain_hdf_path, source_rasmap_path,
+            output_dir, feature_indexes)
+
+    @staticmethod
+    @log_call
+    def get_modification_features(
+        terrain_hdf_path: str | Path, crs: Any
+    ) -> "gpd.GeoDataFrame":
+        """Read complete native line or SetValue polygon edits without mutation.
+
+        Returns a GeoDataFrame in the caller-declared terrain CRS with group_name,
+        feature_index, support_distance (horizontal CRS units), and geometry.
+        Native single-vertex polyline records return Point support geometry without
+        repairing the native record. Retained degenerate records still require
+        native execution qualification. Supports polyline/profile tables and native
+        constant-elevation Polygon Info/Parts/Points records with closed valid rings.
+        Polygon support_distance is zero: the complete polygon is its footprint.
+        Boundary-generated, shape-Z and multipoint polygon methods are unsupported.
+        Unknown
+        layouts or missing support distances raise before a subset is planned.
+        No terrain grid is loaded, no elevations are changed, and no files are
+        written. CRS must match the source terrain; this method does not reproject.
+
+        Args:
+            terrain_hdf_path: Native terrain/modification HDF, opened read-only.
+            crs: Explicit horizontal CRS of the source native coordinates.
+
+        Returns:
+            Complete feature geometries and native support distances, including
+            an explicitly typed empty frame when no modifications exist.
+
+        Raises:
+            ValueError: Missing CRS/support metadata or unsupported native records.
+        """
+        from .._terrain_modification_subset import read_features
+        return read_features(Path(terrain_hdf_path), crs)
+
+    @staticmethod
+    @log_call
+    def copy_modification_features(
+        source_terrain_hdf_path: str | Path,
+        destination_terrain_hdf_path: str | Path,
+        source_rasmap_path: str | Path,
+        destination_rasmap_path: str | Path,
+        feature_indexes: dict[str, list[int]],
+        *,
+        group_prefix: str = "",
+        append: bool = False,
+    ) -> list[dict[str, object]]:
+        """Copy complete selected native modifications to a new native terrain.
+
+        Mutates only the destination HDF and Mapper; source files remain read-only.
+        Terrain creation must already have built the destination grid in the same
+        horizontal CRS and vertical units. This method copies original attributes,
+        coordinates, profile elevations, priorities and Mapper group settings;
+        it only rewrites offsets needed by the subset. It does not clip or rasterize
+        modifications. Each mapping key is a source group and each value is unique
+        zero-based feature indexes. Empty selections omit that group. Returns the
+        retained source indexes/counts, destination_group_name and registration basis. Source
+        matching prefers one exact path, then one caller-verified stale basename;
+        destination matching requires one exact path. Ambiguity fails. No
+        independent artifact is written.
+        Unsupported layouts and invalid indexes fail before mutation. Existing
+        destination modifications fail when append=False. The caller must verify full terrain support for every
+        selected feature and native effective-elevation/property-table equivalence.
+        group_prefix namespaces destination groups without changing record values
+        or group priority. append=True retains existing groups and appends the
+        incoming Mapper layers in source order; duplicate names and incompatible
+        collection settings/root attributes are rejected. This records ordering,
+        not a qualified partition-aware multi-parent terrain composition.
+
+        Args:
+            source_terrain_hdf_path: Verified immutable native source HDF.
+            destination_terrain_hdf_path: Newly built native terrain in the child clone.
+            source_rasmap_path: Source Mapper with complete group settings.
+            destination_rasmap_path: Child Mapper registering the destination exactly.
+            feature_indexes: Group names mapped to unique zero-based source rows.
+            group_prefix: Optional destination-only native group-name prefix.
+            append: False by default; opt in to adding new unique groups.
+
+        Returns:
+            Retained row identities, counts and registration matching decisions,
+            plus geometry_type (Polygon or Polyline native storage layout).
+
+        Raises:
+            ValueError: Invalid layouts/selection, ambiguous registration or an
+                existing destination modification group.
+        """
+        from .._terrain_modification_subset import copy_features
+        return copy_features(source_terrain_hdf_path, destination_terrain_hdf_path,
+                             source_rasmap_path, destination_rasmap_path, feature_indexes,
+                             group_prefix=group_prefix, append=append)
 
     @staticmethod
     @log_call
@@ -1518,19 +1650,19 @@ class RasTerrainModWriter:
                     return
 
         with h5py.File(terrain_hdf_path, "r") as f:
-            for value in f.attrs.values():
+            for value in read_attrs(f).values():
                 for text in RasTerrainModWriter._iter_hdf_strings(value):
                     add_candidate(text)
 
             def visitor(_name, obj):
-                for value in obj.attrs.values():
+                for value in read_attrs(obj).values():
                     for text in RasTerrainModWriter._iter_hdf_strings(value):
                         add_candidate(text)
                 if isinstance(obj, h5py.Dataset):
                     if obj.size <= 10000 and (
                         obj.dtype.names is not None or obj.dtype.kind in {"S", "U", "O"}
                     ):
-                        for text in RasTerrainModWriter._iter_hdf_strings(obj[()]):
+                        for text in RasTerrainModWriter._iter_hdf_strings(read_typed(obj)):
                             add_candidate(text)
 
             f.visititems(visitor)
@@ -1782,7 +1914,7 @@ class RasTerrainModWriter:
     @staticmethod
     def _profile_point_count(mod_grp) -> int:
         if "Profile Info" in mod_grp and len(mod_grp["Profile Info"]) > 0:
-            info = np.asarray(mod_grp["Profile Info"][:], dtype=np.int64)
+            info = np.asarray(read_typed(mod_grp["Profile Info"], slice(None)), dtype=np.int64)
             return int(info[:, 1].sum())
         if "Profile Values" in mod_grp:
             return int(mod_grp["Profile Values"].shape[0])
@@ -1793,16 +1925,16 @@ class RasTerrainModWriter:
     @staticmethod
     def _read_profile_array(mod_grp) -> np.ndarray:
         if "Profile" in mod_grp:
-            values = np.asarray(mod_grp["Profile"][:], dtype=np.float64)
+            values = np.asarray(read_typed(mod_grp["Profile"], slice(None)), dtype=np.float64)
             if "Profile Info" in mod_grp and len(mod_grp["Profile Info"]) > 0:
-                start, count = np.asarray(mod_grp["Profile Info"][0], dtype=np.int64)
+                start, count = np.asarray(read_typed(mod_grp["Profile Info"], 0), dtype=np.int64)
                 values = values[start : start + count]
             return values
 
         if "Profile Values" in mod_grp:
-            values = np.asarray(mod_grp["Profile Values"][:], dtype=np.float64)
+            values = np.asarray(read_typed(mod_grp["Profile Values"], slice(None)), dtype=np.float64)
             if "Profile Info" in mod_grp and len(mod_grp["Profile Info"]) > 0:
-                start, count = np.asarray(mod_grp["Profile Info"][0], dtype=np.int64)
+                start, count = np.asarray(read_typed(mod_grp["Profile Info"], 0), dtype=np.int64)
                 values = values[start : start + count]
             return values
 
@@ -1826,7 +1958,7 @@ class RasTerrainModWriter:
             if "Polyline Points" not in mod_grp:
                 raise KeyError(f"Modification polyline not found: {mod_path}/Polyline Points")
 
-            line = np.asarray(mod_grp["Polyline Points"][:], dtype=np.float64)
+            line = np.asarray(read_typed(mod_grp["Polyline Points"], slice(None)), dtype=np.float64)
             profile = RasTerrainModWriter._read_profile_array(mod_grp)
             attr_row = {}
             if "Attributes" in mod_grp and len(mod_grp["Attributes"]) > 0:
@@ -1834,7 +1966,7 @@ class RasTerrainModWriter:
                     key: RasTerrainModWriter._decode_hdf_scalar(value)
                     for key, value in zip(
                         mod_grp["Attributes"].dtype.names,
-                        mod_grp["Attributes"][0],
+                        read_typed(mod_grp["Attributes"], 0),
                     )
                 }
 
@@ -2172,7 +2304,7 @@ class RasTerrainModWriter:
         mod_group.set('Checked', 'True')
         mod_group.set('Expanded', 'True')
 
-        tree.write(rasmap_path, xml_declaration=False, encoding='unicode')
+        _write_ras_xml(tree, rasmap_path, xml_declaration=False, encoding="unicode")
         return mod_group
 
     @staticmethod
@@ -2236,7 +2368,7 @@ class RasTerrainModWriter:
         cp_layer.set('Type', 'ElevationControlPointLayer')
         cp_layer.set('Checked', 'True')
 
-        tree.write(rasmap_path, xml_declaration=False, encoding='unicode')
+        _write_ras_xml(tree, rasmap_path, xml_declaration=False, encoding="unicode")
         logger.debug(f"Added modification layer '{name}' to .rasmap")
 
 

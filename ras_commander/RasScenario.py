@@ -8,6 +8,8 @@ import os
 import re
 import shutil
 import stat
+import tempfile
+import uuid
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FutureTimeoutError,
@@ -855,18 +857,18 @@ class RasScenario:
             for boundary_index, link, record in candidates
             if not crosswalk[link.mapping_id]
         ]
+        if not inactive:
+            return []
+        deletions = RasScenario._delete_inactive_boundary_blocks(
+            workspace, tuple(index for index, _, _ in inactive),
+        )
         audit: list[Dict[str, Any]] = []
         for boundary_index, link, record in sorted(
             inactive,
             key=lambda value: value[0],
             reverse=True,
         ):
-            deletion = RasUnsteady.delete_boundary(
-                workspace.unsteady_file,
-                boundary_index=boundary_index,
-                force=True,
-                ras_object=None,
-            )
+            deletion = deletions[boundary_index]
             audit.append(
                 {
                     "mapping_id": link.mapping_id,
@@ -887,6 +889,127 @@ class RasScenario:
             )
         audit.sort(key=lambda value: value["boundary_index"])
         return audit
+
+    @staticmethod
+    def _delete_inactive_boundary_blocks(
+        workspace: RasScenarioWorkspace, indices: tuple[int, ...],
+    ) -> dict[int, dict[str, Any]]:
+        """Serialize edits to one scenario clone and retain ownership on failure."""
+        from . import RasBoundary
+
+        lock, identity, token = RasBoundary._acquire_lock(workspace.project_folder)
+        try:
+            return RasScenario._apply_inactive_boundary_edits(workspace, indices)
+        finally:
+            RasBoundary._safe_unlink_owned(lock, identity, expected_bytes=token)
+
+    @staticmethod
+    def _apply_inactive_boundary_edits(
+        workspace: RasScenarioWorkspace, indices: tuple[int, ...],
+    ) -> dict[int, dict[str, Any]]:
+        """Apply one staged transaction to this scenario's owned flow file.
+
+        A separate editor stage permits unresolved inherited DSS references.
+        Its complete copy and the original workspace are authenticated before
+        the verified flow bytes are published. Execution readiness remains the
+        responsibility of ``validate_workspace`` and the scenario worker.
+        """
+        from . import RasBoundary
+        from .RasProject import stage_project_for_boundary_edit, _tree_snapshot
+
+        root = workspace.project_folder.resolve()
+        target = workspace.unsteady_file.absolute()
+        if root == workspace.source_project.resolve().parent:
+            raise ValueError("Boundary editing requires an isolated scenario clone")
+        if target.parent != root or workspace.project_file.parent.resolve() != root:
+            raise ValueError("Scenario boundary target must belong to its project")
+        original, identity = RasBoundary._read_stable(target, root)
+        _, original_tree, _ = _tree_snapshot(root)
+        edit_root = root.with_name(f".boundary-edit-{uuid.uuid4().hex}")
+        staged = stage_project_for_boundary_edit(workspace.project_file, edit_root)
+        inventory = RasUnsteady.inspect_boundary_blocks(
+            staged, unsteady_number=workspace.unsteady_number,
+        )
+        selected = inventory.loc[inventory["boundary_index"].isin(indices)]
+        if len(selected) != len(indices):
+            raise ValueError("Inactive boundary selection changed during staging")
+        selections = tuple({
+            "boundary_id": str(row.boundary_id),
+            "expected_source_sha256": str(row.owner_sha256),
+            "expected_block_sha256": str(row.block_sha256),
+            "expected_bc_type": str(row.bc_type),
+            "expected_location_raw": str(row.boundary_location_raw),
+        } for row in selected.itertuples())
+        if any(item["expected_source_sha256"] != hashlib.sha256(original).hexdigest()
+               for item in selections):
+            raise ValueError("Scenario flow changed before staging")
+        mutations = RasBoundary.delete_boundaries(
+            staged, unsteady_number=workspace.unsteady_number,
+            selections=selections, dry_run=False,
+        )
+        updated = mutations[0].unsteady_file.read_bytes()
+        updated_hash = hashlib.sha256(updated).hexdigest()
+        if any(item.state != "applied" or item.result_sha256 != updated_hash
+               for item in mutations):
+            raise ValueError("Staged boundary result checksum mismatch")
+        # Capture file counts, bytes and every digest before retiring the copy.
+        edit_snapshot = RasScenario._tree_snapshot(edit_root)
+        _, current_tree, _ = _tree_snapshot(root)
+        if current_tree != original_tree:
+            raise ValueError("Scenario project changed during boundary editing")
+        RasBoundary._require_atomic_filesystem(root)
+        descriptor, name = tempfile.mkstemp(prefix=".boundary-", suffix=".tmp", dir=root)
+        temporary = Path(name)
+        temporary_identity = None
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                info = os.fstat(stream.fileno())
+                temporary_identity = (info.st_dev, info.st_ino)
+                stream.write(updated)
+                stream.flush()
+                os.fsync(stream.fileno())
+            info = temporary.lstat()
+            os.chmod(temporary, identity.mode)
+            RasBoundary._atomic_replace(
+                temporary, target, stage_root=root,
+                expected_target_identity=identity,
+                expected_target_sha256=hashlib.sha256(original).hexdigest(),
+                expected_result_sha256=updated_hash,
+                expected_temp_identity=(info.st_dev, info.st_ino),
+            )
+        finally:
+            RasBoundary._safe_unlink_owned(
+                temporary, temporary_identity, expected_sha256=updated_hash,
+            )
+        if target.read_bytes() != updated:
+            raise ValueError("Published scenario boundary file failed readback")
+        evidence = {}
+        for mutation in mutations:
+            evidence[mutation.boundary_index] = {
+                "lines_removed": len(original[
+                    mutation.start_byte:mutation.end_byte_exclusive
+                ].splitlines()),
+                "mutation": {
+                    "source_sha256": mutation.source_sha256,
+                    "result_sha256": mutation.result_sha256,
+                    "removed_block_sha256": mutation.removed_block_sha256,
+                    "state": mutation.state,
+                    "stage_fingerprint": staged.published_fingerprint,
+                    "stage_execution_readiness": staged.execution_readiness,
+                },
+            }
+        _write_json(root / "boundary-edit-evidence.json", {
+            "schema": "ras-commander/scenario-boundary-edit/1.0",
+            "stage_snapshot": edit_snapshot,
+            "mutations": evidence,
+        })
+        # Only the freshly created, verified sibling stage is retired.
+        if edit_root.parent != root.parent or not edit_root.name.startswith(".boundary-edit-"):
+            raise ValueError("Unexpected boundary stage cleanup path")
+        RasBoundary._require_nonreparse_chain(edit_root, root.parent, regular_file=False)
+        RasScenario._verify_tree_snapshot(edit_root, edit_snapshot, label="Boundary editor cleanup")
+        shutil.rmtree(edit_root)
+        return evidence
 
     @staticmethod
     def _boundary_selector(link: RasBoundaryLink) -> Dict[str, Any]:

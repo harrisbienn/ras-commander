@@ -288,7 +288,46 @@ def test_direct_mrms_hyetograph_and_netcdf_exports(tmp_path):
     with xr.open_dataset(nc_path) as ds:
         assert "APCP_surface" in ds.data_vars
         assert ds["APCP_surface"].attrs["units"] == "mm"
-        assert ds["APCP_surface"].shape == precip.shape
+        assert ds["APCP_surface"].attrs["value_type"] == "cumulative"
+        assert ds["APCP_surface"].shape == (4, 2, 2)
+        assert pd.Timestamp(ds["time"].values[0]) == times[0] - pd.Timedelta(hours=1)
+        np.testing.assert_allclose(ds["APCP_surface"].isel(time=0), 0.0)
+        np.testing.assert_allclose(
+            ds["APCP_surface"].isel(time=-1),
+            precip.sum("time"),
+        )
+        assert ds.attrs["first_timestep_hours"] == 1.0
+        assert ds.attrs["zero_tail_frames"] == 0
+
+
+def test_mrms_netcdf_extends_flat_cumulative_tail(tmp_path):
+    xr = pytest.importorskip("xarray")
+    times = pd.date_range("2024-08-09 10:00", periods=2, freq="h")
+    precip = xr.DataArray(
+        np.array([[[2.0]], [[3.0]]], dtype=float),
+        dims=("time", "latitude", "longitude"),
+        coords={"time": times, "latitude": [41.0], "longitude": [-77.5]},
+        attrs={"units": "mm"},
+    )
+
+    nc_path = PrecipMrms.to_ras_netcdf(
+        precip,
+        tmp_path / "mrms_tail.nc",
+        target_crs=None,
+        end_time="2024-08-09 14:00",
+    )
+
+    with xr.open_dataset(nc_path) as ds:
+        assert list(pd.to_datetime(ds["time"].values)) == list(
+            pd.date_range("2024-08-09 09:00", "2024-08-09 14:00", freq="h")
+        )
+        np.testing.assert_allclose(
+            ds["APCP_surface"].values[:, 0, 0],
+            [0.0, 2.0, 5.0, 5.0, 5.0, 5.0],
+        )
+        assert ds.attrs["storm_end"] == "2024-08-09T11:00:00"
+        assert ds.attrs["forcing_end"] == "2024-08-09T14:00:00"
+        assert ds.attrs["zero_tail_frames"] == 3
 
 
 def test_animation_helpers_accept_dataarray_and_hdf(monkeypatch, tmp_path):
@@ -413,7 +452,8 @@ def test_animation_helpers_accept_dataarray_and_hdf(monkeypatch, tmp_path):
 def test_precipitation_animation_separates_rate_and_cumulative_units(
     monkeypatch, tmp_path
 ):
-    pytest.importorskip("matplotlib")
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg", force=True)
     xr = pytest.importorskip("xarray")
 
     precip = xr.DataArray(
@@ -491,6 +531,167 @@ def test_flood_animation_accepts_stored_map_rasters(tmp_path):
     assert raster_stack.attrs["crs"] == "EPSG:2871"
 
 
+def test_terrain_raster_is_warped_to_flood_grid_with_nodata_preserved(tmp_path):
+    rasterio = pytest.importorskip("rasterio")
+    xr = pytest.importorskip("xarray")
+    from rasterio.transform import from_origin
+
+    terrain_path = tmp_path / "terrain.tif"
+    terrain = np.arange(36, dtype="float32").reshape(6, 6)
+    terrain[0, 0] = -9999
+    with rasterio.open(
+        terrain_path,
+        "w",
+        driver="GTiff",
+        height=6,
+        width=6,
+        count=1,
+        dtype="float32",
+        crs="EPSG:2871",
+        transform=from_origin(0, 6, 1, 1),
+        nodata=-9999,
+    ) as dst:
+        dst.write(terrain, 1)
+
+    flood = xr.DataArray(
+        np.ones((2, 2, 3), dtype="float32"),
+        dims=("time", "y", "x"),
+        coords={
+            "time": pd.date_range("2024-02-04", periods=2, freq="h"),
+            "y": [4.5, 3.5],
+            "x": [1.5, 2.5, 3.5],
+        },
+        attrs={"crs": "EPSG:2871"},
+    )
+
+    overlay = PrecipMrms._prepare_terrain_data(
+        terrain_path,
+        target_data=flood,
+    )
+
+    assert overlay["values"].shape == (2, 3)
+    assert overlay["extent"] == (1.0, 4.0, 3.0, 5.0)
+    assert overlay["origin"] == "upper"
+    assert overlay["crs"] == "EPSG:2871"
+    assert np.isfinite(overlay["values"]).all()
+
+
+def test_raw_terrain_array_requires_exact_flood_grid_shape():
+    xr = pytest.importorskip("xarray")
+    flood = xr.DataArray(
+        np.ones((1, 2, 3), dtype="float32"),
+        dims=("time", "y", "x"),
+        coords={"time": [pd.Timestamp("2024-02-04")], "y": [1.5, 0.5], "x": [0.5, 1.5, 2.5]},
+        attrs={"crs": "EPSG:2871"},
+    )
+
+    with pytest.raises(ValueError, match="must match the animation grid shape"):
+        PrecipMrms._prepare_terrain_data(
+            np.ones((4, 4), dtype=float),
+            target_data=flood,
+        )
+
+
+def test_terrain_raster_is_reprojected_when_crs_differs(tmp_path):
+    rasterio = pytest.importorskip("rasterio")
+    xr = pytest.importorskip("xarray")
+    from rasterio.transform import from_origin
+
+    terrain_path = tmp_path / "geographic_terrain.tif"
+    with rasterio.open(
+        terrain_path,
+        "w",
+        driver="GTiff",
+        height=4,
+        width=4,
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=from_origin(-1, 1, 0.5, 0.5),
+    ) as dst:
+        dst.write(np.arange(16, dtype="float32").reshape(4, 4), 1)
+
+    flood = xr.DataArray(
+        np.ones((1, 2, 2), dtype="float32"),
+        dims=("time", "y", "x"),
+        coords={
+            "time": [pd.Timestamp("2024-02-04")],
+            "y": [50000.0, -50000.0],
+            "x": [-50000.0, 50000.0],
+        },
+        attrs={"crs": "EPSG:3857"},
+    )
+
+    overlay = PrecipMrms._prepare_terrain_data(terrain_path, target_data=flood)
+
+    assert overlay["values"].shape == (2, 2)
+    assert overlay["crs"] == "EPSG:3857"
+    assert np.isfinite(overlay["values"]).all()
+
+
+def test_hillshade_retains_terrain_nodata_mask():
+    terrain = np.array([[np.nan, 1.0], [2.0, 3.0]])
+
+    shaded = PrecipMrms._hillshade(terrain)
+
+    assert np.isnan(shaded[0, 0])
+    assert np.isfinite(shaded[1, 1])
+
+
+def test_flood_animation_uses_aligned_terrain_extent(monkeypatch, tmp_path):
+    rasterio = pytest.importorskip("rasterio")
+    pytest.importorskip("matplotlib")
+    xr = pytest.importorskip("xarray")
+    from rasterio.transform import from_origin
+
+    terrain_path = tmp_path / "large_terrain.tif"
+    with rasterio.open(
+        terrain_path,
+        "w",
+        driver="GTiff",
+        height=20,
+        width=20,
+        count=1,
+        dtype="float32",
+        crs="EPSG:2871",
+        transform=from_origin(0, 20, 1, 1),
+    ) as dst:
+        dst.write(np.arange(400, dtype="float32").reshape(20, 20), 1)
+
+    flood = xr.DataArray(
+        np.ones((1, 2, 3), dtype="float32"),
+        dims=("time", "y", "x"),
+        coords={"time": [pd.Timestamp("2024-02-04")], "y": [11.5, 10.5], "x": [5.5, 6.5, 7.5]},
+        attrs={"crs": "EPSG:2871"},
+    )
+    captured = {}
+
+    def capture(fig, update_func, frame_count, output_path, fps, dpi):
+        captured["extents"] = [tuple(image.get_extent()) for image in fig.axes[0].images]
+        captured["shapes"] = [np.asarray(image.get_array()).shape for image in fig.axes[0].images]
+        Path(output_path).touch()
+
+    monkeypatch.setattr(PrecipMrms, "_save_animation", staticmethod(capture))
+    output = PrecipMrms.animate_flood_inundation(
+        flood,
+        tmp_path / "aligned.mp4",
+        terrain=terrain_path,
+    )
+
+    assert output.exists()
+    assert captured["extents"] == [(5.0, 8.0, 10.0, 12.0)] * 2
+    assert captured["shapes"] == [(2, 3), (2, 3)]
+
+
+def test_hdf_flood_animation_rejects_silently_ignored_terrain(tmp_path):
+    with pytest.raises(ValueError, match="HDF point-cloud animation route"):
+        PrecipMrms.animate_flood_inundation(
+            tmp_path / "results.p01.hdf",
+            tmp_path / "flood.mp4",
+            terrain=tmp_path / "terrain.tif",
+        )
+
+
 def test_load_stored_map_stack_reconciles_mixed_single_raster_grids(tmp_path):
     pytest.importorskip("rasterio")
     from rasterio.transform import from_origin
@@ -514,11 +715,76 @@ def test_load_stored_map_stack_reconciles_mixed_single_raster_grids(tmp_path):
 
     assert stack.dims == ("time", "y", "x")
     assert stack.shape == (2, 2, 4)
-    assert stack.attrs == {"units": "ft", "crs": "EPSG:2871"}
+    assert stack.attrs == {
+        "units": "ft",
+        "crs": "EPSG:2871",
+        "grid_bounds": (0.0, 4.0, 0.0, 2.0),
+    }
     assert np.count_nonzero(np.isfinite(stack.values[0])) == 4
     assert np.count_nonzero(np.isfinite(stack.values[1])) == 3
     assert np.all(stack.values[0, :, :2] == 1.0)
     assert np.all(stack.values[1, 0, 1:] == 2.0)
+    assert PrecipMrms._data_extent(stack) == ((0.0, 4.0, 0.0, 2.0), "upper")
+
+
+def test_public_extent_is_treated_as_pixel_edges():
+    data = PrecipMrms._coerce_grid_data(
+        np.ones((1, 2, 4), dtype=float),
+        extent=(1000.0, 1040.0, 1970.0, 2000.0),
+    )
+
+    np.testing.assert_allclose(data.coords["x"], [1005.0, 1015.0, 1025.0, 1035.0])
+    np.testing.assert_allclose(data.coords["y"], [1977.5, 1992.5])
+    assert PrecipMrms._data_extent(data) == (
+        (1000.0, 1040.0, 1970.0, 2000.0),
+        "lower",
+    )
+
+
+def test_stored_map_stack_normalizes_south_up_bounds(tmp_path):
+    pytest.importorskip("rasterio")
+    from affine import Affine
+
+    raster_path = _write_stored_map_raster(
+        tmp_path / "south_up.tif",
+        np.arange(6, dtype="float32").reshape(2, 3),
+        Affine(10.0, 0.0, 1000.0, 0.0, 10.0, 1970.0),
+    )
+
+    stack = PrecipMrms.load_stored_map_stack(raster_path)
+
+    assert stack.attrs["grid_bounds"] == (1000.0, 1030.0, 1970.0, 1990.0)
+    assert PrecipMrms._data_extent(stack) == (
+        (1000.0, 1030.0, 1970.0, 1990.0),
+        "lower",
+    )
+    np.testing.assert_array_equal(
+        stack.values[0],
+        np.arange(6, dtype="float32").reshape(2, 3),
+    )
+
+
+@pytest.mark.parametrize(
+    ("transform", "message"),
+    [
+        (pytest.param((-1.0, 0.0, 2.0, 0.0, -1.0, 2.0), "West-up", id="west-up")),
+        (pytest.param((1.0, 0.1, 0.0, 0.0, -1.0, 2.0), "Rotated", id="rotated")),
+    ],
+)
+def test_stored_map_stack_rejects_unrepresentable_transforms(
+    tmp_path, transform, message
+):
+    pytest.importorskip("rasterio")
+    from affine import Affine
+
+    raster_path = _write_stored_map_raster(
+        tmp_path / f"{message.lower()}.tif",
+        np.ones((2, 2), dtype="float32"),
+        Affine(*transform),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        PrecipMrms.load_stored_map_stack(raster_path)
 
 
 def test_load_stored_map_stack_mosaics_every_grouped_tile(tmp_path):
@@ -750,3 +1016,269 @@ def test_public_animations_route_grouped_rasters_and_forward_grid_options(
     assert calls["combined"][0] == grouped_frames
     assert calls["combined"][1]["cell_size"] == 50
     assert calls["combined"][1]["resampling"] == "cubic"
+
+
+def test_combined_alignment_selects_interval_covering_hydraulic_time():
+    source = pd.to_datetime(["2024-01-01 01:00", "2024-01-01 02:00"])
+    target = pd.to_datetime(
+        ["2024-01-01 00:30", "2024-01-01 01:00", "2024-01-01 01:05"]
+    )
+
+    indices, status = PrecipMrms._align_precipitation_frames(
+        source,
+        target,
+        alignment="covering_interval",
+        interval="1h",
+        coverage_policy="error",
+    )
+
+    assert indices.tolist() == [0, 0, 1]
+    assert status.tolist() == ["covering_interval"] * 3
+
+
+def test_covering_interval_enforces_start_exclusive_end_inclusive():
+    source = pd.to_datetime(["2024-01-01 01:00", "2024-01-01 02:00"])
+
+    indices, _ = PrecipMrms._align_precipitation_frames(
+        source,
+        pd.DatetimeIndex([
+            pd.Timestamp("2024-01-01 00:00") + pd.Timedelta(1, unit="ns"),
+            pd.Timestamp("2024-01-01 01:00"),
+            pd.Timestamp("2024-01-01 02:00"),
+        ]),
+        alignment="covering_interval",
+        interval="1h",
+        coverage_policy="error",
+    )
+
+    assert indices.tolist() == [0, 0, 1]
+    with pytest.raises(ValueError, match="outside precipitation source coverage"):
+        PrecipMrms._align_precipitation_frames(
+            source,
+            pd.to_datetime(["2024-01-01 00:00"]),
+            alignment="covering_interval",
+            interval="1h",
+            coverage_policy="error",
+        )
+
+
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        (["2024-01-01 01:00", "2024-01-01 03:00"], "internal gap"),
+        (["2024-01-01 01:00", "2024-01-01 01:30"], "overlap"),
+    ],
+)
+def test_covering_interval_rejects_gaps_overlaps_and_irregular_cadence(
+    source, message
+):
+    with pytest.raises(ValueError, match=message):
+        PrecipMrms._align_precipitation_frames(
+            pd.to_datetime(source),
+            pd.to_datetime(["2024-01-01 01:15"]),
+            alignment="covering_interval",
+            interval="1h",
+            coverage_policy="hold",
+        )
+
+
+@pytest.mark.parametrize("interval", ["0h", "-1h", pd.NaT])
+def test_covering_interval_requires_finite_positive_duration(interval):
+    with pytest.raises(ValueError, match="finite positive duration"):
+        PrecipMrms._align_precipitation_frames(
+            pd.to_datetime(["2024-01-01 01:00"]),
+            pd.to_datetime(["2024-01-01 00:30"]),
+            alignment="covering_interval",
+            interval=interval,
+        )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        ["2024-01-01 01:00", "2024-01-01 01:00"],
+        ["2024-01-01 02:00", "2024-01-01 01:00"],
+        ["2024-01-01 01:00", None],
+    ],
+)
+def test_combined_alignment_requires_valid_ordered_unique_target_times(target):
+    with pytest.raises(ValueError, match="target_times must"):
+        PrecipMrms._align_precipitation_frames(
+            pd.to_datetime(["2024-01-01 01:00", "2024-01-01 02:00"]),
+            pd.to_datetime(target),
+        )
+
+
+def test_combined_alignment_rejects_empty_target_and_source_nat():
+    with pytest.raises(ValueError, match="target_times must contain"):
+        PrecipMrms._align_precipitation_frames(
+            pd.to_datetime(["2024-01-01 01:00"]),
+            pd.DatetimeIndex([]),
+        )
+    with pytest.raises(ValueError, match="source_times must contain only finite"):
+        PrecipMrms._align_precipitation_frames(
+            pd.DatetimeIndex([pd.NaT]),
+            pd.to_datetime(["2024-01-01 01:00"]),
+        )
+
+
+def test_combined_alignment_distinguishes_hold_error_and_authorized_dry_tail():
+    source = pd.to_datetime(["2024-01-01 01:00", "2024-01-01 02:00"])
+    target = pd.to_datetime(["2024-01-01 00:30", "2024-01-01 02:30"])
+
+    held, held_status = PrecipMrms._align_precipitation_frames(
+        source,
+        target,
+        coverage_policy="hold",
+    )
+    assert held.tolist() == [0, 1]
+    assert held_status.tolist() == ["held outside source coverage"] * 2
+
+    with pytest.raises(ValueError, match="outside precipitation source coverage"):
+        PrecipMrms._align_precipitation_frames(
+            source,
+            target,
+            coverage_policy="error",
+        )
+
+    dry_indices, dry_status = PrecipMrms._align_precipitation_frames(
+        source,
+        pd.to_datetime(["2024-01-01 01:00", "2024-01-01 02:30"]),
+        coverage_policy="dry_tail",
+    )
+    assert dry_indices.tolist() == [0, -1]
+    assert dry_status.tolist() == ["latest_completed", "authorized dry tail"]
+
+    with pytest.raises(ValueError, match="not before"):
+        PrecipMrms._align_precipitation_frames(
+            source,
+            pd.to_datetime(["2024-01-01 00:30"]),
+            coverage_policy="dry_tail",
+        )
+
+
+def test_combined_interval_amount_label_and_dry_tail_are_explicit(monkeypatch, tmp_path):
+    pytest.importorskip("matplotlib")
+    xr = pytest.importorskip("xarray")
+    precip = xr.DataArray(
+        np.array([[[25.4]], [[50.8]]], dtype="float32"),
+        dims=("time", "y", "x"),
+        coords={
+            "time": pd.to_datetime(["2024-01-01 01:00", "2024-01-01 02:00"]),
+            "y": [0.5],
+            "x": [0.5],
+        },
+        attrs={
+            "units": "mm",
+            "crs": "EPSG:2871",
+            "grid_bounds": (0.0, 1.0, 0.0, 1.0),
+        },
+    )
+    flood = xr.DataArray(
+        np.ones((2, 1, 1), dtype="float32"),
+        dims=("time", "y", "x"),
+        coords={
+            "time": pd.to_datetime(["2024-01-01 01:05", "2024-01-01 02:30"]),
+            "y": [0.5],
+            "x": [0.5],
+        },
+        attrs={"crs": "EPSG:2871", "grid_bounds": (0.0, 1.0, 0.0, 1.0)},
+    )
+    captured = {}
+
+    def capture(fig, update_func, frame_count, output_path, fps, dpi):
+        artists = update_func(frame_count - 1)
+        captured["precip"] = np.asarray(artists[0].get_array()).copy()
+        captured["title"] = artists[-1].get_text()
+        captured["labels"] = [axis.get_ylabel() for axis in fig.axes]
+        Path(output_path).touch()
+
+    monkeypatch.setattr(PrecipMrms, "_save_animation", staticmethod(capture))
+    output = PrecipMrms.animate_combined(
+        precip,
+        flood,
+        tmp_path / "combined.mp4",
+        precip_value_semantics="interval_amount",
+        precip_alignment="covering_interval",
+        precip_interval="1h",
+        coverage_policy="dry_tail",
+    )
+
+    assert output.exists()
+    assert np.all(captured["precip"] == 0)
+    assert "authorized dry tail" in captured["title"]
+    assert "Precipitation interval amount (in)" in captured["labels"]
+
+
+def test_public_combined_grid_route_rejects_internal_precipitation_gap(tmp_path):
+    xr = pytest.importorskip("xarray")
+    precip = xr.DataArray(
+        np.ones((2, 2, 2), dtype="float32"),
+        dims=("time", "y", "x"),
+        coords={
+            "time": pd.to_datetime(["2024-01-01 01:00", "2024-01-01 03:00"]),
+            "y": [1.5, 0.5],
+            "x": [0.5, 1.5],
+        },
+        attrs={"units": "mm", "crs": "EPSG:2871"},
+    )
+    flood = xr.DataArray(
+        np.ones((1, 2, 2), dtype="float32"),
+        dims=("time", "y", "x"),
+        coords={
+            "time": pd.to_datetime(["2024-01-01 01:30"]),
+            "y": [1.5, 0.5],
+            "x": [0.5, 1.5],
+        },
+        attrs={"crs": "EPSG:2871"},
+    )
+
+    with pytest.raises(ValueError, match="internal gap"):
+        PrecipMrms.animate_combined(
+            precip,
+            flood,
+            tmp_path / "gap.mp4",
+            precip_value_semantics="interval_amount",
+            precip_alignment="covering_interval",
+            precip_interval="1h",
+            coverage_policy="error",
+        )
+
+
+def test_public_combined_hdf_route_rejects_internal_precipitation_gap(
+    monkeypatch, tmp_path
+):
+    xr = pytest.importorskip("xarray")
+    precip = xr.DataArray(
+        np.ones((2, 2, 2), dtype="float32"),
+        dims=("time", "y", "x"),
+        coords={
+            "time": pd.to_datetime(["2024-01-01 01:00", "2024-01-01 03:00"]),
+            "y": [1.5, 0.5],
+            "x": [0.5, 1.5],
+        },
+        attrs={"units": "mm", "crs": "EPSG:2871"},
+    )
+    monkeypatch.setattr(
+        PrecipMrms,
+        "_load_hdf_flood_points",
+        staticmethod(lambda **_: {
+            "values": np.ones((1, 1), dtype=float),
+            "times": pd.to_datetime(["2024-01-01 01:30"]),
+            "x": np.array([0.5]),
+            "y": np.array([0.5]),
+            "units": "ft",
+            "crs": "EPSG:2871",
+        }),
+    )
+
+    with pytest.raises(ValueError, match="internal gap"):
+        PrecipMrms.animate_combined(
+            precip,
+            tmp_path / "results.p01.hdf",
+            tmp_path / "gap-hdf.mp4",
+            precip_value_semantics="interval_amount",
+            precip_alignment="covering_interval",
+            precip_interval="1h",
+            coverage_policy="error",
+        )

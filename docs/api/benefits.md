@@ -63,9 +63,9 @@ config = BenefitAreaConfig(
 
 Polygon creation is optional. `polygon_output=True` writes a GeoPackage beside
 the BenefitArea raster. An explicit path may use `.gpkg`, `.shp`, `.geojson`,
-`.parquet`, or `.geoparquet`. GeoParquet output requires the optional dependency
-installed with `pip install "ras-commander[geoparquet]"`. Polygon boundaries
-follow the final raster cell edges using four-cell connectivity; they are not
+`.parquet`, or `.geoparquet`. GeoParquet output uses the core `pyarrow`
+dependency. Polygon boundaries follow the final raster cell edges using
+four-cell connectivity; they are not
 smoothed or simplified by default.
 
 Set `polygon_simplify_tolerance` to simplify polygon edges after
@@ -254,3 +254,45 @@ generated from stored Depth maps.
   and raster/polygon generation.
 - `RasProcess.store_benefit_area()` — explicit paired-plan orchestration;
   `RasProcess.store_maps(..., benefit_area=config)` is the usual entry point.
+
+## Complete source reference
+
+### RasBenefits source reference
+
+::: ras_commander.RasBenefits.RasBenefits
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - classify_adverse_depth_arrays
+        - classify_depth_arrays
+        - create_benefit_area
+        - filter_small_regions
+        - get_registered_terrain_source
+        - validate_registered_terrain_source
+        - validate_terrain_tif
+
+### BenefitAreaConfig source reference
+
+::: ras_commander.RasBenefits.BenefitAreaConfig
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+
+### BenefitAreaResult source reference
+
+::: ras_commander.RasBenefits.BenefitAreaResult
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+
+### BenefitCategory source reference
+
+::: ras_commander.RasBenefits.BenefitCategory
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false

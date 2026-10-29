@@ -46,34 +46,63 @@ FEMA's Estimated Base Flood Elevation (eBFE) database provides valuable Base Lev
 ## The Solution: RasEbfeModels
 
 The `RasEbfeModels` class solves this problem by applying delivery-format
-normalization that transforms broken eBFE archives into runnable HEC-RAS models.
+normalization that transforms inconsistent eBFE archives into portable source
+candidates with explicit validation boundaries.
 
 ### Quick Start
 
 ```python
+import os
 from ras_commander.sources import RasEbfeModels
 from ras_commander import init_ras_project
 from pathlib import Path
 
+workspace = (
+    Path(os.environ.get("RAS_COMMANDER_EBFE_ROOT", r"H:\Testing\eBFE"))
+    / "12100201"
+)
+
 # Download/cache, extract, and organize by model slug
 organized = RasEbfeModels.organize_model(
     "upper-guadalupe",
-    download_root=Path(r"H:/Testing/eBFE Model Organization/Downloads"),
-    output_root=Path(r"H:/Testing/eBFE Model Organization/Organized"),
-    validate_dss=True
+    download_root=workspace / "raw",
+    output_root=workspace / "organized",
+    validate_dss=False,
 )
 
-# Use immediately - no manual fixes needed
-init_ras_project(organized / "RAS Model/UPGU1", "6.5")
+# Open the organized source with its authored engine
+init_ras_project(organized / "RAS Model/UPGU1", "6.3.1")
 
-# Opens without errors
-# No "DSS path needs correction" dialog
-# Terrain and land cover load from local folders
-# Pre-run results are accessible from project folders
-# Ready for automation and preprocessor validation
+# Organization is not a completed-result claim. Use the documented bounded
+# pre-compute workflow before describing a source as unsteady-start qualified.
 ```
 
 **Time**: 15 minutes vs 60-120 minutes manual fixes
+
+### Workspace and Path-Length Rule
+
+FEMA archives can contain deeply nested members that exceed limits still used
+by HEC-RAS and older Windows utilities. Preflight the maximum expanded path
+before extraction. The raw cache uses long-path-safe I/O when a source member
+is inherently too long; HEC-RAS-active organized project and run paths must
+remain at or below 240 characters. Configure a concise workspace with
+`RAS_COMMANDER_EBFE_ROOT`; new work on the shared Windows host uses:
+
+```text
+H:\Testing\eBFE\<HUC8>\
+├── raw\
+├── organized\
+├── runs\
+└── reports\
+```
+
+Do not create improvised folders at the drive root. ras-commander extraction
+uses long-path-safe I/O, restores archive timestamps, audits member sizes and
+CRC32 values, then writes a completion receipt. A non-empty legacy folder is
+audited before reuse;
+an incomplete cache is preserved and reported rather than silently accepted or
+deleted. Older validation records under `H:\Testing\eBFE Model Organization`
+remain historical evidence, but new work should use the concise layout.
 
 To inspect the built-in model catalog:
 
@@ -94,16 +123,289 @@ Current built-in organizers include:
 | Slug | HUC8 | Delivery Notes |
 |---|---:|---|
 | `spring-creek` | 12040102 | Single 2D model with nested final archive. |
+| `east-galveston-bay` | 12040202 | Public 2D delivery with a copied HMS project and optional nested RAS extraction. The outer inventory does not establish the RAS version, plan/geometry IDs, flow regime, or runtime readiness. |
+| `austin-oyster` | 12040205 | One HEC-RAS 5.07 2D unsteady project with seven plans. The compiled terrain, land cover, DSS inputs, projection, RASMapper file, geometry HDF, and seven result HDFs are delivered; deterministic reconstruction is required before runtime qualification. |
 | `north-galveston-bay` | 12040203 | Compound HMS plus nested 2D RAS delivery. |
-| `upper-guadalupe` | 12100201 | Four cascaded 2D watershed models. |
+| `upper-guadalupe` | 12100201 | Four cascaded HEC-RAS 6.3.1 2D watershed models with complete modified-terrain triplets. Fresh `p01` source-run qualification is tracked in the [Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-25_upper_guadalupe_record_of_deficiencies.md). |
+| `san-gabriel` | 12070205 | Five-project DSS fan-in covering the Round Rock and Florence ras2fim-2d test area. Unsteady-start validated; shared compiled terrain was not provided. |
 | `eleven-point` | 11010011 | Small split-delivery 2D model archive; organized, path-audited, results-ready, and geometry-preprocessor validated with HEC-RAS 6.6. |
 | `spring-river` | 11010010 | Distinct Spring HUC model archive using `SpringRiver_11010010` naming to avoid confusion with `spring-creek` / `SpringCreek_12040102`. |
-| `lower-colorado-cummins` | 12090301 | 1D steady BLE reach-model collection. |
+| `lower-colorado-cummins` | 12090301 | 2,378 HEC-RAS 4.1.0 1D steady reach projects, each containing plan 01. There are 2,377 seven-profile projects and one delivered six-profile project. The delivery has 2,332 projects at the usual river/reach depth and 46 valid projects nested under intermediate reach groups; terrain is not required. |
+| `pedernales` | 12090206 | 530 HEC-RAS 4.1.0-era 1D steady projects. Eight misplaced delivered result/preprocessor assets are copied to their referenced projects; terrain is not applicable, not missing. All 530 selected plan-01 runs passed in isolated two-core HEC-RAS 6.6 copies. |
+| `cibolo` | 12100304 | One HEC-RAS 5.0.7 2D unsteady project. Terrain, land cover, seven DSS inputs, and the projection are delivered; plan 14 reached owned unsteady-solver startup in an isolated two-core copy. |
+| `medina` | 12100302 | Five HEC-RAS 6.4.1 2D unsteady projects. Four have complete modified terrain and reached owned unsteady-solver startup; UpperMedinaHeadwaters is blocked by an undelivered load-bearing modified `Terrain.hdf`. Land cover, infiltration, and soils are delivered for all five projects. |
+| `salt-draw` | 13070004 | One HEC-RAS 6.4.1 2D rain-on-grid project (`SLDR_004`, geometry `g02`) with seven plans. Terrain, land cover, DSS inputs, and the HEC-HMS model are delivered. Only the selected plan result HDFs (about 9 GB each) are extracted; the default is `p01` and `p02`. |
 | `rio-hondo` | 13060008 | 1D steady BLE reach-model collection. |
 | `amite` | 08070202 | Louisiana component delivery with terrain rebuild handling for CRS mismatches. |
 | `tickfaw` | 08070203 | Large Louisiana 2D model archive. |
 | `lake-maurepas` | 08070204 | Louisiana 2D model archive. |
 | `lower-brazos` | 12070104 | Very large component delivery; manifest-only by default. |
+
+### East Galveston Bay source boundary
+
+`east-galveston-bay` is the public FEMA eBFE/BLE delivery for HUC8 `12040202`.
+It is separate from any RBFS source package. The public outer archive identifies
+a 2D delivery, an HEC-HMS project at `Hydrology/HMS/EastGalvestonBay`, and a
+nested `Hydraulic_Models/RAS_Submittal.zip`. It does not establish a HEC-RAS
+version, plan or geometry identifiers, flow regime, or hydraulic readiness.
+
+```python
+from pathlib import Path
+from ras_commander import RasExamples
+from ras_commander.sources import RasEbfeModels
+
+# Canonical source-aware API.
+organized = RasEbfeModels.organize_model(
+    "east-galveston-bay",
+    output_root=Path(r"D:/eBFE/organized"),
+    extract_ras_nested=False,
+)
+
+# Convenience entry point; it never changes RasExamples.extract_project().
+organized = RasExamples.organize_ebfe_model(
+    "east-galveston-bay", output_path=Path(r"D:/eBFE/organized")
+)
+```
+
+The organizer downloads and verified-extracts the 10.7 GB outer archive in
+both modes. `extract_ras_nested=False` retains the nested RAS submission in the
+raw extraction and avoids expanding it into the generated `RAS Model` folder.
+Use `extract_ras_nested=True` only after allocating additional local storage.
+It extracts Input, Terrain, and LandCover by default; the approximately 10 GB
+Output archive stays in the immutable source unless `include_results=True` is
+explicitly selected. A local 7-Zip CLI is required when the public outer ZIP
+contains Deflate64 members unsupported by the active Python runtime. The
+organizer records extraction state but does not execute HEC-RAS or promote a
+runtime qualification. Zero-byte `*.sr.lock` files delivered under `Features/`
+are archived GIS session artifacts. The organizer removes them only from its
+generated copy and records every removed relative path in the manifest; it does
+not remove other locks or alter the source archive.
+
+### Austin–Oyster reconstruction boundary
+
+The `austin-oyster` source entry covers eBFE HUC8 `12040205`. The public
+archive contains one HEC-RAS 5.07 2D unsteady project with seven registered
+plans. Its load-bearing terrain, land cover, seven DSS inputs, projection,
+RASMapper configuration, geometry HDF, and seven plan/result HDFs are present.
+The delivered `Terrain.hdf` contains no terrain-modification groups, matching
+the absence of modification layers in the delivered `.rasmap`; the organizer
+must preserve that evidence rather than rebuild or substitute terrain.
+
+Reconstruction expands the nested archive chain, relocates fourteen delivered
+`Output` assets plus the projection file, and corrects one RASMapper projection
+path. The organizer also checks all twenty-eight terrain/land-cover attributes
+in the seven plan HDFs. Independent reconstruction found all 28 attributes
+already path-equivalent, so it preserved their delivered bytes and performed
+zero HDF mutations. The eBFE webmap's count of 29 describes its proposed
+metadata-repair surface, not the mutations actually required by the archive.
+
+The two independently reviewed missing references are the optional local
+basemap definitions `Google Map.xml` and `Google Hybrid.xml`. They affect only
+RASMapper display and are not hydraulic inputs. The audit's static `RasCheck`
+sample ran against plan `p03` and recorded one error; it did not start or run
+HEC-RAS computation. Independent CEWS validation subsequently preprocessed
+plan `p08` (`1PAC`) with HEC-RAS 5.0.7 and two cores, reached an owned
+`RasUnsteady64.exe` child with the complete fresh artifact set, and stopped at
+the intended solver-start boundary in 64.9 seconds. This qualifies source
+assembly and unsteady startup, not completed results. The durable
+[Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-23_austin_oyster_record_of_deficiencies.md)
+preserves the evidence boundary and the CEWS staging location.
+
+### Pedernales, Cibolo, and Medina source boundaries
+
+The `pedernales`, `cibolo`, and `medina` entries use dedicated, fail-closed
+organizers. They bind the public FEMA object to its expected URL, byte size,
+and retained multipart ETag; validate the recoverable ZIP members; and apply
+only the study's audited repairs in a staged copy. Fresh organizer manifests
+remain pending until their own copies run; durable registry qualification is
+recorded separately from reviewed RAS Commander receipts.
+
+```python
+from pathlib import Path
+
+from ras_commander.sources import RasEbfeModels
+
+root = Path(r"H:\Testing\eBFE")
+for slug, huc8 in (
+    ("pedernales", "12090206"),
+    ("cibolo", "12100304"),
+    ("medina", "12100302"),
+):
+    organized = RasEbfeModels.organize_model(
+        slug,
+        download_root=root / huc8 / "raw",
+        output_root=root / huc8 / "organized",
+    )
+```
+
+Pedernales is a corpus of 530 independent 1D steady projects. The organizer
+selects each project's `p01`/`g01`/`f01` chain and copies eight misplaced,
+delivered assets to the three projects that reference them. No model in the
+corpus references terrain. Terrain is therefore **not applicable**, and its
+absence must not be reported as a delivery gap. All 530 path-identified `p01`
+plans completed in isolated two-core HEC-RAS 6.6 runs. This establishes
+corpus runnability in 6.6; it does not claim numerical equivalence with the
+unavailable authored 4.10 engine. See the
+[Pedernales Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-25_pedernales_record_of_deficiencies.md).
+
+Cibolo is one 2D unsteady project inside a nested `_Final.zip`. The organizer
+stages the delivered compiled terrain, component rasters, VRT, Manning's-n
+land-cover HDF/raster, projection, and seven DSS files. It rewrites the seven
+active DSS references and one RASMapper projection reference. Terrain and
+land cover are delivered and are not rebuilt. The canonical 1% test is plan
+`p14`, geometry `g05`, and unsteady-flow file `u02`. That plan reached owned
+unsteady-solver startup with two cores in HEC-RAS 5.0.7. See the
+[Cibolo Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-25_cibolo_record_of_deficiencies.md).
+
+Medina contains Leon1, Leon2, Leon3, MiddleLowerMedina, and
+UpperMedinaHeadwaters. Land cover, infiltration, and soils are delivered for
+all five projects. Four projects also contain the compiled modified terrain
+used by their active geometry. UpperMedinaHeadwaters does not: its required
+`Terrain.hdf`, including the referenced
+`UpperMedinaHW_TerrainModifications` group, is absent. This is a critical,
+load-bearing source gap that blocks downstream use of that project. Separately,
+the public ZIP ends inside `UpperMedinaHW.p01.hdf`; that member is a supplied
+result HDF, so the publisher truncation is a recoverable delivery defect, not
+the hydraulic-source blocker. Leon1, Leon2, Leon3, and MiddleLowerMedina each
+reached owned unsteady-solver startup with two cores in HEC-RAS 6.4.1; this
+does not change UpperMedinaHeadwaters' blocked status. See the
+[Medina Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-25_medina_record_of_deficiencies.md).
+
+### Salt Draw selectable result HDFs
+
+`salt-draw` is the public FEMA eBFE delivery for HUC8 `13070004`. The
+67 GB archive holds one HEC-RAS 6.4.1 2D project, `SLDR_004`, with a single
+2D flow area of 794,234 cells driven by precipitation on the grid. All seven
+plans use geometry `g02`:
+
+| Plan | Title | Unsteady file | Event |
+|---|---|---|---|
+| `p01` | `SLDR_004_1pct` | `u01` | 1% AEP |
+| `p02` | `SLDR_004_0_2pct` | `u02` | 0.2% AEP |
+| `p03` | `SLDR_004_10pct` | `u03` | 10% AEP |
+| `p04` | `SLDR_004_4pct` | `u04` | 4% AEP |
+| `p05` | `SLDR_004_2pct` | `u05` | 2% AEP |
+| `p06` | `SLDR_004_1plu` | `u06` | 1% AEP plus (upper confidence) |
+| `p07` | `SLDR_004_1min` | `u07` | 1% AEP minus (lower confidence) |
+
+Each delivered plan result HDF is about 9 GB. The organizer reads the
+retained archive and CRC-extracts only the result HDFs named in
+`output_plans` (default `p01` and `p02`). Plan, unsteady, geometry, terrain,
+land-cover, DSS, and HMS files are always kept. The delivered
+`RAS_Submittal/{Input,Terrain,Landcover}` layout is preserved, so every
+terrain, land-cover, and DSS reference resolves without repair.
+
+```python
+from pathlib import Path
+
+from ras_commander import init_ras_project
+from ras_commander.sources import RasEbfeModels
+
+organized = RasEbfeModels.organize_model(
+    "salt-draw",
+    download_root=Path(r"H:\Testing\eBFE\13070004\raw"),
+    output_root=Path(r"H:\Testing\eBFE\13070004\organized"),
+    output_plans=["p01", "p02"],
+)
+ras = init_ras_project(organized / "RAS Model" / "RAS_Submittal" / "Input", "6.6")
+```
+
+`downloaded_folder=` also accepts the archive itself or an already-extracted
+`13070004_Models_20250416` tree. An extracted tree has no archive identity to
+check; the manifest records it as `pre_extracted_tree`, and every requested
+result HDF must be present in it.
+
+The delivered results contain water surface and face velocity but no face
+flow. HEC-RAS 6.6 cannot regenerate the delivered mesh unchanged because 48
+cells have more than eight faces. Repair the computation points with
+`GeomMesh.plan_computation_point_repair` and
+`GeomMesh.apply_computation_point_repair` before regenerating the mesh in 6.6.
+The organizer does not change the mesh, and it leaves the delivered
+`Current Plan=p07` in `SLDR_004.prj` unchanged. The four RASMapper references
+outside the delivery (two host basemaps, a profile-line layer, and a stale
+author-local `u01.hdf` event layer) are display-only.
+
+For large 2D studies, keep the authoritative organized source and durable
+receipts on the CEWS H: data library, but make bounded execution copies on a
+fixed local disk. Cibolo and Medina repeatedly exceeded the startup wait when
+preprocessing directly from H:, while unchanged local I: copies reached the
+same RAS Commander gate. This is an execution-tier rule, not permission to
+move or modify the authoritative delivery.
+
+### Alabama BLE watershed corpora
+
+Alabama's statewide BLE catalog is exposed through the separate
+`AlabamaBleModels` source adapter. It joins the public ArcGIS model layer to
+the public model-link table by publisher `ModelID` and downloads only the
+table's `WebPath`. The publisher's bare object-store prefixes are not
+browsable directory endpoints, so callers must not scrape or construct URLs
+from those prefixes.
+
+The qualified `AL03130002` study key identifies the Middle
+Chattahoochee-Lake Harding HUC8 corpus: 197 1D steady projects grouped into
+eight source basins. The adapter preserves all of them in one movable delivery
+folder for FIM Commander and writes a relative-path inventory of each
+project's registered plan, geometry, flow, geometry HDF, and source archive.
+
+```python
+from pathlib import Path
+
+from ras_commander.sources import AlabamaBleModels
+
+workspace = Path("D:/ble/AL03130002")
+
+# Dynamic ArcGIS/WebPath inventory: all 197 models, or one named source basin.
+all_models = AlabamaBleModels.list_watershed_models("AL03130002")
+halawakee = AlabamaBleModels.list_watershed_models(
+    "03130002",
+    basin="Halawakee Creek",
+)
+
+# Reuse a separately retained raw corpus when it contains every verified ZIP
+# and source-identity sidecar; extracted folders alone are not trusted.
+# Otherwise download, verify, extract, and organize the complete HUC8 directly.
+raw_source = workspace / "raw"
+if raw_source.exists():
+    delivery = AlabamaBleModels.organize_watershed(
+        "03130002",
+        raw_source,
+        workspace / "organized",
+    )
+else:
+    delivery = AlabamaBleModels.download_watershed(
+        "03130002",
+        workspace / "organized",
+    )
+if not delivery.success:
+    raise RuntimeError(delivery.message)
+
+inventory = AlabamaBleModels.build_watershed_delivery_inventory(
+    delivery.model_path
+)
+```
+
+The organized root contains `Source Archives/`, `RAS Models/`, and
+`Documentation/`. Basin grouping is retained below the first two folders;
+paths in `Documentation/watershed_delivery_inventory.json` are relative to the
+delivery root. The retained source manifest uses
+`ras_commander.watershed_source_manifest` contract `1.0.0`; its `download`
+mode retains the downloader's archive provenance block, while `staged-copy`
+retains the verified staging provenance block. Both modes share the same
+source identity and extraction keys and require source ZIPs, strong-ETag
+sidecars, and archive-bound extraction receipts. The inventory contract is identified by
+`ras_commander.watershed_delivery_inventory` version `1.0.0`; it is the
+canonical FIM intake. The Example Project
+Library's four-layer combined PMTiles is a display derivative and must not
+replace it.
+
+Current source qualification found 197 registered steady plans, 197 geometry
+HDFs, and 5,365 cross sections. Delivered plan metadata identifies 135 plans
+as 6.20 and two as 6.31; 60 omit `Program Version`, so the source adapter does
+not apply a blanket version. No plan computation has yet been run across this
+corpus. One extra physical file, `OSANIPPA CREEK.p02`, is preserved but is not
+registered by its project and is excluded from the canonical plan inventory.
+Because these are pure 1D geometry models, absence of a terrain HDF is not a
+source deficiency for this corpus product.
 
 ## Delivery Validation Gate
 
@@ -137,6 +439,53 @@ runs the HEC-RAS geometry preprocessor through ras-commander, and reviews
 compute messages without requiring full unsteady calculations or floodplain
 mapping/post-processing as the delivery-format gate. For 1D steady BLE reach
 models, document terrain or land cover checks only when mapper layers exist.
+
+For Lower Colorado-Cummins, run exactly one plan per project from isolated
+copies. The study-aware runner automatically enables nested-project discovery,
+uses the organized source as immutable input, and records the run-copy path:
+
+```powershell
+.\.venv\Scripts\python scripts\ebfe_steady_plan_batch.py `
+  --study 12090301 `
+  --workspace "H:\Testing\eBFE\12090301" `
+  --plan 01 `
+  --ras-version 6.6 `
+  --num-cores 2 `
+  --force-geompre
+```
+
+The source metadata distinguishes the delivered HEC-RAS 4.1.0 version from the
+qualified 6.6 execution version and lists the separate public Models,
+SpatialData, and Documents packages. The SpatialData package contains published
+depth and water-surface-elevation results, not a terrain surface. Absence of a
+Terrain HDF or RASMapper file is therefore not a deficiency for these 1D steady
+projects. Study metadata also applies a 600-second per-plan timeout; a stalled
+owned process tree is cancelled through `RasCmdr.cancel_plan()` and recorded as
+a failed project, while legacy explicit-root runs retain their prior no-timeout
+default.
+
+Study mode also supplies the delivered profile-count contract: seven profiles
+for 2,377 projects and six for `WALNUT 0329`. The organizer repairs the missing
+`Flow File=f01` record in exactly `PINEY 062` and `PINEY 089` after validating
+their source fingerprints; it never modifies the downloaded source.
+
+The separate source packages use the same integrity-checked download and
+extraction path as the Models archive:
+
+```python
+from ras_commander.sources import RasEbfeModels
+
+documents = RasEbfeModels.download_source_asset(
+    "12090301",
+    "documents",
+    workspace / "raw",
+)
+spatial_data = RasEbfeModels.download_source_asset(
+    "12090301",
+    "spatial_data",
+    workspace / "raw",
+)
+```
 
 For repeatable end-to-end checks from the repository, use:
 
@@ -354,42 +703,114 @@ RAS_Submittal archive in place.
 ### Upper Guadalupe (12100201) - Pattern 3b
 
 **Model Type**: 4 cascaded 2D watershed models
-**Size**: 55 GB
+**Source size**: 58,575,220,457 bytes
 **Models**: UPGU1 → UPGU2 → UPGU3 → UPGU4 (hydraulic cascade)
 **Plans**: 28 total (7 AEP frequencies × 4 models)
-**DSS**: 10,248 pathnames validated
+**DSS**: 10 delivered files; 21 live upstream-to-downstream references checked
 
 **Usage**:
 ```python
 from ras_commander.sources import RasEbfeModels
-from ras_commander import init_ras_project, RasCmdr, RasPrj
+from ras_commander import RasCmdr, RasPreprocess, RasPrj, init_ras_project
 
 # Organize (applies delivery normalization across all 4 models)
 organized = RasEbfeModels.organize_upper_guadalupe(
     downloaded_folder,
-    validate_dss=True  # Validates 10,248 pathnames
+    validate_dss=False,
 )
 
-# Execute cascade (upstream to downstream)
+# Bounded source qualification (upstream to downstream)
 for model in ['UPGU1', 'UPGU2', 'UPGU3', 'UPGU4']:
     ras_obj = RasPrj()
-    init_ras_project(organized / "RAS Model" / model, "6.5", ras_object=ras_obj)
-    RasCmdr.compute_plan("01", ras_object=ras_obj, num_cores=4)
+    init_ras_project(organized / "RAS Model" / model, "6.3.1", ras_object=ras_obj)
+    result = RasPreprocess.preprocess_plan("01", ras_object=ras_obj)
+    assert result.success
+    RasCmdr.cancel_plan_exact("01", ras_object=ras_obj)
 ```
 
 **Fixes Applied**:
-- 56 HDF files (~41 GB) moved into project folders
-- 4 Terrain folders (~15.7 GB) moved into project folders
+- 56 delivered Output assets placed at their expected Input locations in the staged copy
+- 4 complete terrain triplets staged without replacing their channel or polygon modifications
 - DSS assets copied into per-project `DSS Inputs/` folders and references rewritten
 - Land cover copied into per-project `Land Cover/` folders
-- Projection copied or generated under per-project `Projection/` folders
+- The one delivered shared projection copied under each project `Projection/` folder
 - `.rasmap` terrain, land cover, and projection paths rewritten to local folders
 
-**Validated**: UPGU1, UPGU2, and UPGU3 passed geometry-preprocessor validation
-with a 1-hour timeout. UPGU4 produced preprocessor artifacts but exceeded the
-1-hour cap and remains an explicit long-runtime validation item.
+**Current qualification gate**: historical preprocessor artifacts do not replace
+fresh source-run evidence. UPGU1 `p01` reached owned unsteady-solver startup in
+an isolated two-core run. UPGU2's receipt records `natural_completion` without
+owned solver-start evidence after property-table rebuilding was observed, and UPGU3–UPGU4 were not run;
+those three projects therefore remain unqualified in the
+[Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-25_upper_guadalupe_record_of_deficiencies.md).
 
 **Example Notebook**: `examples/952_ebfe_upper_guadalupe_cascade.ipynb`
+
+### San Gabriel (12070205) - Pattern 3b
+
+**Model Type**: Five linked 2D unsteady projects
+
+**HEC-RAS**: 6.3
+
+**Dependency**: LBSG_501, LBSG_502, LBSG_503, and LBSG_504 feed LBSG_505
+
+**Test use**: Round Rock is in LBSG_504; Florence is nearest LBSG_503
+
+**Validation**: One 1% plan per model reached unsteady computation
+
+```python
+import os
+from pathlib import Path
+
+from ras_commander.sources import RasEbfeModels
+
+workspace = (
+    Path(os.environ.get("RAS_COMMANDER_EBFE_ROOT", r"H:\Testing\eBFE"))
+    / "12070205"
+)
+organized = RasEbfeModels.organize_model(
+    "san-gabriel",
+    download_root=workspace / "raw",
+    output_root=workspace / "organized",
+    validate_dss=True,
+)
+```
+
+The organizer preserves each `LBSG_50#\Input` project and its sibling land
+cover folder, stages delivered plan-result HDFs beside their plan files, copies
+the delivered HEC-HMS 4.10 project, and rewrites only the known LBSG_505
+cross-project DSS prefixes. Every terrain layer in all five `.rasmap` files is
+normalized to the one shared organized target,
+`RAS Model\Terrain\Terrain.hdf`. It does not use basename-based DSS repair
+because the delivery contains several unrelated files named `100.dss`.
+
+!!! danger "Critical 2D source gap: computational terrain not provided"
+    The hydraulic inventory and all five `.rasmap` files name one shared
+    `Terrain\Terrain.hdf`, but no public San Gabriel package contains it. The
+    three HDEMs and the terrain spatial files are preserved under
+    `RAS Model\Terrain Submittal`; deeply nested supplemental reports remain in
+    the audited raw cache, outside the active RAS tree. The HDEMs omit the two
+    road-crossing ground-line layers and Lake Georgetown polygon named as
+    terrain modifications. The organizer does not automatically synthesize a
+    replacement. An explicitly authorized working copy can build one shared
+    HDEM-only terrain through `RasTerrain.create_terrain_hdf(...)`; all five
+    projects then point to that file, but it is not FEMA's original and cannot
+    support a numerical-equivalence claim. For a 2D model this is a critical,
+    model-blocking deficiency: the public delivery is not reproducible or
+    usable for downstream hydraulic computation, and a viewable supplied
+    result HDF does not cure the gap. The generated Record of Deficiencies
+    preserves that distinction. `unsteady_start` is compute evidence only;
+    delivery readiness is `critical_source_gap` and the model must not be
+    presented as a runnable example until source-equivalent terrain is restored.
+
+Qualified 1% smoke plans:
+
+| Project | Plan | Geometry | Unsteady file |
+|---|---:|---:|---:|
+| LBSG_501 | 01 | 02 | 01 |
+| LBSG_502 | 02 | 03 | 01 |
+| LBSG_503 | 04 | 04 | 01 |
+| LBSG_504 | 05 | 05 | 01 |
+| LBSG_505 | 06 | 06 | 02 |
 
 ## API Reference
 
@@ -480,27 +901,29 @@ NorthGalvestonBay_12040203/
 @staticmethod
 @log_call
 def organize_upper_guadalupe(
-    downloaded_folder: Path,
-    output_folder: Optional[Path] = None,
-    validate_dss: bool = True
+    downloaded_folder: Optional[Union[str, Path]] = None,
+    output_folder: Optional[Union[str, Path]] = None,
+    validate_dss: bool = False
 ) -> Path
 ```
 
 **Organizes**: Upper Guadalupe (12100201) - Pattern 3b
 
 **Parameters**:
-- `downloaded_folder`: Path to extracted 12100201_UpperGuadalupe_Models folder
+- `downloaded_folder`: Optional path to the retained ZIP or an extracted delivery;
+  when omitted, the pinned FEMA object is downloaded
 - `output_folder`: Output location (default: ./ebfe_organized/UpperGuadalupe_12100201/)
-- `validate_dss`: Run DSS validation (default: True, validates 10,248 pathnames)
+- `validate_dss`: Optionally inventory the ten staged DSS files (default: False)
 
-**Returns**: Path to organized model with 4 runnable cascaded HEC-RAS projects
+**Returns**: Path to the four-project organized source candidate. Organization
+alone is not a runtime or full-completion claim.
 
 **Fixes Applied** (x 4 models):
-1. Moves 56 HDF files (~41 GB) INTO project folders
-2. Moves 4 Terrain folders (~15.7 GB) INTO project folders
+1. Places 56 delivered Output assets at their expected Input locations in the staged copy
+2. Stages all four complete terrain triplets while preserving their terrain modifications
 3. Copies DSS assets into per-project `DSS Inputs/` folders and rewrites references
 4. Copies land-cover assets into per-project `Land Cover/` folders
-5. Copies or creates project CRS files under per-project `Projection/` folders
+5. Materializes the one delivered shared CRS file under each project `Projection/` folder
 6. Rewrites `.rasmap` terrain, land cover, and projection references
 7. Creates comprehensive agent/model_log.md
 
@@ -508,20 +931,39 @@ def organize_upper_guadalupe(
 ```
 UpperGuadalupe_12100201/
 └── RAS Model/
-    ├── UPGU1/  # Upstream watershed (runnable)
-    ├── UPGU2/  # Receives UPGU1 flow via DSS (runnable)
-    ├── UPGU3/  # Receives UPGU2 flow via DSS (runnable)
-    └── UPGU4/  # Downstream watershed (runnable)
+    ├── UPGU1/  # Upstream source project
+    ├── UPGU2/  # Receives UPGU1 flow via DSS
+    ├── UPGU3/  # Receives UPGU2 flow via DSS
+    └── UPGU4/  # Downstream source project
 ```
 
 **Cascade Execution** (sequential required):
 ```python
 for model in ['UPGU1', 'UPGU2', 'UPGU3', 'UPGU4']:
     ras_obj = RasPrj()
-    init_ras_project(organized / "RAS Model" / model, "6.5", ras_object=ras_obj)
+    init_ras_project(organized / "RAS Model" / model, "6.3.1", ras_object=ras_obj)
     RasCmdr.compute_plan("01", ras_object=ras_obj, num_cores=4)
     # Upstream results feed downstream via DSS
 ```
+
+### RasEbfeModels.organize_san_gabriel()
+
+```python
+@staticmethod
+@log_call
+def organize_san_gabriel(
+    downloaded_folder: Optional[str | Path] = None,
+    output_folder: Optional[str | Path] = None,
+    validate_dss: bool = True,
+) -> Path
+```
+
+This additive organizer retains the five-project folder relationships, applies
+the documented 1% smoke-plan table flags, restores classification timestamps
+recorded in each selected geometry HDF, and writes
+`agent/san_gabriel_manifest.json`. The existing `organize_model()` return type
+and compact `available_models()` schema are unchanged; detailed dependency and
+deficiency metadata is exposed through `ModelMetadata.extra`.
 
 ## Standardized 4-Folder Structure
 
@@ -561,7 +1003,7 @@ All organized models use the same structure:
 
 ### DSS Pathname Validation
 
-All organize methods include comprehensive DSS validation:
+Organizers can optionally inventory DSS catalogs when `validate_dss=True`:
 
 ```python
 from ras_commander.dss import RasDss
@@ -574,7 +1016,9 @@ for dss_file in dss_files:
         # Invalid pathnames documented in agent/model_log.md
 ```
 
-**Upper Guadalupe Achievement**: 10,248 pathnames validated, 100% valid ✓
+Upper Guadalupe's required source gate is narrower and reproducible: ten DSS
+files exist, 28 project-local precipitation references resolve, and all 21
+cross-project transfer references remain live rather than copied snapshots.
 
 ### Path Existence Validation
 
@@ -633,9 +1077,9 @@ Complete working examples demonstrating each model:
 
 **Demonstrates**:
 - Organizing Pattern 3b (cascaded watersheds)
-- Massive scale fixes (57 GB moved, 96 corrections)
-- 10,248 DSS pathname validation
-- Cascaded model execution (UPGU1→2→3→4)
+- Large split-folder source assembly
+- Project-local precipitation and live transfer-DSS validation
+- Cascaded model ordering (UPGU1→2→3→4)
 - Gridded precipitation DSS
 - Pre-run results extraction
 
@@ -669,6 +1113,15 @@ Complete working examples demonstrating each model:
 - Confirming local projection, terrain, land-cover, and RASMapper assets.
 - Reusing saved ras-commander geometry-preprocessor evidence for plan 13.
 - Verifying that all seven plan result HDF paths resolve inside the organized RAS project folder.
+
+### 956_hydrofabric_conflation_visual_qa.ipynb
+
+**Demonstrates**:
+- Conflating the Texas Lower Colorado-Cummins SHILOH BRANCH footprint, reach, and 40 cross sections to NextGen v2.2 VPU 12 flowpaths.
+- Mapping native NextGen `wb-*` flowpaths, `cat-*` catchments, WBD HUC12 boundaries, ranked candidates, and direct cross-section intersections for visual QA.
+- Auditing candidate score components and the confidence margin while resolving native `nex-*` links and preferring total upstream drainage area.
+- Comparing default and deliberately strict thresholds to expose matched, ambiguous, and unmatched states without fake accepted identifiers.
+- Verifying along-flowpath cross-section measures and a two-feature NextGen reach sequence.
 
 ### 957_ebfe_spring_river_validation.ipynb
 
@@ -724,10 +1177,11 @@ RasCmdr.compute_plan("01")  # Hangs on "DSS path needs correction" dialog
 ### With Path Corrections
 
 ```python
-# Automation WORKS - no GUI interruptions
-organized = RasEbfeModels.organize_upper_guadalupe(source, validate_dss=True)
-init_ras_project(organized / "RAS Model/UPGU1", "6.5")
-RasCmdr.compute_plan("01", num_cores=4)  # Runs to completion
+# Portable assembly and bounded solver-start qualification
+organized = RasEbfeModels.organize_upper_guadalupe(source, validate_dss=False)
+init_ras_project(organized / "RAS Model/UPGU1", "6.3.1")
+result = RasPreprocess.preprocess_plan("01")
+assert result.success  # Solver-start evidence; not full-plan completion
 ```
 
 ## Testing and Validation
@@ -738,11 +1192,28 @@ Current validation is tracked in the repository-level
 `VALIDATION_MATRIX.md`, with generated audit reports under the H: workspace:
 `H:\Testing\eBFE Model Organization\Validation\ebfe_delivery`.
 
-- Lower Colorado-Cummins sample: geometry preprocessor passed.
+- Lower Colorado-Cummins: plan `01` was attempted for all 2,378 isolated
+  project copies with HEC-RAS 6.6. After two exact missing-flow-reference
+  repairs and recognition of the one delivered six-profile project, 2,375
+  passed with HDF results. Three remain model-blocked by delivered hydraulic
+  data defects: overlapping blocked obstructions in `ALUM CREEK`, and flow
+  boundaries assigned to nonexistent cross sections in `WALNUT 0613` and
+  `WILLBARGER 0185`.
 - Rio Hondo: 253 1D steady reach projects passed sequential geometry preprocessor validation, and 253/253 steady plans computed successfully in `steady_plan_validation_20260424_160022.json`.
 - Spring Creek: 2D geometry preprocessor passed.
 - North Galveston Bay: nested download/extract/organize path passed geometry preprocessor validation; delivered HMS project loads through hms-commander.
-- Upper Guadalupe: UPGU1, UPGU2, and UPGU3 passed; UPGU4 requires the 7200-second validation record because its geometry preprocessor can exceed one hour.
+- Upper Guadalupe: UPGU1 `p01` reached owned unsteady-solver startup in a fresh
+  two-core isolated run. UPGU2's receipt records `natural_completion` without
+  owned solver-start evidence after its property-table rebuild was observed,
+  and UPGU3–UPGU4 were not attempted, so
+  those three remain unqualified. Supplied plan HDFs are publication artifacts,
+  not fresh execution evidence.
+- San Gabriel: all five selected 1% plans reached the unsteady-computation
+  phase through ras-commander. This is `unsteady_start` compute evidence only.
+  The required compiled terrain and terrain-modification payloads are `Not
+  Provided in Source`, a `critical_source_gap` that makes the public 2D model
+  non-reproducible and unusable for downstream computation. The HDEM-only
+  diagnostic rebuild does not promote its delivery-readiness status.
 - Eleven Point: organized from the split `Input.zip`, `Terrain.zip`, and `Land_Cover.zip` delivery; path-audited with zero issues, seven local plan HDFs, and a passing ras-commander geometry-preprocessor run using HEC-RAS 6.6.
 - Spring River: cataloged separately from Spring Creek as `spring-river` / `SpringRiver_11010010`; downloaded, organized, path-audited with zero issues, preprocessor-valid in HEC-RAS 6.1, and results-ready with seven local plan HDFs. The validation notebook preserves the legacy `Land Classification` compatibility copy referenced by `Spring_BLE.g01.hdf`, archives fresh preprocessor evidence, and restores the delivered full-result plan HDF; see `examples/957_ebfe_spring_river_validation.ipynb`.
 - Lower Brazos: LB_MA01, LB_MA02, and LB_MA03 are downloaded, extracted, organized, path-audited with zero issues, and results-ready with 61 local plan HDFs in the latest audit. LB_MA02 passed ras-commander geometry-preprocessor validation in 3846.3 seconds; LB_MA01 exceeded the 7200-second timeout with no compute messages, and LB_MA03 returned without producing compute messages, so Lower Brazos remains partially preprocessor-validated.
@@ -761,16 +1232,14 @@ Current eBFE notebooks `950`-`957` execute against the shared
 refreshed after delivery-format updates, and notebook QA confirmed no error
 outputs in the eBFE notebook set.
 
-### DSS Validation Scale
+### Upper Guadalupe active-reference audit
 
-**Largest validation ever**:
-- Model: Upper Guadalupe
-- DSS files: 10
-- Total pathnames: 10,248
-- Validation rate: 100% (0 errors)
-- Breakdown:
-  - Gridded precipitation: 6,720 pathnames
-  - Boundary conditions: 3,528 pathnames
+- 10 delivered DSS files
+- 28 project-local precipitation references
+- 21 live cascade-transfer references
+- 28 plan geometry/unsteady bindings
+- 224 fixed-length HDF association attributes
+- 12 terrain payload files and 5 terrain-modification groups
 
 ## Why This Matters
 

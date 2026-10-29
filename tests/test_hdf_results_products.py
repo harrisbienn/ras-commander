@@ -39,6 +39,28 @@ def _write_product_hdf(
             "Geometry/2D Flow Areas/Attributes",
             data=attributes,
         )
+        # Product readiness now includes the topology used during export.
+        hdf_file.create_dataset(
+            "Geometry/2D Flow Areas/Mesh/Cells Center Coordinate",
+            data=np.asarray([[0.0, 0.0], [1.0, 1.0]]),
+        )
+        hdf_file.create_dataset(
+            "Geometry/2D Flow Areas/Mesh/Cells Face and Orientation Info",
+            data=np.asarray([[0, 2], [2, 2]], dtype=np.int32),
+        )
+        hdf_file.create_dataset(
+            "Geometry/2D Flow Areas/Mesh/Cells Face and Orientation Values",
+            data=np.asarray([[0, 1], [1, 1], [1, -1], [2, 1]], dtype=np.int32),
+        )
+        hdf_file.create_dataset(
+            "Geometry/2D Flow Areas/Mesh/Cells Minimum Elevation",
+            data=np.asarray([8.0, 20.0]),
+        )
+        hdf_file.create_dataset(
+            "Results/Unsteady/Output/Output Blocks/Base Output/"
+            "Summary Output/2D Flow Areas/Mesh/Maximum Water Surface",
+            data=np.asarray([[12.0, 21.0], [1.0 / 24.0, 1.0 / 24.0]]),
+        )
         hdf_file.create_dataset(
             f"{BASE}/Time Date Stamp (ms)",
             data=np.asarray(
@@ -89,6 +111,7 @@ def test_inspect_result_reports_stac_ready_metadata(tmp_path):
         "count": 2,
         "regular": True,
         "interval_seconds": 3600.0,
+        "datasets": [f"{BASE}/Time Date Stamp (ms)"],
     }
     assert result["mesh_names"] == ["Mesh"]
     assert result["crs"] == "EPSG:3451"

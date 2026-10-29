@@ -77,6 +77,12 @@ research/**/__pycache__/
 !/feature_dev_notes/README.md
 !/feature_dev_notes/multicore_raster_processing/
 !/feature_dev_notes/multicore_raster_processing/*.md
+!/feature_dev_notes/structured_execution_evidence/
+!/feature_dev_notes/structured_execution_evidence/*.md
+!/feature_dev_notes/Mesh_Grid_Anchor/
+!/feature_dev_notes/Mesh_Grid_Anchor/**
+!/feature_dev_notes/rust_hdf_acceleration/
+!/feature_dev_notes/rust_hdf_acceleration/*.md
 /research
 !/research/
 !/research/fixtures/
@@ -101,6 +107,9 @@ examples/example_projects.csv
 # Ignore remote worker credentials and API keys
 examples/RemoteWorkers.json
 RemoteWorkers.json
+# Timestamped backups can contain the same credentials as the live files.
+RemoteWorkers.json.*.bak
+examples/RemoteWorkers.json.*.bak
 examples/usgs_api_key.txt
 usgs_api_key.txt
 /troubleshooting
@@ -178,9 +187,12 @@ check_*.py
 !ras_commander/check/check_*.py
 fix_*.py
 run_*.py
+!scripts/qualification/execution_evidence/run_io.py
 !scripts/benchmarks/run_raster_profile_matrix.py
 test_*.py
 !tests/test_*.py
+!tests/qualification/
+!tests/qualification/test_*.py
 monitor_*.py
 cayce_*.py
 ai_tools/generate_*.py  # Only ignore AI tool generators, not scripts/
@@ -242,6 +254,7 @@ ras_commander/sources/*
 !ras_commander/sources/base.py
 !ras_commander/sources/county/
 !ras_commander/sources/federal/
+!ras_commander/sources/state/
 
 # Claude Code workspace directories
 examples/.claude/
@@ -269,3 +282,4 @@ terminal-logs/
 # test temp
 .test-tmp/
 .vscode/settings.json
+rust/step05/target/

@@ -18,6 +18,7 @@ import time
 import re
 from .LoggingConfig import get_logger
 from .Decorators import log_call
+from ._ras_text import _write_ras_text
 
 logger = get_logger(__name__)
 
@@ -44,6 +45,11 @@ class BcoMonitor:
         check_interval: Seconds between .bco file polls (default: 0.5)
         max_wait_seconds: Maximum wait time before timeout (default: 300)
         message_callback: Optional callback for new messages
+        blocking_condition: Optional callback returning a diagnostic when a
+            known modal condition prevents progress
+        alternate_signal_condition: Optional callback for an equivalent,
+            job-scoped readiness signal when the .bco file remains empty
+        alternate_signal_description: Human-readable alternate signal name
 
     Example:
         >>> monitor = BcoMonitor(
@@ -62,16 +68,25 @@ class BcoMonitor:
     project_name: str
     signal_string: str = "Starting Unsteady Flow Computations"
     check_interval: float = 0.5
-    max_wait_seconds: int = 300
+    max_wait_seconds: float = 300.0
 
     # Optional callback for streaming messages
     message_callback: Optional[Callable[[str], None]] = None
+
+    # Optional probes used by process-owning callers such as RasPreprocess.
+    blocking_condition: Optional[Callable[[], Optional[str]]] = None
+    alternate_signal_condition: Optional[Callable[[], bool]] = None
+    alternate_signal_description: Optional[str] = None
 
     # Internal state (initialized in __post_init__)
     bco_file: Path = field(init=False)
     execution_start_time: Optional[float] = field(default=None, init=False)
     _last_file_position: int = field(default=0, init=False)
     _callback_error_logged: bool = field(default=False, init=False)
+    _blocking_probe_error_logged: bool = field(default=False, init=False)
+    _alternate_probe_error_logged: bool = field(default=False, init=False)
+    blocked_reason: Optional[str] = field(default=None, init=False)
+    signal_source: Optional[str] = field(default=None, init=False)
 
     def __post_init__(self):
         """Initialize paths and validate configuration."""
@@ -108,7 +123,7 @@ class BcoMonitor:
                     content
                 )
                 if new_content != content:
-                    plan_file_path.write_text(new_content, encoding='utf-8')
+                    _write_ras_text(plan_file_path, new_content, encoding="utf-8")
                     logger.debug(f"Enabled detailed logging in {plan_file_path.name}")
             else:
                 # Add the setting after Run HTab line or at the end
@@ -119,7 +134,7 @@ class BcoMonitor:
                     )
                 else:
                     new_content = content + "\nWrite Detailed= 1\n"
-                plan_file_path.write_text(new_content, encoding='utf-8')
+                _write_ras_text(plan_file_path, new_content, encoding="utf-8")
                 logger.debug(f"Added detailed logging setting to {plan_file_path.name}")
 
             return True
@@ -149,11 +164,14 @@ class BcoMonitor:
             - File is read incrementally to minimize I/O overhead
         """
         self.execution_start_time = time.time()
-        start_time = time.time()
+        deadline = time.monotonic() + float(self.max_wait_seconds)
 
         logger.info(f"Monitoring {self.bco_file.name} for '{self.signal_string}' signal...")
 
-        while time.time() - start_time < self.max_wait_seconds:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             # Check if process died
             if process.poll() is not None:
                 if process.returncode == 0:
@@ -171,6 +189,36 @@ class BcoMonitor:
                     self._read_and_callback_new_content()
                 return False
 
+            if self.blocking_condition is not None:
+                try:
+                    blocked_reason = self.blocking_condition()
+                except Exception as e:
+                    if not self._blocking_probe_error_logged:
+                        logger.warning(f"Blocking-condition probe failed: {e}")
+                        self._blocking_probe_error_logged = True
+                else:
+                    if blocked_reason:
+                        self.blocked_reason = str(blocked_reason)
+                        logger.error(self.blocked_reason)
+                        return False
+
+            if self.alternate_signal_condition is not None:
+                try:
+                    alternate_detected = self.alternate_signal_condition()
+                except Exception as e:
+                    if not self._alternate_probe_error_logged:
+                        logger.warning(f"Alternate signal probe failed: {e}")
+                        self._alternate_probe_error_logged = True
+                else:
+                    if alternate_detected:
+                        description = (
+                            self.alternate_signal_description
+                            or "alternate completion condition"
+                        )
+                        self.signal_source = "alternate"
+                        logger.info(f"Detected {description}")
+                        return True
+
             # Check for .bco file with signal detection
             if self.bco_file.exists():
                 # Verify file was modified after we started execution
@@ -179,10 +227,11 @@ class BcoMonitor:
                     # Read new content and check for signal
                     content = self._read_and_callback_new_content()
                     if content and self.signal_string in content:
+                        self.signal_source = "bco"
                         logger.info(f"Detected '{self.signal_string}' in {self.bco_file.name}")
                         return True
 
-            time.sleep(self.check_interval)
+            time.sleep(min(float(self.check_interval), remaining))
 
         logger.warning(
             f"Monitoring {self.bco_file.name} timed out after "

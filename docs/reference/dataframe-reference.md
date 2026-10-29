@@ -41,6 +41,75 @@ Related live notebooks:
 - [212_landcover_mannings_n_write.ipynb](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/212_landcover_mannings_n_write.ipynb)
 - [611_validating_map_layers.ipynb](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/611_validating_map_layers.ipynb)
 
+## Project asset inventory
+
+`inspect_project_assets()` returns one row per file reference or referenced
+dataset. File and dataset state are separate: an available DSS container, for
+example, does not prove that a pathname exists or covers a plan window.
+
+The ordered schema is:
+
+| Column group | Meaning |
+|--------------|---------|
+| `inventory_schema_version`, `inventory_id`, `inspection_depth` | Snapshot identity and requested scope |
+| `asset_id`, `parent_asset_id`, `asset_kind`, `asset_role` | Stable row identity, containment, and mechanical role |
+| `plan_number`, `unsteady_number`, `required` | Plan/flow scope and whether the dependency is mechanically enabled |
+| `owner_file`, `owner_sha256`, `reference_raw`, `resolved_path` | Exact reference provenance and resolved path |
+| `path_scope`, `portable` | Internal/external/ambiguous path classification |
+| `exists`, `is_file`, `is_dir`, `volume_id`, `file_id`, `size_bytes`, `mtime_ns`, `sha256` | Filesystem and optional streamed-hash evidence |
+| `dataset_name`, `expected_start`, `expected_end`, `available_start`, `available_end` | HDF/DSS/GDAL dataset and coverage evidence |
+| `inspection_state`, `readiness`, `reason_code`, `detail`, `source_api` | Explicit observation state and parser provenance |
+
+`inspection_state` is one of `available`, `missing`, `ambiguous`,
+`not_inspected`, `failed`, or `not_applicable`. `readiness` is independently
+`ready`, `not_ready`, `unknown`, or `not_required`. In particular,
+`not_inspected` is never silently promoted to ready.
+
+Foreign Windows filesystem references on POSIX have null `resolved_path` and file facts
+(including `exists` and `sha256`); they are not reported as missing local files.
+Their `inspection_state` is `ambiguous` and readiness is `unknown`, or
+`not_required` when the row is explicitly optional. Additive reason codes are:
+
+| Reason code | Meaning and scope |
+|-------------|-------------------|
+| `reference_foreign_windows_anchor` | On POSIX, an absolute Windows drive or UNC anchor is `external` with `portable=false`; a drive-relative or backslash root-relative reference is `ambiguous` with `portable=null`. No host drive/share mapping is inferred. |
+
+Structured RASMapper rows and raw XML rows retain foreign lexical references
+with the precise reason above. The shared resolver does not prefix foreign
+anchors with the project folder. Native POSIX absolute paths and relative paths using
+either separator resolve normally. Parent traversal and symlinks are evaluated
+against the real project root. DSS pathnames such as `//BASIN/...` are dataset
+identifiers, so filesystem-anchor classification does not apply to them.
+
+Controlled DSS 6/7 tests found existing-file reads byte-stable, but the normal
+Java handle remained write-capable and several read APIs created a new DSS file
+when the target was missing. Direct source pathname and coverage requests
+therefore remain `not_inspected` with reason `reader_not_source_immutable`; the
+container path is still inventoried normally. A future deeper reader will use a
+verified disposable copy, OS-denied writes, must-exist open, and a short-lived
+worker before returning snapshot-derived coverage.
+
+## Exact boundary-block inventory
+
+`RasUnsteady.inspect_boundary_blocks(staged, unsteady_number="01")` returns one
+row per exact `Boundary Location=` block in an owned `StageProjectResult`. This
+is a mutation-evidence table, not a replacement for the broader
+`ras.boundaries_df` summary. Its key groups are:
+
+| Column group | Meaning |
+|--------------|---------|
+| `inventory_schema_version`, `inventory_id`, `stage_operation_id` | Snapshot and owning stage identity |
+| `owner_relative_path`, `owner_sha256`, `owner_size_bytes`, `owner_mtime_ns`, `volume_id`, `file_id` | Exact staged unsteady-file evidence |
+| `boundary_index`, `occurrence_ordinal`, `boundary_count` | Raw order and duplicate disambiguation |
+| `boundary_location_raw`, `location_kind`, `river`, `reach`, `river_station`, `area_2d`, `bc_line` | Exact and parsed location evidence |
+| `bc_type`, `start_byte`, `end_byte_exclusive`, `block_length_bytes`, `block_sha256` | Detected type and byte-splice evidence |
+| `encoding`, `has_bom`, `newline`, `boundary_id` | File format and exact selector identity |
+| `inspection_state`, `reason_code`, `detail` | Explicit success/failure evidence |
+
+Every column has an exact Arrow dtype in `DATAFRAME_SCHEMAS`. A successful
+mutation invalidates this snapshot; inspect a newly staged copy before a
+subsequent edit.
+
 ## Plan-Number Normalization
 
 ras-commander normalizes RAS file numbers to a two-digit form before path
@@ -74,14 +143,26 @@ parsed from the plan text are strings unless noted:
 | `plan_number` | str | normalized two-digit plan id such as `01` |
 | `geometry_number` | str | normalized geometry id used by the plan |
 | `unsteady_number` | str / None | normalized unsteady-flow id when the plan is unsteady; `None` for steady plans |
+| `quasi_unsteady_number` | str / None | normalized quasi-unsteady id when the plan references `.q##` |
+| `flow_file_prefix` | str / None | exact normalized plan reference prefix: `f`, `u`, or `q` |
 | `Plan Title` | str | HEC-RAS plan title (`Plan Title=`) |
 | `Short Identifier` | str | HEC-RAS short id used by stored-map/result folders |
 | `Geom File` | str | geometry reference number from the plan (`Geom File=`) |
 | `Geom Path` | str | resolved absolute `.g##` path |
-| `Flow File` | str | steady/unsteady flow reference number (`Flow File=`) |
-| `Flow Path` | str | resolved absolute `.f##` / `.u##` path |
+| `Flow File` | str | normalized steady, unsteady, or quasi-unsteady reference number (`Flow File=`) |
+| `Flow Path` | str | resolved absolute `.f##`, `.u##`, or `.q##` path |
+| `Sediment File` | str / None | normalized sediment-file number such as `01`; `None` when no recognized `s##` reference is present |
+| `sediment_number` | str / None | normalized `.s##` identifier; sediment is independent of flow regime |
+| `Sediment Path` | str / None | expected absolute `.s##` path for the selected sediment file; file existence/readiness is reported separately by the asset inventory |
+| `breach_definition_count` | nullable Int64 | number of successfully parsed stored `Breach Loc` definitions; zero means none and null means inspection failed |
+| `breach_active_count` | nullable Int64 | number of stored definitions whose local `RasBreach` `is_active` flag is true; not evidence that a breach initiated during computation |
 | `Computation Interval` | str | computation time step (`Computation Interval=`) |
 | `Mapping Interval` | str | RAS Mapper output interval (`Mapping Interval=`) |
+| `Output Interval` | str | hydrograph output interval (`Output Interval=`) |
+| `Instantaneous Interval` | str | detailed output interval (`Instantaneous Interval=`) |
+| `Write Detailed` | str | detailed-log flag (`Write Detailed=`) |
+| `HDF Compression` / `HDF Chunk Size` / `HDF Spatial Parts` / `HDF Use Max Rows` / `HDF Fixed Rows` | str | HDF5 compression and chunking keys when present in the plan; see [Output Intervals and HDF Compression](../user-guide/plan-output-intervals-hdf-compression.md) |
+| `HDF Write Warmup` / `HDF Write Time Slices` / `HDF Flush` | str | HDF5 write toggles (`-1` on, `0` off) when present |
 | `Simulation Date` | str | simulation date/time window (`Simulation Date=`) |
 | `Run HTab` / `Run UNet` / `Run PostProcess` / `Run Sediment` / `Run WQNet` | str | run-flag toggles parsed from the plan |
 | `UNET D1 Cores` / `UNET D2 Cores` / `PS Cores` | int / None | core counts; cast to `int` when present, else `None` |
@@ -93,12 +174,33 @@ parsed from the plan text are strings unless noted:
 | `description` | str / None | plan `BEGIN DESCRIPTION` block when present |
 | `HDF_Results_Path` | str / None | resolved `.p##.hdf` path; `None` when results do not exist yet |
 | `full_path` | str | resolved absolute `.p##` path |
-| `flow_type` | str | `"Unsteady"`, `"Steady"`, or `"Unknown"` (derived from `unsteady_number`) |
+| `flow_type` | str | Flow computation mode: `"Unsteady"`, `"Steady"`, `"Quasi-Unsteady"`, or `"Unknown"` (derived from the plan's `.u##`, `.f##`, or `.q##` reference). Sediment, dam breach, and topology are separate features. |
+| `geometry_type` | str | hydraulic inventory: `1D`, `2D`, `1D/2D`, or `Unknown` |
+| `plan_type` | str | finite execution class: `steady_1d`, `unsteady_1d`, `unsteady_2d`, `unsteady_1d_2d`, `quasi_unsteady_1d`, or `unknown` |
+| `plan_classification_valid` | nullable bool | whether the plan maps to a supported execution class |
+| `plan_classification_reason` | str / None | why classification failed closed |
+| `geometry_metadata_source` | str | `hdf`, `text`, or `unavailable` provenance inherited from `geom_df` |
+| `geometry_metadata_valid` | nullable bool | whether geometry metadata was successfully inspected |
+| `geometry_metadata_error` | str / None | failed-source details, including HDF-to-text fallback |
 
 !!! note
-    Columns derive directly from `_parse_plan_file()` in `ras_commander/RasPrj.py`,
-    so any plan key present in the file appears as a same-named column. Not every plan
-    contains every key; missing keys are simply absent or `None`.
+    Most source columns derive directly from `_parse_plan_file()` in
+    `ras_commander/RasPrj.py`, so a plan key appears under its source name.
+    `Sediment File` is normalized for consistency with `Geom File` and `Flow
+    File`; the two breach counts are derived through the existing `RasBreach`
+    reader. Not every plan contains every source key.
+
+The execution taxonomy is deliberately finite. HEC-RAS has no steady 2D
+solver, so a steady plan that references `2D` or `1D/2D` geometry is
+`plan_type="unknown"` with `plan_classification_valid=False`; no
+`steady_2d` or `steady_1d_2d` value is emitted. Quasi-unsteady is anticipated
+as `quasi_unsteady_1d`; quasi plans with a mesh also fail closed.
+
+Sediment is orthogonal to flow classification. Both `.u##` and `.q##` plans
+can reference `.s##`. Storage-area-only geometries with no cross sections or
+2D areas currently classify as `unknown`. Pipe-network presence is also
+orthogonal: an unsteady pipe-plus-mesh plan remains `unsteady_2d` based on its
+hydraulic geometry inventory.
 
 Common patterns:
 
@@ -108,6 +210,12 @@ plans_with_results = ras.plan_df[ras.plan_df["HDF_Results_Path"].notna()]
 
 # Plans using a specific geometry
 g04_plans = ras.plan_df[ras.plan_df["geometry_number"] == "04"]
+
+# Plans with successfully parsed active stored breach definitions
+active_breach_plans = ras.plan_df[ras.plan_df["breach_active_count"].fillna(0) > 0]
+
+# Plans linked to a sediment file (independent of the Run Sediment flag)
+sediment_plans = ras.plan_df[ras.plan_df["Sediment File"].notna()]
 
 # Quick lookup through RasPrj helpers
 info = ras.get_plan_info("01")
@@ -130,7 +238,11 @@ HDF-based extraction when `.g##.hdf` exists and falls back to plain-text parsing
 | `geom_title` | str / None | parsed `Geom Title=` value when present |
 | `description` | str / None | geometry `BEGIN DESCRIPTION` block when present |
 | `has_1d_xs` | bool | `True` if the geometry has 1D cross sections |
-| `has_2d_mesh` | bool | `True` if the geometry has 2D mesh / flow areas |
+| `has_2d_mesh` | nullable bool | `True` if HDF metadata identifies a mesh or text pairs `Storage Area=<name>` with `Storage Area Is2D=-1`; null when no source can be inspected |
+| `geometry_type` | str | `1D`, `2D`, `1D/2D`, or `Unknown` |
+| `geometry_metadata_source` | str | successful source: `hdf`, `text`, or `unavailable` |
+| `geometry_metadata_valid` | nullable bool | whether a geometry source was successfully inspected |
+| `geometry_metadata_error` | str / None | failed source reads encountered before success, or terminal failure |
 | `num_cross_sections` | int | count of 1D cross sections |
 | `num_inline_structures` | int | total inline structures (bridges + culverts + weirs) |
 | `num_bridges` | int | count of bridge structures |
@@ -139,12 +251,27 @@ HDF-based extraction when `.g##.hdf` exists and falls back to plain-text parsing
 | `num_gates` | int | count of gate structures |
 | `num_lateral_structures` | int | count of lateral structures |
 | `num_sa_2d_connections` | int | count of SA/2D connections |
-| `mesh_cell_count` | int | total 2D mesh cells across all areas |
+| `mesh_cell_count` | nullable Int64 | total HDF mesh cells; null for text-only geometry |
 | `mesh_area_names` | list[str] | names of 2D flow areas |
 
-When metadata extraction fails for a geometry, counts default to `0`, booleans to
-`False`, and `mesh_area_names` to an empty list. Use this table for geometry
-discovery first, then move to `RasGeometry`, `Geom*`, or HDF readers for detail.
+When HDF inspection fails, `GeomMetadata` retries the plain geometry and keeps
+the HDF error in `geometry_metadata_error`. When neither source is readable,
+the classification booleans remain null and the geometry fails closed as
+`Unknown`; an unreadable geometry never masquerades as a valid empty 1D model.
+Text geometry can prove that a 2D area exists, but it cannot provide a mesh-cell
+count until preprocessing materializes the HDF.
+
+`RasPlan.set_geom()`, `set_steady()`, and `set_unsteady()` rewrite exactly one
+top-level plan reference, preserve description text and newline style, verify
+the write, and then refresh geometry, flow, and plan classification dataframes
+in dependency order.
+
+Classification tests pin the public RAS example archive by release, byte size,
+and SHA-256. Derived copies remove or corrupt HDFs without changing the
+immutable source. The private CLB qualification tier additionally covers real
+6.31 text-only 2D, 6.70 pipe-plus-2D, and 7.00 1D HDF schemas. These gates
+qualify metadata classification only; they do not claim solver execution or
+numerical-result parity.
 
 ## `flow_df` and `unsteady_df`
 
@@ -220,11 +347,34 @@ dss_boundaries = ras.boundaries_df[ras.boundaries_df["Use DSS"] == "True"]
 flow_bcs = ras.boundaries_df[ras.boundaries_df["bc_type"] == "Flow Hydrograph"]
 ```
 
+## DSS boundary inventory
+
+`RasUnsteady.get_dss_boundaries(unsteady_file)` returns the DSS-linked subset
+from one unsteady-flow file with exact block identity and parsed pathname parts.
+Its canonical 2D identity columns match `boundaries_df`:
+
+| Column | Dtype | Meaning |
+|--------|-------|---------|
+| `area_2d` | str | 2D flow-area name when present |
+| `bc_line_name` | str | named 2D boundary-condition line when present |
+| `sa_2d_name` | str | deprecated compatibility alias for `area_2d` |
+| `bc_line` | str | deprecated compatibility alias for `bc_line_name` |
+
+The aliases remain equal to their canonical columns during the compatibility
+window. Machine-readable deprecation mappings are available from
+`inventory.attrs["deprecated_columns"]`.
+
+Boundary mutation methods retain their existing compatibility keywords during
+this window. Pass canonical inventory values explicitly, for example
+`sa_2d_name=row["area_2d"]` and `bc_line=row["bc_line_name"]` when calling
+`RasUnsteady.set_boundary_dss_link()`.
+
 ## `rasmap_df`
 
-`rasmap_df` is a **single-row compact summary** of the project `.rasmap`.
-Several columns contain lists because the dataframe is optimized for project
-overview, not one-row-per-layer discovery.
+`rasmap_df` is a **single-row compact summary** of the project `.rasmap`. It has
+one row for every outcome, including a missing or unreadable file. Several
+columns contain lists because the dataframe is optimized for project overview,
+not one-row-per-layer discovery.
 
 Current default columns (each cell is one element because the DataFrame is a
 single row; "Dtype" describes the value inside that cell):
@@ -242,12 +392,31 @@ single row; "Dtype" describes the value inside that cell):
 | `basemap_layer_names` | list[str] | basemap layer names |
 | `basemap_layer_path` | list[str] | basemap layer paths |
 | `current_settings` | dict | compact `.rasmap` settings summary |
+| `rasmap_path` | str / None | requested or expected `.rasmap` path, including when absent |
+| `rasmap_status` | str | `absent`, `parsed`, `parsed_with_errors`, or `failed` |
+| `rasmap_error` | str / None | document-level read, parse, or initialization error |
+| `rasmap_field_errors` | dict | extraction errors keyed by affected data column |
 
 ```python
 summary = ras.rasmap_df.iloc[0]
-print(summary["terrain_hdf_path"])
-print(summary["landcover_hdf_path"])
+
+if summary["rasmap_status"] == "failed":
+    raise RuntimeError(summary["rasmap_error"])
+if summary["rasmap_status"] == "absent":
+    print(f"No RASMapper file at {summary['rasmap_path']}")
+else:
+    if summary["rasmap_field_errors"]:
+        print("Incomplete RASMapper fields:", summary["rasmap_field_errors"])
+    print(summary["terrain_hdf_path"])
+    print(summary["landcover_hdf_path"])
 ```
+
+Do not use `len(rasmap_df)`, `rasmap_df.empty`, or `rasmap_df is not None` as a
+parse-success check. Those values are deliberately constant so callers can
+safely use `.iloc[0]`; inspect `rasmap_status` instead. Missing optional
+sections and an empty projection filename are valid parsed states. Missing
+files referenced by otherwise valid XML are asset-validation findings, not
+parser failures.
 
 Use `rasmap_df` for quick project-level path inspection. When you need
 discoverable layer names and per-layer metadata, prefer:
@@ -277,7 +446,7 @@ health, and runtime columns are always present, `None`/`0` when unavailable):
 |--------|-------|---------|
 | `plan_number` | str | copied plan id |
 | `plan_title` | str / None | copied plan title |
-| `flow_type` | str / None | `Steady` / `Unsteady` classification |
+| `flow_type` | str / None | `Steady`, `Unsteady`, `Quasi-Unsteady`, or `Unknown` flow computation mode |
 | `hdf_path` | str | path to the `.p##.hdf` result file |
 | `hdf_exists` | bool | whether the HDF result file exists |
 | `hdf_file_modified` | datetime / None | HDF modification timestamp |
@@ -327,18 +496,26 @@ not. Prefer the dedicated HDF readers and xarray-backed APIs for:
 ### Profile-Line Flow Outputs
 
 `HdfResultsMesh.get_profile_line_flow_timeseries()` returns a profile/reference
-line flow time series. The API uses native HDF reference-line internal faces
-when present, then falls back to RAS Mapper profile-line geometry.
+line flow time series using native RASMapper methods. Depending on
+`selection_source`, it returns a native-associated precomputed hydrograph or
+aggregates selected face flows. The hydrograph branch's observed-versus-computed
+provenance has not been independently qualified; read solver-recorded reference
+matrices with `HdfResultsXsec.get_ref_lines_timeseries()` when those are required.
+See [the extraction-route contracts](../api/results-queries.md).
 
 | Column | Meaning |
 |--------|---------|
 | `time` | Output timestamp |
-| `flow` | Sum of selected face flows |
+| `flow` | Native-associated hydrograph value or aggregated face flows; interpretation depends on source and direction |
 | `line_name` | Requested profile/reference line |
-| `mesh_name` | 2D flow area used for extraction |
-| `direction` | `absolute` or `signed` aggregation mode |
-| `face_count` | Count of selected mesh faces |
-| `selection_source` | `reference_line_internal_faces` or `profile_lines_geometry` |
+| `mesh_name` | Selected 2D area; the precomputed-hydrograph branch echoes the supplied name or an empty string |
+| `direction` | `absolute` or `signed`; hydrograph magnitude differs from summed absolute face flows |
+| `face_count` | Selected face count; zero is a sentinel for the precomputed-hydrograph branch |
+| `selection_source` | Canonical: `try_read_ref_line_flow`, `reference_line_internal_faces`, or `rasmapper_perimeter_faces`; `_legacy` may report `profile_lines_geometry` |
+
+Retain the returned `attrs` (units, variable, face IDs) separately when exporting
+CSV. Signed face aggregation uses native face signs without common line-normal
+correction; it is not automatically net discharge across a drawn section.
 
 `HdfResultsMesh.get_profile_line_peak_flow()` returns one peak-Q row derived
 from the time series.
@@ -351,7 +528,7 @@ from the time series.
 | `peak_flow` | Peak flow value; signed mode preserves native sign |
 | `direction` | `absolute` or `signed` aggregation mode |
 | `face_count` | Count of selected mesh faces |
-| `selection_source` | `reference_line_internal_faces` or `profile_lines_geometry` |
+| `selection_source` | Same canonical route values as the underlying time-series method |
 
 See:
 

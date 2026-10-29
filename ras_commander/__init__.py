@@ -6,7 +6,10 @@ Docs: https://rascommander.info/ras
 GitHub: https://github.com/gpt-cmdr/ras-commander
 """
 
+from ._optional_deps import import_feature_module
 from importlib.metadata import version, PackageNotFoundError
+import sys
+from types import ModuleType
 from .LoggingConfig import setup_logging, get_logger
 from .Decorators import log_call, standardize_input
 
@@ -14,7 +17,7 @@ try:
     __version__ = version("ras-commander")
 except PackageNotFoundError:
     # package is not installed
-    __version__ = "0.99.1"
+    __version__ = "0.110.1"
 
 # Canonical machine-readable agent index (see docs() helper below)
 __llms_txt__ = "https://rascommander.info/ras/llms.txt"
@@ -73,85 +76,19 @@ def agent_guide_path():
     from importlib.resources import files
     return files("ras_commander").joinpath("LLM_GUIDE.md")
 
-# Core functionality
+# Lean compute/inventory surface. These imports use only the base and
+# ``compute`` dependency groups; the remainder of the historical top-level API
+# is resolved lazily below.
 from .RasPrj import RasPrj, init_ras_project, get_ras_exe, ras, create_project_from_template
 from .RasPlan import RasPlan
 from .RasGeo import RasGeo  # DEPRECATED - use geom subpackage
-from .RasGeometry import RasGeometry  # DEPRECATED - use geom subpackage
-from .RasGeometryUtils import RasGeometryUtils  # DEPRECATED - use geom subpackage
-from .RasUnsteady import RasUnsteady
-from .RasSteady import RasSteady
 from .RasUtils import RasUtils
-from .RasExamples import RasExamples
-from .sources.federal import RasEbfeModels
-from .sources.county import M3Model
 from .RasCmdr import RasCmdr
-from .RasScenario import (
-    RasBoundaryLink,
-    RasRunArtifact,
-    RasScenario,
-    RasScenarioWorkspace,
-)
-from .RasScenarioWorker import RasScenarioWorker, RasScenarioWorkerError
-from .RasCurrency import RasCurrency
-from .RasControl import RasControl
-from .RasTcu import RasTcu, TcuStatus
 from .ComputeResults import (
     ComputeResult,
     ComputeParallelResult,
-    RasControlResult,
-    PreprocessResult,
-    GeometryPreprocessResult,
-    GeometryLayerResult,
-    GeometryCompleteResult,
 )
-from .RasPreprocess import RasPreprocess
 from .RasMap import RasMap
-from .RasDialogWatchdog import DialogWatchdog, DismissedDialog
-from .RasEncroachments import RasEncroachments
-from .RasMapValidation import RasMapValidation
-from .RasBenefits import (
-    BenefitAreaConfig,
-    BenefitAreaResult,
-    BenefitCategory,
-    RasBenefits,
-)
-from .RasProcess import RasProcess, ProjectionInfo
-from .RasterPerformance import (
-    GeoTiffWriteOptions,
-    RasterOperationProfileResult,
-    StoreMapPerformanceOptions,
-    StoreMapProfileResult,
-    StoreMapResourceEstimate,
-    StoreMapResourceSample,
-    TerrainResourceEstimate,
-)
-from .RasGeometryCompute import RasGeometryCompute
-from .RasGuiAutomation import RasGuiAutomation
-from .RasScreenshot import RasScreenshot
-from .RasBreach import RasBreach
-from .RasFloodway import RasFloodway
-from .RasHydroCompare import RasHydroCompare
-from .RasModPuls import RasModPuls
-from .RasPermutation import RasPermutation, RangeSpec
-from .RasMonteCarlo import RasMonteCarlo
-from .RasCalibrate import (
-    CalibrationPoint,
-    RasCalibrate,
-    compute_objective,
-    extract_modeled,
-    extract_steady_profile_modeled,
-    extract_steady_profile_observations,
-    make_composite_apply_fn,
-    make_infiltration_apply_fn,
-    make_mannings_apply_fn,
-    make_steady_profile_calibration_points,
-    make_xsec_mannings_apply_fn,
-)
-from .RasFlowOptimization import RasFlowOptimization
-
-# Validation framework - core validation infrastructure
-from .RasValidation import ValidationSeverity, ValidationResult, ValidationReport
 
 # Real-time execution monitoring callbacks
 from .ExecutionCallback import ExecutionCallback
@@ -163,37 +100,258 @@ from .callbacks import (
 )
 from .RasBco import BcoMonitor
 
-# Geometry handling - imported from geom subpackage
-from .geom import (
-    GeomParser, GeomPreprocessor, GeomLandCover, ManningsFromLandCover,
-    GeomCrossSection, CrossSectionBankStations, CrossSectionBuildInput,
-    CrossSectionBuildResult, CrossSectionManningsN, CrossSectionReachLengths,
-    GeomStorage, GeomProjection, GeomLateral,
-    GeomInlineWeir, GeomBridge, GeomCulvert, GeomCulvertGIS,
-    GeomReferenceFeatures, GeomBcLines, GeomMesh,
-    GeomPipeNetwork,
-    MeshResult, BCConflict, BCFixResult,
-)
+_LAZY_EXPORTS = {
+    "RasBoundaryLink": (".RasScenario", "RasBoundaryLink"),
+    "RasRunArtifact": (".RasScenario", "RasRunArtifact"),
+    "RasScenario": (".RasScenario", "RasScenario"),
+    "RasScenarioWorkspace": (".RasScenario", "RasScenarioWorkspace"),
+    "RasScenarioWorker": (".RasScenarioWorker", "RasScenarioWorker"),
+    "RasScenarioWorkerError": (".RasScenarioWorker", "RasScenarioWorkerError"),
 
-# HDF handling - imported from hdf subpackage
-from .hdf import (
-    HdfBase, HdfUtils, HdfPlan,
-    HdfMesh, HdfXsec, HdfBndry, HdfStruc, HdfStorageArea, HdfHydraulicTables,
-    HdfResultsPlan, HdfResultsMesh, HdfResultsQuery, HdfResultsXsec, HdfResultsBreach,
-    HdfResultsSediment, HdfResultsProducts,
-    HdfPipe, HdfPump, HdfInfiltration, HdfLandCover,
-    HdfPlot, HdfResultsPlot,
-    HdfFluvialPluvial, HdfBenefitAreas, HdfChannelCapacity, HdfResultsAnalysis,
-    HdfProject,
-)
+    "RasText": (".RasText", "RasText"),
+    'RasDocker': ('.RasDocker', 'RasDocker'),
+    'RasSlurm': ('.RasSlurm', 'RasSlurm'),
+    'SlurmSiteConfig': ('.RasSlurm', 'SlurmSiteConfig'),
+    'SlurmTransportConfig': ('.RasSlurm', 'SlurmTransportConfig'),
+    'SlurmSubmission': ('.RasSlurm', 'SlurmSubmission'),
+    'SlurmStatus': ('.RasSlurm', 'SlurmStatus'),
+    'SlurmTaskAccounting': ('.RasSlurm', 'SlurmTaskAccounting'),
+    'SlurmCollection': ('.RasSlurm', 'SlurmCollection'),
+    'RasApptainer': ('.RasApptainer', 'RasApptainer'),
+    'ApptainerSiteProfile': ('.RasApptainer', 'ApptainerSiteProfile'),
+    'ApptainerJob': ('.RasApptainer', 'ApptainerJob'),
+    'ApptainerStatus': ('.RasApptainer', 'ApptainerStatus'),
+    'ApptainerCollection': ('.RasApptainer', 'ApptainerCollection'),
+    'ApptainerPrepareCollection': ('.RasApptainer', 'ApptainerPrepareCollection'),
+    'RasContainerImages': ('.RasContainerImages', 'RasContainerImages'),
+    'ApptainerTransport': ('.RasApptainer', 'ApptainerTransport'),
+    'SshApptainerTransport': ('.RasApptainer', 'SshApptainerTransport'),
+    'ApptainerProfileError': ('.RasApptainer', 'ApptainerProfileError'),
+    'InputCheckError': ('.RasApptainer', 'InputCheckError'),
+    'ContainerResult': ('.RasDocker', 'ContainerResult'),
+    'ContainerEvent': ('.RasDocker', 'ContainerEvent'),
+    'ContainerBatchResult': ('.RasDocker', 'ContainerBatchResult'),
+    # Core feature modules outside the lean compute surface.
+    'RasGeometry': ('.RasGeometry', 'RasGeometry'),
+    'RasGeometryUtils': ('.RasGeometryUtils', 'RasGeometryUtils'),
+    'RasUnsteady': ('.RasUnsteady', 'RasUnsteady'),
+    'RasRestart': ('.RasRestart', 'RasRestart'),
+    'RasSteady': ('.RasSteady', 'RasSteady'),
+    'RasExamples': ('.RasExamples', 'RasExamples'),
+    'RasEbfeModels': ('.sources.federal', 'RasEbfeModels'),
+    'AlabamaBleModels': ('.sources.state', 'AlabamaBleModels'),
+    'M3Model': ('.sources.county', 'M3Model'),
+    'RasCurrency': ('.RasCurrency', 'RasCurrency'),
+    'RasControl': ('.RasControl', 'RasControl'),
+    'RasTcu': ('.RasTcu', 'RasTcu'),
+    'TcuStatus': ('.RasTcu', 'TcuStatus'),
+    'RasPreprocess': ('.RasPreprocess', 'RasPreprocess'),
+    **{
+        name: ('.ExecutionEvidence', name)
+        for name in (
+            'EVIDENCE_CHANNELS', 'EVIDENCE_STATES',
+            'EXECUTION_OBSERVATION_NAMES', 'EvidenceChannel',
+            'EvidenceObservation', 'EvidenceState', 'ExecutionEvidence',
+            'ObservationName',
+        )
+    },
+    **{
+        name: ('.ExecutionArtifacts', name)
+        for name in (
+            'PlanExecutionCleanup', 'PlanExecutionCleanupError',
+            'ResultArtifactAmbiguityError',
+        )
+    },
+    'DialogWatchdog': ('.RasDialogWatchdog', 'DialogWatchdog'),
+    'DismissedDialog': ('.RasDialogWatchdog', 'DismissedDialog'),
+    'RasEncroachments': ('.RasEncroachments', 'RasEncroachments'),
+    'RasMapValidation': ('.RasMapValidation', 'RasMapValidation'),
+    'RasGeometryCompute': ('.RasGeometryCompute', 'RasGeometryCompute'),
+    'RasPrecipHdf': ('.RasPrecipHdf', 'RasPrecipHdf'),
+    'PrecipCapabilities': ('.precip', 'PrecipCapabilities'),
+    'GriddedPrecipitationCapabilities': (
+        '.precip', 'GriddedPrecipitationCapabilities'
+    ),
+    **{
+        name: ('.precip', name)
+        for name in (
+            'GriddedPrecipitationImportResult', 'PrecipitationCube',
+            'PrecipitationNetcdfResult', 'RasPrecipGrid',
+            'PrecipitationSource', 'QualificationRoute',
+            'QualificationStatus', 'TimingStatus',
+        )
+    },
+    'RasGuiAutomation': ('.RasGuiAutomation', 'RasGuiAutomation'),
+    'RasScreenshot': ('.RasScreenshot', 'RasScreenshot'),
+    'RasBreach': ('.RasBreach', 'RasBreach'),
+    'RasFloodway': ('.RasFloodway', 'RasFloodway'),
+    'RasHydroCompare': ('.RasHydroCompare', 'RasHydroCompare'),
+    **{
+        name: ('.RasNetworkConflation', name)
+        for name in (
+            'RasNetworkConflation', 'NetworkConflationResult',
+            'NetworkEdgeCoverageResult', 'NetworkEdgeCoveragePlanResult',
+            'ConflationStatus', 'NetworkAdapter', 'NHDPlusAdapter',
+            'NWMHydrofabricAdapter', 'NextGenFlowpathAdapter',
+        )
+    },
+    'RasModPuls': ('.RasModPuls', 'RasModPuls'),
+    'RasMonteCarlo': ('.RasMonteCarlo', 'RasMonteCarlo'),
+    'RasFlowOptimization': ('.RasFlowOptimization', 'RasFlowOptimization'),
+    **{
+        name: ('.RasBreakout1D', name)
+        for name in (
+            'RasBreakout1D', 'Breakout1DAssemblyResult',
+            'Breakout1DDomainSelection', 'Breakout1DResult',
+            'Breakout1DSelection', 'Breakout1DSourceCatalog',
+            'Breakout1DPlan',
+            'Breakout1DValidationReport',
+        )
+    },
+    **{
+        name: ('.RasBreakout2D', name)
+        for name in (
+            'RasBreakout2D', 'Breakout2DSpec', 'Breakout2DPreflight',
+            'Breakout2DCloneResult', 'Breakout2DPreparationResult',
+            'Breakout2DFluxReview',
+        )
+    },
+    **{
+        name: ('.subdomain', name)
+        for name in (
+            'RasSubdomain', 'SplitLineCriteria', 'SplitLineSearch',
+            'SubdomainPartition',
+        )
+    },
+    'RasProcess': ('.RasProcess', 'RasProcess'),
+    'RasQualification': ('.RasQualification', 'RasQualification'),
+    'ProjectionInfo': ('.RasProcess', 'ProjectionInfo'),
+    'StoredMapProductsIncompleteError': (
+        '.RasProcess', 'StoredMapProductsIncompleteError'
+    ),
+    'RasPermutation': ('.RasPermutation', 'RasPermutation'),
+    'RangeSpec': ('.RasPermutation', 'RangeSpec'),
+    # Project staging and mutation results.
+    **{
+        name: ('.RasProject', name)
+        for name in (
+            'ProjectCopyVerificationError', 'ProjectDriftError',
+            'ProjectLockedError', 'ProjectPathAmbiguityError',
+            'ProjectPopulationError', 'ProjectPublicationError',
+            'ProjectStageError', 'StageProjectResult',
+            'STAGE_PROJECT_TREE_FINGERPRINT_ALGORITHM',
+            'inspect_project_assets', 'stage_project', 'stage_project_for_boundary_edit',
+        )
+    },
+    **{
+        name: ('.RasBoundary', name)
+        for name in (
+            'BoundaryFormatError', 'BoundaryMutationError',
+            'BoundaryMutationResult', 'BoundaryPostPublicationError',
+            'BoundaryPublicationError', 'BoundarySelectorError',
+            'BoundaryStageOwnershipError', 'BoundaryStaleEvidenceError',
+        )
+    },
+    **{
+        name: ('.ComputeResults', name)
+        for name in (
+            'RasControlResult', 'PreprocessResult',
+            'GeometryPreprocessResult', 'GeometryLayerResult',
+            'GeometryCompleteResult', 'PrecipRasterImportResult', 'RasProcessRecord',
+            'RasProcessQueryError', 'RasProcessInventory',
+            'PlanProcessInventory', 'PlanCancellationResult',
+            'FlowPathPolicyResult', 'TerrainExportResult',
+        )
+    },
+    **{
+        name: ('.fim', name)
+        for name in (
+            'RasFim', 'FimAoi', 'FimPreparedProfile', 'FimPreparedSlopingModel', 'FimError',
+            'FimEngineNotFoundError', 'FimEngineError', 'FimUnsupportedError',
+            'FimAoiError', 'FimMappingError',
+        )
+    },
+    **{
+        name: ('.RasBenefits', name)
+        for name in (
+            'BenefitAreaResult',
+            'BenefitCategory', 'RasBenefits',
+        )
+    },
+    **{
+        name: ('.RasCrossSections', name)
+        for name in ('RasCrossSections', 'VerticalTransform')
+    },
+    'BenefitAreaConfig': ('._execution_types', 'BenefitAreaConfig'),
+    **{
+        name: ('.RasterPerformance', name)
+        for name in (
+            'GeoTiffWriteOptions', 'RasterOperationProfileResult',
+            'StoreMapProfileResult',
+            'StoreMapResourceEstimate', 'StoreMapResourceSample',
+            'TerrainResourceEstimate',
+        )
+    },
+    'StoreMapPerformanceOptions': (
+        '._execution_types', 'StoreMapPerformanceOptions'
+    ),
+    **{
+        name: ('.RasCalibrate', name)
+        for name in (
+            'CalibrationPoint', 'RasCalibrate', 'compute_objective',
+            'extract_modeled', 'extract_steady_profile_modeled',
+            'extract_steady_profile_observations', 'make_composite_apply_fn',
+            'make_infiltration_apply_fn', 'make_mannings_apply_fn',
+            'make_steady_profile_calibration_points',
+            'make_xsec_mannings_apply_fn',
+        )
+    },
+    **{
+        name: ('.RasValidation', name)
+        for name in ('ValidationSeverity', 'ValidationResult', 'ValidationReport')
+    },
+    # Geometry and HDF packages retain their existing public class names while
+    # deferring optional geospatial, plotting, and scientific dependencies.
+    **{
+        name: ('.geom', name)
+        for name in (
+            'GeomParser', 'GeomPreprocessor', 'GeomLandCover',
+            'ManningsFromLandCover', 'GeomCrossSection',
+            'CrossSectionBankStations', 'CrossSectionBuildInput',
+            'CrossSectionBuildResult', 'CrossSectionManningsN',
+            'CrossSectionReachLengths', 'GeomStorage', 'GeomProjection',
+            'GeomLateral', 'GeomInlineWeir', 'GeomBridge', 'GeomCulvert',
+            'GeomCulvertGIS', 'GeomReferenceFeatures', 'GeomBcLines',
+            'GeomMesh', 'GeomMeshRepair', 'GeomPipeNetwork', 'MeshResult', 'BCConflict',
+            'BCFixResult', 'DomainContainmentResult',
+            'DomainContainmentViolation', 'GridAnchor',
+        )
+    },
+    **{
+        name: ('.hdf', name)
+        for name in (
+            'HdfBase', 'HdfCompletion', 'HdfUtils', 'HdfPlan', 'HdfMesh', 'MeshCellPolygonError', 'HdfXsec',
+            'HdfBndry', 'HdfStruc', 'HdfStorageArea',
+            'HdfHydraulicTables', 'HdfResultsPlan', 'HdfResultsMesh',
+            'MeshSeriesAvailabilityError', 'HdfResultView', 'HdfResultsQuery', 'HdfResultsXsec',
+            'HdfResultsBreach',
+            'HdfResultsSediment', 'HdfResultsProducts', 'HdfPipe',
+            'HdfPump', 'HdfInfiltration', 'HdfLandCover', 'HdfPlot',
+            'HdfResultsPlot', 'HdfFluvialPluvial', 'HdfBenefitAreas',
+            'HdfChannelCapacity', 'HdfResultsAnalysis', 'HdfProject',
+        )
+    },
+}
 
 # Remote execution - lazy loaded to avoid importing until needed
 # This reduces import time and allows optional dependencies to be truly optional
 _REMOTE_EXPORTS = {
-    'RasWorker', 'PsexecWorker', 'LocalWorker', 'SshWorker', 'WinrmWorker',
-    'DockerWorker', 'SlurmWorker', 'AwsEc2Worker', 'AzureFrWorker',
+    'RasWorker', 'PsexecWorker', 'LocalWorker', 'DockerWorker',
     'init_ras_worker', 'load_workers_from_json', 'compute_parallel_remote',
-    'ExecutionResult', 'get_worker_status'
+    'ExecutionResult', 'get_worker_status', 'validate_steady_results', 'validate_unsteady_results',
+    'PreprocessPolicy', 'RasExecutionRequest', 'RasExecutionReceipt',
+    'StoredMapsRequest', 'validate_execution_receipt',
+    'RasPortableDocker', 'PortableDockerExecutionResult', 'PortableDockerPoolResult',
 }
 
 # DSS operations - lazy loaded to avoid importing pyjnius/Java until needed
@@ -213,7 +371,9 @@ _FIXIT_EXPORTS = {
 }
 
 # Terrain module - HEC-RAS terrain creation and manipulation
-_TERRAIN_EXPORTS = {'RasTerrain', 'RasTerrainModification', 'RasTerrainModWriter'}
+_TERRAIN_EXPORTS = {
+    'RasTerrain', 'RasTerrainModification', 'RasTerrainModWriter',
+}
 
 # Results module - Compute message parsing and execution summary
 _RESULTS_EXPORTS = {'ResultsParser', 'ResultsSummary'}
@@ -227,46 +387,137 @@ _GUI_EXPORTS = {
     'OpenRasMapperWorkflow', 'MeshRegenerationWorkflow',
 }
 
+def _load_export(name):
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module 'ras_commander' has no attribute '{name}'")
+    module_name, attribute_name = target
+    module = import_feature_module(
+        module_name, __name__, f"ras_commander.{name}"
+    )
+    value = getattr(module, attribute_name)
+    globals()[name] = value
+    return value
+
+
 def __getattr__(name):
-    """Lazy load remote execution, DSS, check, fixit, terrain, results, and gui components on first access."""
+    """Resolve optional public features on first access and cache the result."""
+    if name in _LAZY_EXPORTS:
+        return _load_export(name)
     if name in _REMOTE_EXPORTS:
-        from . import remote
-        return getattr(remote, name)
+        remote = import_feature_module(".remote", __name__, f"ras_commander.{name}")
+        value = getattr(remote, name)
+        globals()[name] = value
+        return value
     if name in _DSS_EXPORTS:
-        from . import dss
-        return getattr(dss, name)
+        dss = import_feature_module(".dss", __name__, f"ras_commander.{name}")
+        value = getattr(dss, name)
+        globals()[name] = value
+        return value
     if name in _CHECK_EXPORTS:
-        from . import check
-        return getattr(check, name)
+        check = import_feature_module(".check", __name__, f"ras_commander.{name}")
+        value = getattr(check, name)
+        globals()[name] = value
+        return value
     if name in _FIXIT_EXPORTS:
-        from . import fixit
-        return getattr(fixit, name)
+        fixit = import_feature_module(".fixit", __name__, f"ras_commander.{name}")
+        value = getattr(fixit, name)
+        globals()[name] = value
+        return value
     if name in _TERRAIN_EXPORTS:
-        from . import terrain
-        return getattr(terrain, name)
+        terrain = import_feature_module(".terrain", __name__, f"ras_commander.{name}")
+        value = getattr(terrain, name)
+        globals()[name] = value
+        return value
     if name in _RESULTS_EXPORTS:
-        from . import results
-        return getattr(results, name)
+        results = import_feature_module(".results", __name__, f"ras_commander.{name}")
+        value = getattr(results, name)
+        globals()[name] = value
+        return value
     if name in _GUI_EXPORTS:
-        from . import gui
-        return getattr(gui, name)
+        gui = import_feature_module(".gui", __name__, f"ras_commander.{name}")
+        value = getattr(gui, name)
+        globals()[name] = value
+        return value
     raise AttributeError(f"module 'ras_commander' has no attribute '{name}'")
+
+
+class _LazyRasCommanderModule(ModuleType):
+    """Preserve class exports when same-named submodules are imported first."""
+
+    def __getattribute__(self, name):
+        namespace = ModuleType.__getattribute__(self, "__dict__")
+        exports = namespace.get("_LAZY_EXPORTS", {})
+        current = namespace.get(name)
+        if name in exports and (current is None or isinstance(current, ModuleType)):
+            return namespace["_load_export"](name)
+        return ModuleType.__getattribute__(self, name)
+
+
+sys.modules[__name__].__class__ = _LazyRasCommanderModule
 
 
 # Define __all__ to specify what should be imported when using "from ras_commander import *"
 __all__ = [
+    "RasBoundaryLink",
+    "RasRunArtifact",
+    "RasScenario",
+    "RasScenarioWorkspace",
+    "RasScenarioWorker",
+    "RasScenarioWorkerError",
+
+    'RasDocker', 'ContainerResult', 'ContainerEvent', 'ContainerBatchResult',
     # Core functionality
     'RasPrj', 'init_ras_project', 'get_ras_exe', 'ras', 'create_project_from_template',
-    'RasPlan', 'RasUnsteady', 'RasSteady', 'RasUtils',
+    'RasText', 'RasPlan', 'RasUnsteady', 'RasRestart', 'RasSteady', 'RasUtils', 'RasHydroCompare',
+    'ProjectStageError', 'ProjectPopulationError', 'ProjectPathAmbiguityError',
+    'ProjectLockedError', 'ProjectDriftError', 'ProjectCopyVerificationError',
+    'ProjectPublicationError',
+    'StageProjectResult', 'STAGE_PROJECT_TREE_FINGERPRINT_ALGORITHM',
+    'inspect_project_assets', 'stage_project', 'stage_project_for_boundary_edit',
+    'RasQualification',
+    'BoundaryMutationResult', 'BoundaryMutationError',
+    'BoundaryStageOwnershipError', 'BoundarySelectorError',
+    'BoundaryStaleEvidenceError', 'BoundaryFormatError',
+    'BoundaryPublicationError', 'BoundaryPostPublicationError',
     'ComputeResult', 'ComputeParallelResult', 'RasControlResult',
+    'RasProcessRecord', 'RasProcessQueryError', 'RasProcessInventory',
+    'PlanProcessInventory', 'PlanCancellationResult',
+    'EvidenceState', 'EvidenceChannel', 'ObservationName',
+    'EVIDENCE_STATES', 'EVIDENCE_CHANNELS', 'EXECUTION_OBSERVATION_NAMES',
+    'EvidenceObservation', 'ExecutionEvidence',
+    'PlanExecutionCleanup', 'PlanExecutionCleanupError',
+    'ResultArtifactAmbiguityError',
     'PreprocessResult', 'GeometryPreprocessResult',
-    'GeometryLayerResult', 'GeometryCompleteResult',
-    'RasGeometryCompute',
+    'GeometryLayerResult', 'GeometryCompleteResult', 'PrecipRasterImportResult',
+    'FlowPathPolicyResult',
+    'TerrainExportResult',
+    'RasGeometryCompute', 'RasPrecipHdf',
+    'PrecipCapabilities', 'GriddedPrecipitationCapabilities',
+    'GriddedPrecipitationImportResult', 'PrecipitationCube',
+    'PrecipitationNetcdfResult', 'RasPrecipGrid',
+    'PrecipitationSource', 'QualificationRoute',
+    'QualificationStatus', 'TimingStatus',
     'RasPreprocess',
-    'RasExamples', 'RasEbfeModels', 'M3Model', 'RasCmdr', 'RasCurrency', 'RasControl', 'RasTcu', 'TcuStatus', 'RasMap', 'RasEncroachments', 'RasProcess', 'ProjectionInfo', 'GeoTiffWriteOptions', 'RasterOperationProfileResult', 'StoreMapPerformanceOptions', 'StoreMapProfileResult', 'StoreMapResourceEstimate', 'StoreMapResourceSample', 'TerrainResourceEstimate', 'RasGuiAutomation', 'RasScreenshot', 'HdfFluvialPluvial',
-    'RasBoundaryLink', 'RasRunArtifact', 'RasScenario', 'RasScenarioWorkspace',
-    'RasScenarioWorker', 'RasScenarioWorkerError',
+    'RasExamples', 'RasEbfeModels', 'AlabamaBleModels', 'M3Model', 'RasCmdr', 'RasCurrency', 'RasControl', 'RasTcu', 'TcuStatus', 'RasMap', 'RasEncroachments', 'RasProcess', 'ProjectionInfo', 'StoredMapProductsIncompleteError', 'GeoTiffWriteOptions', 'RasterOperationProfileResult', 'StoreMapPerformanceOptions', 'StoreMapProfileResult', 'StoreMapResourceEstimate', 'StoreMapResourceSample', 'TerrainResourceEstimate', 'RasGuiAutomation', 'RasScreenshot', 'HdfFluvialPluvial',
     'RasBenefits', 'BenefitAreaConfig', 'BenefitAreaResult', 'BenefitCategory',
+    'RasFim', 'FimAoi', 'FimPreparedProfile', 'FimPreparedSlopingModel', 'FimError', 'FimEngineNotFoundError',
+    'FimEngineError', 'FimUnsupportedError', 'FimAoiError', 'FimMappingError',
+    'RasBreakout1D', 'Breakout1DAssemblyResult',
+    'Breakout1DDomainSelection', 'Breakout1DResult',
+    'Breakout1DSelection', 'Breakout1DSourceCatalog',
+    'Breakout1DPlan',
+    'Breakout1DValidationReport',
+    'RasBreakout2D', 'Breakout2DSpec', 'Breakout2DPreflight',
+    'Breakout2DCloneResult', 'Breakout2DPreparationResult',
+    'Breakout2DFluxReview',
+    'RasSubdomain', 'SplitLineCriteria', 'SplitLineSearch', 'SubdomainPartition',
+    'RasNetworkConflation', 'NetworkConflationResult',
+    'NetworkEdgeCoverageResult', 'NetworkEdgeCoveragePlanResult',
+    'ConflationStatus', 'NetworkAdapter', 'NHDPlusAdapter',
+    'NWMHydrofabricAdapter',
+    'NextGenFlowpathAdapter',
+    'RasCrossSections', 'VerticalTransform',
     'RasFloodway', 'RasFlowOptimization', 'RasModPuls', 'RasPermutation', 'RangeSpec', 'RasMonteCarlo',
     'CalibrationPoint', 'RasCalibrate',
     'compute_objective', 'extract_modeled',
@@ -281,18 +532,24 @@ __all__ = [
     'CrossSectionBuildResult', 'CrossSectionManningsN', 'CrossSectionReachLengths',
     'GeomStorage', 'GeomProjection', 'GeomLateral',
     'GeomInlineWeir', 'GeomBridge', 'GeomCulvert', 'GeomCulvertGIS',
-    'GeomReferenceFeatures', 'GeomBcLines', 'GeomMesh',
+    'GeomReferenceFeatures', 'GeomBcLines', 'GeomMesh', 'GeomMeshRepair',
     'GeomPipeNetwork',
-    'MeshResult', 'BCConflict', 'BCFixResult',
+    'MeshResult', 'BCConflict', 'BCFixResult', 'DomainContainmentResult',
+    'DomainContainmentViolation', 'GridAnchor',
 
     # Deprecated geometry classes (will be removed before v1.0)
     'RasGeo', 'RasGeometry', 'RasGeometryUtils',
 
     # Remote execution (lazy loaded)
-    'RasWorker', 'PsexecWorker', 'LocalWorker', 'SshWorker', 'WinrmWorker',
-    'DockerWorker', 'SlurmWorker', 'AwsEc2Worker', 'AzureFrWorker',
+    'RasWorker', 'PsexecWorker', 'LocalWorker', 'DockerWorker',
     'init_ras_worker', 'load_workers_from_json', 'compute_parallel_remote',
-    'ExecutionResult', 'get_worker_status',
+    'ExecutionResult', 'get_worker_status', 'validate_steady_results', 'validate_unsteady_results',
+    'PreprocessPolicy', 'RasExecutionRequest', 'RasExecutionReceipt',
+    'StoredMapsRequest', 'validate_execution_receipt',
+    'RasPortableDocker', 'PortableDockerExecutionResult', 'PortableDockerPoolResult',
+    'RasSlurm', 'SlurmSiteConfig', 'SlurmTransportConfig', 'SlurmSubmission',
+    'SlurmStatus', 'SlurmTaskAccounting', 'SlurmCollection',
+    'RasApptainer', 'ApptainerSiteProfile', 'ApptainerJob', 'ApptainerStatus', 'ApptainerCollection', 'ApptainerPrepareCollection', 'RasContainerImages', 'ApptainerTransport', 'SshApptainerTransport', 'ApptainerProfileError', 'InputCheckError',
 
     # DSS operations (lazy loaded)
     'RasDss',
@@ -319,8 +576,9 @@ __all__ = [
     'OpenRasMapperWorkflow', 'MeshRegenerationWorkflow',
 
     # HDF handling
-    'HdfBase', 'HdfBndry', 'HdfMesh', 'HdfPlan', 'HdfProject',
-    'HdfResultsMesh', 'HdfResultsPlan', 'HdfResultsProducts', 'HdfResultsQuery',
+    'HdfBase', 'HdfCompletion', 'HdfBndry', 'HdfMesh', 'MeshCellPolygonError', 'HdfPlan', 'HdfProject',
+    'HdfResultsMesh', 'MeshSeriesAvailabilityError', 'HdfResultView', 'HdfResultsPlan',
+    'HdfResultsProducts', 'HdfResultsQuery',
     'HdfResultsXsec', 'HdfResultsSediment',
     'HdfStruc', 'HdfStorageArea', 'HdfUtils', 'HdfXsec', 'HdfPump',
     'HdfPipe', 'HdfInfiltration', 'HdfLandCover', 'HdfHydraulicTables', 'HdfResultsBreach', 'RasBreach',
@@ -361,7 +619,6 @@ __all__ = [
 #   OLD: from ras_commander.validation_base import ValidationSeverity, ...
 #   NEW: from ras_commander.RasValidation import ValidationSeverity, ...
 # ======================================================================
-import sys
 import warnings
 
 

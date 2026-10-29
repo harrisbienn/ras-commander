@@ -11,6 +11,7 @@ from typing import Any, Iterable, Optional, Sequence, Union
 import pandas as pd
 
 from . import _land_classification_helper as _lch
+from ._ras_text import _write_ras_xml
 from .LoggingConfig import get_logger
 from .RasUtils import RasUtils
 
@@ -24,6 +25,7 @@ REFERENCE_MAP_LAYER_TYPES = frozenset(
     }
 )
 BASEMAP_LAYER_TYPE = "WMSLayer"
+LAND_CLASSIFICATION_LAYER_TYPES = frozenset({"LandCover", "LandCoverLayer"})
 
 STANDARD_BASEMAP_LAYERS: dict[str, str] = {
     "Google Hybrid": r"%LocalAppData%\HEC\Mapping\5.1\XML\Google Hybrid.xml",
@@ -59,6 +61,34 @@ MAP_LAYER_COLUMNS = [
 ]
 
 
+def _local_name(tag: str) -> str:
+    """Return an XML tag without an optional namespace."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def map_layers_element(root: ET.Element) -> Optional[ET.Element]:
+    """Return the direct ``MapLayers`` container from a parsed root."""
+    return next(
+        (child for child in root if _local_name(child.tag) == "MapLayers"),
+        None,
+    )
+
+
+def map_layer_children(map_layers: ET.Element) -> tuple[ET.Element, ...]:
+    """Return direct ``Layer`` children from a ``MapLayers`` container."""
+    return tuple(
+        child for child in map_layers if _local_name(child.tag) == "Layer"
+    )
+
+
+def top_level_map_layers(root: ET.Element) -> tuple[ET.Element, ...]:
+    """Return direct ``MapLayers/Layer`` declarations from a parsed root."""
+    map_layers = map_layers_element(root)
+    if map_layers is None:
+        return ()
+    return map_layer_children(map_layers)
+
+
 def list_available_basemaps() -> pd.DataFrame:
     """Return the standard HEC-RAS 6.x basemap entries observed in .rasmap XML."""
     return pd.DataFrame(
@@ -81,12 +111,12 @@ def list_map_layers(ras_project_path: Union[str, Path]) -> pd.DataFrame:
         return pd.DataFrame(columns=MAP_LAYER_COLUMNS)
 
     root = ET.parse(project_paths.rasmap_path).getroot()
-    map_layers = root.find("MapLayers")
-    if map_layers is None:
+    layers = top_level_map_layers(root)
+    if not layers:
         return pd.DataFrame(columns=MAP_LAYER_COLUMNS)
 
     records = []
-    for position, layer in enumerate(map_layers.findall("Layer")):
+    for position, layer in enumerate(layers):
         records.append(_build_map_layer_record(project_paths, layer, position))
 
     return pd.DataFrame(records, columns=MAP_LAYER_COLUMNS)
@@ -127,7 +157,7 @@ def set_map_layer_visibility(
     """
     project_paths = _lch.resolve_project_paths(ras_project_path)
     tree, root = _load_rasmap_tree(project_paths.rasmap_path)
-    map_layers = root.find("MapLayers")
+    map_layers = map_layers_element(root)
     if map_layers is None:
         return 0
 
@@ -135,7 +165,7 @@ def set_map_layer_visibility(
     types = _normalize_string_filter(layer_type)
     categories = _normalize_string_filter(category)
     has_selector = any((names, types, categories))
-    layers = list(map_layers.findall("Layer"))
+    layers = list(map_layer_children(map_layers))
     matches = [
         layer
         for layer in layers
@@ -396,7 +426,7 @@ def _classify_map_layer(layer: ET.Element) -> str:
         return "basemap"
     if layer_type in REFERENCE_MAP_LAYER_TYPES:
         return "reference"
-    if layer_type == "LandCoverLayer":
+    if layer_type in LAND_CLASSIFICATION_LAYER_TYPES:
         return "land_classification"
     return "other"
 
@@ -428,7 +458,7 @@ def _load_rasmap_tree(rasmap_path: Path) -> tuple[ET.ElementTree, ET.Element]:
 
 
 def _ensure_map_layers(root: ET.Element) -> ET.Element:
-    map_layers = root.find("MapLayers")
+    map_layers = map_layers_element(root)
     if map_layers is not None:
         return map_layers
 
@@ -442,7 +472,7 @@ def _ensure_map_layers(root: ET.Element) -> ET.Element:
 
 
 def _write_rasmap_tree(tree: ET.ElementTree, rasmap_path: Path) -> None:
-    tree.write(rasmap_path, encoding="utf-8", xml_declaration=False)
+    _write_ras_xml(tree, rasmap_path, encoding="utf-8", xml_declaration=False)
 
 
 def _normalize_string_filter(
@@ -471,7 +501,7 @@ def _remove_existing_layers(
     layer_types: Iterable[str],
 ) -> None:
     layer_type_set = set(layer_types)
-    for layer in list(map_layers.findall("Layer")):
+    for layer in map_layer_children(map_layers):
         if layer.attrib.get("Name") == name and layer.attrib.get("Type") in layer_type_set:
             map_layers.remove(layer)
 

@@ -17,6 +17,11 @@ from .Utils import (
     clear_worker_plan_hdf_artifacts,
     copy_geometry_outputs_back,
     copy_plan_hdf_back,
+    copy_plan_result_back,
+)
+from ..ExecutionArtifacts import (
+    get_plan_result_artifact_paths,
+    infer_execution_result_format,
 )
 from ..LoggingConfig import get_logger
 from ..RasCurrency import RasCurrency
@@ -160,7 +165,7 @@ def execute_local_plan(
         ras_obj: RAS project object
         num_cores: Number of cores
         clear_geompre: Clear geompre files (.c## only)
-        force_geompre: Force full geometry reprocessing (clears .g##.hdf AND .c##)
+        force_geompre: Clear cached geometry products in place and force execution
         force_rerun: Force execution even if results are current
         sub_worker_id: Sub-worker ID for parallel execution (default 1)
         autoclean: Delete temporary worker folder after execution (default True)
@@ -191,14 +196,13 @@ def execute_local_plan(
         logger.debug(f"Copying project for plan {plan_number} to local worker folder: {worker_temp_folder}")
         worker_project_path = worker_temp_folder / project_name
         shutil.copytree(project_folder, worker_project_path, dirs_exist_ok=True, ignore=RasUtils.ignore_windows_reserved)
-        hdf_file = worker_project_path / RasCurrency.get_plan_hdf_path(plan_number, ras_obj).name
-
-        if force_rerun:
+        staged_results_cleared = force_rerun or force_geompre
+        if staged_results_cleared:
             clear_worker_plan_hdf_artifacts(worker_project_path, plan_number, ras_obj)
 
         # Step 3: Execute using RasCmdr.compute_plan()
         from ..RasCmdr import RasCmdr
-        from ..RasPrj import RasPrj, init_ras_project
+        from ..RasPrj import RasPrj, _matching_copied_prj_file, init_ras_project
 
         # Initialize project in worker folder
         logger.debug("Initializing project in local worker folder")
@@ -208,14 +212,39 @@ def execute_local_plan(
             logger.error(f"No .prj file found in {worker_project_path}")
             return False
 
-        # Get version from original ras object
-        ras_version = getattr(ras_obj, 'ras_version', '7.0')
+        # The worker-selected executable is authoritative for the staged run.
+        # Fall back to source-project configuration only when no worker path
+        # was supplied.
+        execution_engine = getattr(worker, "ras_exe_path", None) or getattr(
+            ras_obj, "ras_exe_path", None
+        ) or getattr(ras_obj, "ras_version", None)
+        if not execution_engine:
+            raise ValueError(
+                "Local worker requires an explicit HEC-RAS version or executable"
+            )
+        worker_prj = _matching_copied_prj_file(
+            worker_project_path, getattr(ras_obj, "prj_file", None)
+        )
         init_ras_project(
-            str(worker_project_path),
-            ras_version,
+            str(worker_prj or worker_project_path),
+            execution_engine,
             ras_object=temp_ras,
             hide_intro=True,
         )
+        output_format = infer_execution_result_format(temp_ras)
+
+        if not staged_results_cleared:
+            is_current, _ = RasCurrency._are_plan_results_current_for_execution(
+                plan_number,
+                temp_ras,
+                output_format=output_format,
+            )
+            if not is_current:
+                clear_worker_plan_hdf_artifacts(
+                    worker_project_path,
+                    plan_number,
+                    ras_obj,
+                )
 
         logger.debug(f"Executing plan {plan_number} with RasCmdr.compute_plan()")
         success = RasCmdr.compute_plan(
@@ -234,18 +263,52 @@ def execute_local_plan(
             )
             return False
 
-        if not hdf_file.exists():
-            logger.error(f"HDF file not created: {hdf_file}")
+        worker_artifacts = get_plan_result_artifact_paths(
+            plan_number,
+            ras_object=ras_obj,
+            project_folder=worker_project_path,
+            project_name=project_name,
+        )
+        result_file = (
+            worker_artifacts.hdf
+            if output_format == "hdf"
+            else worker_artifacts.legacy_output
+        )
+        result_valid = (
+            RasCurrency.check_plan_hdf_complete(result_file)
+            if output_format == "hdf"
+            else RasCmdr._verify_legacy_result(
+                plan_number,
+                temp_ras,
+                check_errors=True,
+            )
+        )
+        if not result_valid:
+            logger.error(
+                "%s result was not created or is incomplete for plan %s",
+                output_format,
+                plan_number,
+            )
             return False
 
-        if not RasCurrency.check_plan_hdf_complete(hdf_file):
-            logger.error(f"HDF file is incomplete: {hdf_file}")
-            return False
+        logger.debug(
+            "%s result created successfully for plan %s",
+            output_format,
+            plan_number,
+        )
 
-        logger.debug(f"HDF file created successfully for plan {plan_number}: {hdf_file}")
-
-        # Step 4: Copy results back (HDF file)
-        if copy_plan_hdf_back(worker_project_path, plan_number, ras_obj) is None:
+        # Step 4: Copy the selected result family back.
+        copied_result = (
+            copy_plan_hdf_back(worker_project_path, plan_number, ras_obj)
+            if output_format == "hdf"
+            else copy_plan_result_back(
+                worker_project_path,
+                plan_number,
+                ras_obj,
+                output_format=output_format,
+            )
+        )
+        if copied_result is None:
             return False
 
         if copy_geometry_outputs:

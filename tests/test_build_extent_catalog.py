@@ -5,10 +5,18 @@ import json
 from pathlib import Path
 
 import geopandas as gpd
-from shapely.geometry import MultiPolygon, box, shape
+import pytest
+from shapely.geometry import MultiPolygon, box, mapping, shape
 
-SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "example_library" / "build_extent_catalog.py"
-CATALOG_CONFIG_PATH = Path(__file__).parents[1] / "agent_tasks" / "rasexamples_extent_catalog.json"
+SCRIPT_PATH = (
+    Path(__file__).parents[1]
+    / "scripts"
+    / "example_library"
+    / "build_extent_catalog.py"
+)
+CATALOG_CONFIG_PATH = (
+    Path(__file__).parents[1] / "agent_tasks" / "rasexamples_extent_catalog.json"
+)
 SPEC = importlib.util.spec_from_file_location("build_extent_catalog", SCRIPT_PATH)
 assert SPEC and SPEC.loader
 builder = importlib.util.module_from_spec(SPEC)
@@ -24,7 +32,279 @@ def test_catalog_extent_outputs_do_not_overlap_viewer_artifacts() -> None:
         assert "/viewer/" not in project["extent_output"]
 
 
-def test_write_javascript_catalog_assigns_a_compact_bbox_fallback(tmp_path: Path) -> None:
+def test_san_gabriel_catalog_has_five_linked_submodel_entries() -> None:
+    config = json.loads(CATALOG_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    projects = [
+        item
+        for item in config["projects"]
+        if item["id"].startswith("san-gabriel-lbsg-")
+    ]
+    assert [project["id"] for project in projects] == [
+        "san-gabriel-lbsg-501-12070205",
+        "san-gabriel-lbsg-502-12070205",
+        "san-gabriel-lbsg-503-12070205",
+        "san-gabriel-lbsg-504-12070205",
+        "san-gabriel-lbsg-505-12070205",
+    ]
+    assert all(
+        project["status"] == "Source qualification candidate" for project in projects
+    )
+    assert all(
+        project["viewer_type"] == "Qualification candidate" for project in projects
+    )
+    assert all(not project["webmap"] for project in projects)
+    details = [project["details"] for project in projects]
+    assert len(set(details)) == 5
+    assert details == [
+        "https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/"
+        f"2026-09-05_san_gabriel_record_of_deficiencies.md#lbsg-{number}"
+        for number in range(501, 506)
+    ]
+    assert all(
+        project["record_of_deficiencies"].endswith(
+            "2026-09-05_san_gabriel_record_of_deficiencies.md"
+        )
+        for project in projects
+    )
+    assert [Path(project["geometry_hdf"]).name for project in projects] == [
+        "BLE_LBSG_501.g02.hdf",
+        "BLE_LBSG_502.g03.hdf",
+        "BLE_LBSG_503.g04.hdf",
+        "BLE_LBSG_504.g05.hdf",
+        "BLE_LBSG_505.g06.hdf",
+    ]
+
+
+def test_double_mountain_fork_brazos_catalog_has_four_linked_candidates() -> None:
+    config = json.loads(CATALOG_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    projects = [
+        item
+        for item in config["projects"]
+        if item["id"].startswith("double-mountain-fork-brazos-dmf")
+    ]
+    assert [project["id"] for project in projects] == [
+        f"double-mountain-fork-brazos-dmf{number}-12050004" for number in range(1, 5)
+    ]
+    assert all(
+        project["status"] == "Source qualification candidate" for project in projects
+    )
+    assert all(
+        project["viewer_type"] == "Qualification candidate" for project in projects
+    )
+    assert all(
+        not project[field]
+        for project in projects
+        for field in ("webmap", "manifest", "project_manifest")
+    )
+    assert [project["details"].rsplit("#", 1)[-1] for project in projects] == [
+        f"dmf{number}" for number in range(1, 5)
+    ]
+    assert all(
+        project["record_of_deficiencies"].endswith(
+            "2026-09-11_double_mountain_fork_brazos_record_of_deficiencies.md"
+        )
+        for project in projects
+    )
+    assert [Path(project["geometry_hdf"]).name for project in projects] == [
+        "DMF_1.g01.hdf",
+        "DMF2.g01.hdf",
+        "DMF_3.g01.hdf",
+        "DMF_BrazosRiver4.g01.hdf",
+    ]
+    assert all(
+        "reached unsteady computation" in project["notes"] for project in projects
+    )
+    assert all("pending" not in project["notes"].lower() for project in projects)
+
+
+def test_alabama_ble_catalog_has_one_corpus_candidate() -> None:
+    config = json.loads(CATALOG_CONFIG_PATH.read_text(encoding="utf-8"))
+    project_id = "middle-chattahoochee-lake-harding-al03130002"
+    projects = [item for item in config["projects"] if item["id"] == project_id]
+
+    assert len(projects) == 1
+    project = projects[0]
+    assert project["status"] == "Source qualification candidate"
+    assert project["viewer_type"] == "Qualification candidate"
+    assert project["extent_geojson"].endswith("AL03130002_model_footprints.geojson")
+    assert project["extent_source"].startswith("Union of 197")
+    assert project["landing_extent_source"] == "Exact union of 197 model footprints"
+    assert all(
+        not project[field]
+        for field in (
+            "webmap",
+            "manifest",
+            "project_manifest",
+            "landing_geometry_pmtiles",
+            "landing_geometry_profile",
+        )
+    )
+    assert "197 Alabama BLE 1D steady projects" in project["notes"]
+
+
+def test_austin_oyster_catalog_has_one_unsteady_start_candidate() -> None:
+    config = json.loads(CATALOG_CONFIG_PATH.read_text(encoding="utf-8"))
+    project_id = "austin-oyster-12040205"
+    projects = [item for item in config["projects"] if item["id"] == project_id]
+
+    assert len(projects) == 1
+    project = projects[0]
+    assert project["crs"] == "EPSG:6588"
+    assert project["geometry_hdf"] == (
+        "source_projects/ebfe_organized/AustinOyster_12040205/RAS Model/"
+        "AustinOyster/Input/AustinOyster.g02.hdf"
+    )
+    assert project["status"] == "Source qualification candidate"
+    assert project["viewer_type"] == "Qualification candidate"
+    assert all(
+        not project[field] for field in ("webmap", "manifest", "project_manifest")
+    )
+    assert project["details"].startswith("https://")
+    assert project["record_of_deficiencies"].startswith("https://")
+    assert project["details"] == project["record_of_deficiencies"]
+    assert "reached unsteady-solver startup" in project["notes"]
+    assert "completed-result" in project["notes"]
+
+
+def test_upper_guadalupe_catalog_has_four_linked_source_candidates() -> None:
+    config = json.loads(CATALOG_CONFIG_PATH.read_text(encoding="utf-8"))
+
+    projects = [
+        item
+        for item in config["projects"]
+        if item["id"].startswith("upper-guadalupe-ras-model-upgu")
+    ]
+    expected_ids = [
+        "upper-guadalupe-ras-model-upgu1-upgu1-prj-030c0a6a",
+        "upper-guadalupe-ras-model-upgu2-upgu2-prj-917be43b",
+        "upper-guadalupe-ras-model-upgu3-upgu3-prj-c79886b4",
+        "upper-guadalupe-ras-model-upgu4-upgu4-prj-a9a9000f",
+    ]
+    assert [project["id"] for project in projects] == expected_ids
+    assert all(
+        project["status"] == "Source qualification candidate"
+        for project in projects
+    )
+    assert all(
+        project["viewer_type"] == "Qualification candidate"
+        for project in projects
+    )
+    assert all(
+        not project[field]
+        for project in projects
+        for field in ("webmap", "manifest", "project_manifest")
+    )
+    assert [project["details"].rsplit("#", 1)[-1] for project in projects] == [
+        f"upgu{number}" for number in range(1, 5)
+    ]
+    assert all(
+        project["record_of_deficiencies"].endswith(
+            "2026-09-25_upper_guadalupe_record_of_deficiencies.md"
+        )
+        for project in projects
+    )
+    assert "reached owned unsteady-solver startup" in projects[0]["notes"]
+    assert "qualification is not established" in projects[1]["notes"]
+    assert all(
+        "qualification was not attempted" in project["notes"]
+        for project in projects[2:]
+    )
+    assert [Path(project["geometry_hdf"]).name for project in projects] == [
+        f"UPGU{number}.g01.hdf" for number in range(1, 5)
+    ]
+
+
+def test_pedernales_catalog_has_one_exact_corpus_candidate() -> None:
+    config = json.loads(CATALOG_CONFIG_PATH.read_text(encoding="utf-8"))
+    projects = [
+        item for item in config["projects"] if item["id"] == "pedernales-12090206"
+    ]
+
+    assert len(projects) == 1
+    project = projects[0]
+    assert project["crs"] == "EPSG:2277"
+    assert project["extent_geojson"].endswith(
+        "pedernales_12090206_model_footprints.geojson"
+    )
+    assert project["extent_geojson_crs"] == "EPSG:4326"
+    assert "Union of 530 HdfProject.get_project_extent" in project["extent_source"]
+    assert project["landing_extent_source"] == (
+        "Exact union of 530 active model footprints"
+    )
+    assert project["status"] == "Qualified: 530/530 plan-01 runs passed"
+    assert project["viewer_type"] == "Qualification candidate"
+    assert all(
+        not project[field]
+        for field in (
+            "webmap",
+            "manifest",
+            "project_manifest",
+            "landing_geometry_pmtiles",
+            "landing_geometry_profile",
+        )
+    )
+    assert project["record_of_deficiencies"].endswith(
+        "2026-09-25_pedernales_record_of_deficiencies.md"
+    )
+
+
+def test_cibolo_and_medina_candidate_catalog_contract() -> None:
+    config = json.loads(CATALOG_CONFIG_PATH.read_text(encoding="utf-8"))
+    by_id = {item["id"]: item for item in config["projects"]}
+
+    cibolo = by_id["cibolo-12100304"]
+    assert cibolo["crs"] == "EPSG:2278"
+    assert Path(cibolo["geometry_hdf"]).name == "Cibolo.g05.hdf"
+    assert cibolo["status"] == "Qualified: unsteady start"
+    assert "owned unsteady-solver startup" in cibolo["notes"]
+    assert all(
+        not cibolo[field] for field in ("webmap", "manifest", "project_manifest")
+    )
+
+    medina_ids = [
+        "medina-leon1-12100302",
+        "medina-leon2-12100302",
+        "medina-leon3-12100302",
+        "medina-middle-lower-medina-12100302",
+        "medina-upper-medina-headwaters-12100302",
+    ]
+    medina = [by_id[project_id] for project_id in medina_ids]
+    assert [Path(project["geometry_hdf"]).name for project in medina] == [
+        "Leon1.g01.hdf",
+        "Leon2.g01.hdf",
+        "Leon3.g01.hdf",
+        "MLM.g01.hdf",
+        "UpperMedinaHW.g02.hdf",
+    ]
+    assert all(project["crs"] == "EPSG:2278" for project in medina)
+    assert all(
+        not project[field]
+        for project in medina
+        for field in ("webmap", "manifest", "project_manifest")
+    )
+    assert [project["status"] for project in medina[:4]] == [
+        "Qualified: unsteady start"
+    ] * 4
+    assert all(
+        "owned unsteady-solver startup" in project["notes"]
+        for project in medina[:4]
+    )
+    assert medina[-1]["status"] == "Critical source gap — blocked"
+    assert medina[-1]["viewer_type"] == "Blocked source model"
+    assert "compiled modified Terrain.hdf" in medina[-1]["notes"]
+    assert all(
+        project["record_of_deficiencies"].endswith(
+            "2026-09-25_medina_record_of_deficiencies.md"
+        )
+        for project in medina
+    )
+
+
+def test_write_javascript_catalog_preserves_exact_project_footprint(
+    tmp_path: Path,
+) -> None:
     output = tmp_path / "ras-example-projects-data.js"
     catalog = {
         "type": "FeatureCollection",
@@ -59,19 +339,133 @@ def test_write_javascript_catalog_assigns_a_compact_bbox_fallback(tmp_path: Path
     assert contents.endswith(";\n")
     fallback = json.loads(contents.removeprefix(prefix).removesuffix(";\n"))
     assert fallback["name"] == catalog["name"]
-    assert fallback["fallbackGeometry"] == "bounding-box"
-    assert fallback["features"][0]["properties"]["fallbackGeometry"] == "bounding-box"
-    assert fallback["features"][0]["geometry"] == {
-        "type": "Polygon",
-        "coordinates": [[[-85.0, 40.0], [-84.0, 40.0], [-84.0, 41.0], [-85.0, 41.0], [-85.0, 40.0]]],
+    assert fallback["fallbackSource"] == "embedded-api-derived-project-footprints"
+    assert "fallbackGeometry" not in fallback
+    assert "fallbackGeometry" not in fallback["features"][0]["properties"]
+    assert fallback["features"][0]["geometry"] == catalog["features"][0]["geometry"]
+    assert not shape(fallback["features"][0]["geometry"]).equals(
+        box(*fallback["features"][0]["bbox"])
+    )
+
+
+def test_write_javascript_catalog_derives_missing_bbox_from_geometry(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "ras-example-projects-data.js"
+    catalog = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {
+                    "title": "Model without bbox",
+                    "projectId": "model-without-bbox",
+                },
+                "geometry": mapping(box(-111.5, 40.1, -111.4, 40.2)),
+            }
+        ],
     }
 
+    builder._write_javascript_catalog(output, catalog)
 
-def test_project_feature_uses_display_crs_without_losing_definition(monkeypatch, tmp_path: Path) -> None:
+    prefix = "window.RAS_EXAMPLE_PROJECTS = "
+    fallback = json.loads(
+        output.read_text(encoding="utf-8").removeprefix(prefix).removesuffix(";\n")
+    )
+    assert fallback["features"][0]["id"] == "model-without-bbox"
+    assert fallback["features"][0]["bbox"] == [-111.5, 40.1, -111.4, 40.2]
+
+
+def test_merge_javascript_catalog_replaces_and_appends_exact_features(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "ras-example-project-supplements.js"
+    existing = {
+        "type": "FeatureCollection",
+        "name": "supplements",
+        "generatedAt": "old",
+        "features": [
+            {
+                "type": "Feature",
+                "id": "retained",
+                "properties": {"title": "Retained"},
+                "geometry": mapping(box(-86.0, 32.0, -85.9, 32.1)),
+            },
+            {
+                "type": "Feature",
+                "id": "replaced",
+                "properties": {"title": "Old"},
+                "geometry": mapping(box(-85.8, 32.0, -85.7, 32.1)),
+            },
+        ],
+    }
+    prefix = "window.RAS_EXAMPLE_PROJECT_SUPPLEMENTS = "
+    output.write_text(prefix + json.dumps(existing) + ";\n", encoding="utf-8")
+    replacement_geometry = mapping(box(-85.7, 32.1, -85.6, 32.2))
+    appended_geometry = mapping(box(-85.6, 32.2, -85.5, 32.3))
+    generated = {
+        "type": "FeatureCollection",
+        "generatedAt": "new",
+        "features": [
+            {
+                "type": "Feature",
+                "id": "replaced",
+                "properties": {"title": "New"},
+                "geometry": replacement_geometry,
+            },
+            {
+                "type": "Feature",
+                "id": "appended",
+                "properties": {"title": "Appended"},
+                "geometry": appended_geometry,
+            },
+        ],
+    }
+
+    builder._merge_javascript_catalog(
+        output,
+        generated,
+        "RAS_EXAMPLE_PROJECT_SUPPLEMENTS",
+    )
+
+    merged = json.loads(
+        output.read_text(encoding="utf-8").removeprefix(prefix).removesuffix(";\n")
+    )
+    assert merged["generatedAt"] == "new"
+    assert [feature["id"] for feature in merged["features"]] == [
+        "retained",
+        "replaced",
+        "appended",
+    ]
+    assert shape(merged["features"][1]["geometry"]).equals(shape(replacement_geometry))
+    assert shape(merged["features"][2]["geometry"]).equals(shape(appended_geometry))
+    assert all(
+        "fallbackGeometry" not in item["properties"] for item in merged["features"]
+    )
+
+
+def test_javascript_catalog_rejects_invalid_variable_name(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Invalid JavaScript variable"):
+        builder._write_javascript_catalog(
+            tmp_path / "catalog.js",
+            {"type": "FeatureCollection", "features": []},
+            "BAD;alert(1)",
+        )
+
+
+def test_project_feature_uses_display_crs_without_losing_definition(
+    monkeypatch, tmp_path: Path
+) -> None:
     hdf_path = tmp_path / "model.g01.hdf"
     hdf_path.touch()
     extent = gpd.GeoDataFrame(geometry=[box(-85.0, 40.0, -84.9, 40.1)], crs="EPSG:4326")
-    monkeypatch.setattr(builder.HdfProject, "get_project_extent", lambda *args, **kwargs: (extent, extent.total_bounds))
+    calls = []
+
+    def get_project_extent(*args, **kwargs):
+        calls.append((args, kwargs))
+        return extent, extent.total_bounds
+
+    monkeypatch.setattr(builder.HdfProject, "get_project_extent", get_project_extent)
     project = {
         "id": "model-1",
         "title": "Model 1",
@@ -82,6 +476,8 @@ def test_project_feature_uses_display_crs_without_losing_definition(monkeypatch,
         "webmap": "../viewer/",
         "manifest": "https://example.test/manifest.json",
         "project_manifest": "https://example.test/project.json",
+        "landing_geometry_pmtiles": "https://example.test/corpus.pmtiles",
+        "landing_geometry_profile": "ras-1d-corpus-v1",
         "notes": "Test model",
     }
 
@@ -89,16 +485,38 @@ def test_project_feature_uses_display_crs_without_losing_definition(monkeypatch,
 
     assert feature["properties"]["crs"] == "WGS 84"
     assert feature["properties"]["crsDefinition"] == "EPSG:4326"
+    assert calls == [
+        (
+            (hdf_path,),
+            {
+                "geometry_type": "footprint",
+                "buffer_percent": 0,
+                "fill_holes": True,
+            },
+        )
+    ]
+    assert "fill_holes=True" in feature["properties"]["extentSource"]
+    assert (
+        feature["properties"]["landingGeometryPmtiles"]
+        == "https://example.test/corpus.pmtiles"
+    )
+    assert feature["properties"]["landingGeometryProfile"] == "ras-1d-corpus-v1"
 
 
-def test_project_feature_unions_configured_geometry_hdfs(monkeypatch, tmp_path: Path) -> None:
+def test_project_feature_unions_configured_geometry_hdfs(
+    monkeypatch, tmp_path: Path
+) -> None:
     first_hdf_path = tmp_path / "model.g01.hdf"
     second_hdf_path = tmp_path / "model.g02.hdf"
     first_hdf_path.touch()
     second_hdf_path.touch()
     extents = {
-        first_hdf_path: gpd.GeoDataFrame(geometry=[box(-85.0, 40.0, -84.9, 40.1)], crs="EPSG:4326"),
-        second_hdf_path: gpd.GeoDataFrame(geometry=[box(-84.8, 40.0, -84.7, 40.1)], crs="EPSG:4326"),
+        first_hdf_path: gpd.GeoDataFrame(
+            geometry=[box(-85.0, 40.0, -84.9, 40.1)], crs="EPSG:4326"
+        ),
+        second_hdf_path: gpd.GeoDataFrame(
+            geometry=[box(-84.8, 40.0, -84.7, 40.1)], crs="EPSG:4326"
+        ),
     }
 
     def get_project_extent(path: Path, **_kwargs):
@@ -123,6 +541,48 @@ def test_project_feature_unions_configured_geometry_hdfs(monkeypatch, tmp_path: 
 
     assert feature["geometry"]["type"] == "MultiPolygon"
     assert feature["bbox"] == [-85.0, 40.0, -84.7, 40.1]
+
+
+def test_project_feature_accepts_api_generated_extent_geojson(tmp_path: Path) -> None:
+    extent_path = tmp_path / "viewer" / "model_extent.geojson"
+    extent_path.parent.mkdir()
+    extent_path.write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {"geometry_id": "g01"},
+                        "geometry": box(-89.0, 42.0, -88.9, 42.1).__geo_interface__,
+                    },
+                    {
+                        "type": "Feature",
+                        "properties": {"geometry_id": "g02"},
+                        "geometry": box(-88.8, 42.0, -88.7, 42.1).__geo_interface__,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    project = {
+        "id": "model-1",
+        "title": "Model 1",
+        "source_family": "Example",
+        "crs": "EPSG:3435",
+        "extent_geojson": "viewer/model_extent.geojson",
+        "extent_geojson_crs": "EPSG:4326",
+        "webmap": "../viewer/",
+        "manifest": "https://example.test/manifest.json",
+        "project_manifest": "https://example.test/project.json",
+        "notes": "Test model",
+    }
+
+    feature = builder._project_feature(project, tmp_path)
+
+    assert feature["geometry"]["type"] == "MultiPolygon"
+    assert feature["bbox"] == [-89.0, 42.0, -88.7, 42.1]
 
 
 def test_catalog_uses_configured_landing_envelope_without_changing_exact_extent(

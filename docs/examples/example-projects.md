@@ -1,171 +1,29 @@
 # Example Project Library
 
 <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.6.0/dist/maplibre-gl.css">
-<link rel="stylesheet" href="../../assets/stylesheets/ras-example-library.css?v=20260714Tlibrarytable01">
+<link rel="stylesheet" href="../../assets/stylesheets/ras-example-library.css?v=20260906Tsan-gabriel-submodels01">
 
-!!! warning "Under construction"
-    The Example Project Library is moving to a RAS Commander MapLibre viewer
-    backed by PMTiles and WebGIS-hosted artifacts. The current promotion set
-    includes HEC examples, ScienceBase releases, and an eBFE/BLE delivery.
-
-RAS Commander uses repeatable HEC-RAS project fixtures for examples, tests,
-documentation, and regression checks. The library combines several source
-families rather than treating one archive as the entire example set:
-
-- HEC tutorial and example projects
-- HEC special sample datasets
-- publicly available USGS ScienceBase model releases
-- organized FEMA eBFE/BLE deliveries
-- other public state, county, and federal model catalogs as they are reviewed
-
-HEC's example projects are instructional fixtures, not production studies. They
-are still useful because they are the same projects that HEC-RAS tutorials and
-manual examples are based on. Public ScienceBase and eBFE/BLE sources play a
-different role: they expose real delivery structure, metadata, scale, path
-issues, and model packaging details.
-
-Only projects with a verified coordinate reference system are eligible for the
-web map viewer. Projects without a CRS can remain useful for notebook examples,
-but they are not published as map-review targets until their CRS is resolved.
-
-<details class="ras-library-details" markdown="1">
-<summary>ScienceBase model acquisition and validation details</summary>
-
-`RasExamples` exposes only ScienceBase HEC-RAS archives explicitly promoted as
-runnable. Every execution dependency must exist and be portable. Promotion
-normally also requires a representative plan to complete a fresh
-version-appropriate RAS Commander run (`RasCmdr` for HEC-RAS 6.x and
-`RasControl` for legacy versions). A curator may explicitly accept a reviewed,
-long-running archive without repeating a full compute; that exception and its
-incomplete-compute evidence remain visible in catalog metadata. Listing the
-catalog performs no network request and does not initialize or download the
-standard example collection.
-
-```python
-from ras_commander import RasExamples
-
-models = RasExamples.list_sciencebase_models()
-```
-
-Candidate and rejected releases are intentionally absent from that result. A
-curator can review them with
-`UsgsScienceBase.list_catalog_models(validated_only=False)`.
-
-| Catalog entry | Model software | Promotion status | Evidence or blocker |
-| --- | --- | --- | --- |
-| [Kalamazoo River](https://www.sciencebase.gov/catalog/item/67a38201d34ee33d441d2f22) | HEC-RAS 6.6 | Validated | All 21 plans and dependencies resolve; fresh plan 44 run verified with zero compute-message errors or warnings |
-| [Fox River Chain of Lakes](https://www.sciencebase.gov/catalog/item/661e9565d34e7eb9eb7e3ce4) | HEC-RAS 6.5 | Solver-ready; curator-accepted and promoted | The 12.0 GB archive is complete; an exact three-reference DSS repair leaves all 6 plans, 3 geometries, and 6 unsteady-flow files portable with zero missing-path issues. Plan 01 then ran under HEC-RAS 6.6 for 97.97 minutes, loaded every DSS boundary record, and produced zero errors or warnings before an intentional curator stop. The curator explicitly waived another multi-hour completion test; `compute_verified=False` remains visible in metadata |
-| [Silver Creek / Scott AFB](https://www.sciencebase.gov/catalog/item/644c1526d34e45f6ddcd4a3a) | HEC-HMS 4.9 + HEC-RAS 6.5; validated with HEC-RAS 6.6 | Validated and promoted | The exact 68.5 GB archive was selectively extracted to its runnable RAS tree. A deterministic two-reference DSS repair and pruning of three unreferenced unsteady-flow entries leave 35 plans, 8 geometries, and 38 unsteady-flow files with zero path issues. Fresh plan 10 completed its 66-hour simulation with 0 errors, 0 warnings, and 0.001495% volume error |
-| Squannacook River Crossings | HEC-RAS 6.x | Pending | Geometry archive has not yet passed the execution gate |
-| [St. Joseph River](https://www.sciencebase.gov/catalog/item/584197dfe4b04fc80e518b6b) | HEC-RAS 4.1 | Validated after curated repair | The delivered final plan 24 is complete; pruning 42 stale project-index references leaves plan 24, geometry 18, and flow 01. A fresh forced `RasControl` run completed with zero compute-message errors or warnings and returned 588 result rows across 7 profiles and 84 locations |
-
-The St. Joseph ZIP is retained unchanged. On extraction,
-`download_sciencebase_model()` applies a narrowly registered repair to the
-working copy: it removes plans 01–23 and geometries 01–17, 19, and 20 only when
-those exact files are absent and the retained plan 24 dependencies exist. Any
-different missing-file pattern is rejected instead of being guessed at. The
-repair is idempotent.
-
-The Fox River ZIP is also retained unchanged. Its registered working-copy repair
-replaces exactly three references in unsteady-flow file 01 to use the USGS DSS
-file that is present in the archive. The repair is rejected if the expected
-reference count or delivered replacement file differs. After repair, all six
-plans pass the portable-path audit. A controlled HEC-RAS 6.6 readiness run then
-loaded all six April/May 2022 DSS records and sustained 97.97 minutes of stable
-hydraulic computation with zero errors or warnings before an intentional stop.
-The curator confirmed the archive runs and explicitly waived another multi-hour
-completion test. Fox is therefore included by
-`RasExamples.list_sciencebase_models()`, while its `solver_ready` status,
-`compute_verified=False`, and full-compute caveat remain explicit.
-
-Silver Creek uses the registry's reviewed `model_run_files/HEC-RAS_model`
-archive prefix, so a normal `RasExamples` download extracts the runnable RAS
-delivery rather than expanding the unrelated HMS meteorology payload. The
-published 7-Zip archive remains unchanged. In the extracted working copy, the
-registered repair redirects two stale March 23 DSS references to the updated
-DSS delivered in the same archive and removes project-index entries for three
-unreferenced unsteady files whose older DSS inputs were not delivered. The
-post-repair audit found zero path issues across all 35 retained plans. Plan 10's
-29 DSS boundary series all read successfully and cover the full simulation
-window. A forced fresh HEC-RAS 6.6 run then completed the 66-hour simulation in
-1.904 hours using the workstation's 8 available solver cores, with zero
-compute-message errors or warnings and 0.3273 acre-ft (0.001495%) overall
-volume error. Silver Creek is therefore included by
-`RasExamples.list_sciencebase_models()`.
-
-Fox and Silver Creek are public ScienceBase cloud attachments. They do not
-require a ScienceBase account, but ScienceBase requires a browser CAPTCHA before
-issuing each temporary large-file URL. `UsgsScienceBase.get_download_manifest()`
-reports the official CAPTCHA page and exact local destination. After the CAPTCHA,
-pass the temporary URL to `download_model(..., signed_download_urls={...})`, or
-place the browser download at the reported destination. Downloads use the same
-resumable `.part` workflow as eBFE deliveries and must match the authoritative
-ScienceBase byte count. ZIP and 7-Zip deliveries are then safely extracted with
-member-path and member-size checks; complete extractions are not repeated.
-
-```python
-from pathlib import Path
-from ras_commander.sources.federal.usgs_sciencebase import UsgsScienceBase
-
-download_root = Path(r"H:\Testing\USGS Sciencebase Models\ScienceBase Downloads")
-manifest = UsgsScienceBase.get_download_manifest("fox-river", download_root)
-
-# After completing the public CAPTCHA and copying its temporary URL:
-temporary_url = "https://temporary-download-url-issued-by-sciencebase"
-model_root = UsgsScienceBase.download_model(
-    "fox-river",
-    download_root,
-    signed_download_urls={"model_archive.zip": temporary_url},
-)
-
-# If the browser downloaded the archive directly to the manifest destination,
-# continue entirely offline without another ScienceBase request:
-model_root = UsgsScienceBase.extract_local_model("fox-river", download_root)
-
-# Preserve the published hierarchy and write MANIFEST.md plus agent audit files.
-audit = UsgsScienceBase.organize_model("fox-river", download_root)
-assert audit["paths_validated"]
-```
-
-After extraction, use `inspect_sciencebase_model()` to check plan, geometry,
-flow, DSS, restart, gridded meteorology, terrain, land-classification, and
-projection paths across every discovered HEC-RAS project. Then use
-`validate_sciencebase_model()` with an explicit project and plan to force a fresh run
-in an isolated output folder. The validator uses HDF verification for modern
-HEC-RAS and fresh detailed compute messages for legacy HEC-RAS. Pending and
-rejected candidates cannot be downloaded through the public `RasExamples`
-facade.
-
-SRH-2D, CE-QUAL-W2, and derived raster inundation collections are outside this
-catalog regardless of whether their source archives are otherwise useful.
-
-</details>
+Explore HEC tutorial projects, organized public model releases, and explicitly
+marked source-qualification candidates used throughout the RAS Commander
+examples. Select a model area on the map or open a project below to review its
+available geometry, terrain, and results.
 
 ## Project Explorer
 
-The explorer shows one model-limit polygon per promoted MapLibre project.
-Click a polygon to review source metadata and open that project's webmap. The
-table below is the same published catalog: each project name is linked once to
-its viewer and the Project Information column summarizes the current bundle.
-Projects stay out of this map until they have a valid CRS, a WGS84 model limit,
-and a published MapLibre webmap.
-
-<div class="ras-example-library" data-ras-example-library data-index="https://rascommander.info/data/rasexamples/hec-ras-7.0/example-projects.geojson?v=20260715Tterrainalpha01">
+<div class="ras-example-library" data-ras-example-library data-index="https://rascommander.info/data/rasexamples/hec-ras-7.0/current/example-projects.geojson">
   <div class="ras-library-map-shell">
     <div class="ras-library-map" data-library-map></div>
   </div>
   <div class="ras-library-map-footer">
-    <span data-library-status>Published MapLibre project extents</span>
-    <span>Click a model extent to open its webmap.</span>
+    <span data-library-status>Select a project pin or model extent.</span>
   </div>
   <div class="ras-library-table-wrap">
     <table class="ras-library-table">
       <thead>
         <tr>
           <th scope="col">Project</th>
-          <th scope="col">Project Information</th>
-          <th scope="col">Source</th>
-          <th scope="col">CRS</th>
+          <th scope="col">Technical Description</th>
+          <th scope="col">HEC-RAS Version</th>
         </tr>
       </thead>
       <tbody data-project-table></tbody>
@@ -175,8 +33,108 @@ and a published MapLibre webmap.
 
 <script src="https://unpkg.com/maplibre-gl@5.6.0/dist/maplibre-gl.js"></script>
 <script src="https://unpkg.com/pmtiles@4.3.0/dist/pmtiles.js"></script>
-<script src="../../assets/javascripts/ras-example-projects-data.js?v=20260715Tterrainalpha01"></script>
-<script src="../../assets/javascripts/ras-example-library.js?v=20260714Tlibrarytable01"></script>
+<script src="../../assets/javascripts/ras-example-project-profiles.js?v=20260925Tpedernales-cibolo-medina02"></script>
+<script src="../../assets/javascripts/ras-example-projects-data.js?v=20260925Tupper-guadalupe02"></script>
+<script src="../../assets/javascripts/ras-example-project-supplements.js?v=20260925Tpedernales-cibolo-medina02"></script>
+<script src="../../assets/javascripts/ras-example-library.js?v=20260912Talabama-ble-corpus01"></script>
+
+## Dashboard Qualification Status
+
+San Gabriel appears in the dashboard only as a **deficient source candidate**.
+Double Mountain Fork Brazos (12050004) is a four-project **source qualification
+candidate** after all four selected two-core 1% AEP plans reached unsteady
+computation. Middle Chattahoochee–Lake Harding (AL03130002) is one
+**source and geometry qualification candidate** for its complete 197-model 1D
+steady corpus; no hydraulic computation has been run for that corpus. Each
+candidate name links to its qualification record. Austin–Oyster (12040205) is
+an **unsteady-start-qualified source and geometry candidate** after plan `p08`
+passed the bounded pre-compute workflow. Upper Guadalupe (12100201) is a
+four-project **partially qualified source candidate**: UPGU1 reached unsteady
+solver startup, while UPGU2–UPGU4 remain unqualified. The San Gabriel, Double Mountain Fork,
+and Upper Guadalupe entries retain project-specific sub-model links. These
+evidence links are not project-viewer links and
+must not imply that the public delivery has a published result viewer.
+Pedernales (12090206) is one **qualified source and geometry corpus**
+for its 530-project 1D steady corpus; its single map outline is the exact union
+of all active model footprints. Cibolo (12100304) is one organized 2D source
+candidate with delivered terrain. Medina (12100302) is one grouped five-model
+study: four projects contain their compiled modified terrain, while Upper
+Medina Headwaters is explicitly blocked by a critical missing-terrain gap.
+
+| Source | RAS Commander entry point | Qualification | Known limitation |
+|---|---|---|---|
+| FEMA San Gabriel BLE (12070205) | `RasEbfeModels.organize_model("san-gabriel")` | Five linked HEC-RAS 6.3 projects; one 1% plan per project reached unsteady computation. A reconstructed-terrain LBSG_503 1% run also completed successfully with a 0.0236% volume error and 0.737-ft P95 maximum-WSE difference from the supplied result. LBSG_504 covers Round Rock and LBSG_503 is the Florence-area project. This is compute evidence only. | **Critical, model-blocking source gap:** the compiled `Terrain\Terrain.hdf` and its road-crossing/Lake Georgetown modification payloads were not provided. The HDEM-only reconstruction resolves paths and supports diagnostic QA, but does not make the public 2D model reproducible or usable downstream. |
+| FEMA Double Mountain Fork Brazos eBFE (12050004) | `RasEbfeModels.organize_model("double-mountain-fork-brazos")` | Four chained HEC-RAS 6.10 projects (HEC-RAS 6.1 family). Exact API-derived footprints are published here, and all four selected two-core 1% AEP plans reached unsteady computation with `owned_process_artifacts` evidence and no timeout or error. This is source-qualification evidence, not a completed-result viewer. | Hydraulic inputs and compiled terrain are delivered. DMF2 correctly references `Terrain.Clone (1).hdf` with the `Polygons (1)` elevation modification. DMF1/DMF2 `g01` require native `RasMap` reassociation plus HEC-RAS table recomputation in the validation copy. Remaining nonhydraulic gaps are local basemap/profile-line references and an inaccurate DMF1 result count in `Readme.txt`. |
+| FEMA Austin–Oyster eBFE (12040205) | `RasEbfeModels.organize_model("austin-oyster")` | One HEC-RAS 5.07 2D unsteady project with seven plans. Plan `p08` (`1PAC`) passed the bounded pre-compute workflow with two cores: an owned `RasUnsteady64.exe` and the complete fresh preprocessing artifact set were detected in 64.9 seconds. This is solver-start evidence, not a completed-result claim. | Reconstruction relocates fourteen Output assets and the projection, then corrects one RASMapper projection path. All 28 audited plan-HDF path attributes were already path-equivalent and were preserved byte-for-byte. The two genuinely undelivered references are display-only `Google Map.xml` and `Google Hybrid.xml`. The delivered terrain has no modification groups and the `.rasmap` references none. |
+| FEMA Upper Guadalupe eBFE (12100201) | `RasEbfeModels.organize_model("upper-guadalupe")` | Four cascading HEC-RAS 6.3.1 2D unsteady projects, each with seven plans. Four exact API-derived model footprints and durable UPGU1–UPGU4 deficiency links are published here. UPGU1 `p01` reached owned unsteady-solver startup in a fresh two-core run. UPGU2's receipt records `natural_completion` without owned solver-start evidence after property-table rebuilding was observed; UPGU3–UPGU4 were not attempted. Supplied plan HDFs remain published artifacts, not fresh execution evidence. | The archive is CRC-clean and includes all four modified-terrain triplets. UPGU1–UPGU3 retain channel modifications; UPGU4 retains channel and polygon modifications. Reconstruction applies 344 unique staged actions and rewrites 224 fixed-length HDF association attributes, including 28 geometry-HDF attributes omitted by the source audit. Twenty-one omitted files are display/result/QC assets and do not include terrain or hydraulic startup inputs. |
+| Alabama Middle Chattahoochee–Lake Harding BLE (AL03130002) | `AlabamaBleModels.organize_watershed("03130002", ...)` | One portable delivery contains 197 1D steady projects in eight source basins, 197 registered plans and geometry HDFs, and 5,365 cross sections. The landing outline is the union of all individual model footprints; one staged PMTiles derivative combines their geometry. This is source and geometry evidence only; no plan computation or result viewer has been qualified. | The publisher's bare object-store prefixes return 404, so discovery must join the Alabama ArcGIS model and link records and use only each link's public `WebPath`. One extra physical plan file, `OSANIPPA CREEK.p02`, is not registered by its project. Delivered plan metadata records 135 projects at 6.20, two at 6.31, and omits the version for 60. |
+| FEMA Pedernales eBFE (12090206) | `RasEbfeModels.organize_model("pedernales")` | One HUC8-level discovery entry represents 530 independent HEC-RAS 4.1 1D steady projects. The landing outline is the exact union of all 530 active geometry footprints, derived through `HdfProject` from compiled geometry HDF where delivered and the plain-text fallback otherwise. All 530 selected `p01` runs passed in isolated two-core HEC-RAS 6.6 copies. | Eight delivered HDF/compute-message assets require exact-copy placement in three referenced project folders. Terrain is not applicable to this pure 1D steady corpus. HEC-RAS 4.1 was unavailable, so qualification does not assert native-version numerical equivalence. No hosted four-layer geometry PMTiles or completed-result viewer is claimed. |
+| FEMA Cibolo eBFE (12100304) | `RasEbfeModels.organize_model("cibolo")` | One HEC-RAS 5.0.7 2D unsteady project with seven plans. Its exact API-derived `g05` footprint is shown here; the organizer closes the active `p14` source references, and `p14` reached owned unsteady-solver startup with two cores. This entry does not claim completed results. | The delivered compiled terrain and land cover are present and no terrain modification groups are referenced. Reconstruction extracts the nested delivery, relocates seven DSS assets, rewrites seven active DSS paths, and corrects the RASMapper projection path. Five remaining references are backup/display-only. |
+| FEMA Medina eBFE (12100302) | `RasEbfeModels.organize_model("medina")` | One grouped row retains five exact API-derived 2D model polygons. Leon1, Leon2, Leon3, and Middle/Lower Medina are source-complete and each selected plan reached owned unsteady-solver startup with two cores. Upper Medina Headwaters remains visibly blocked and is not represented as qualified. | **Critical, model-blocking source gap for Upper Medina Headwaters:** its active geometry requires a compiled `Terrain.hdf` with `UpperMedinaHW_TerrainModifications`, but that file is absent. The other four projects include their compiled channel-modified terrain. The publisher ZIP is also truncated inside one supplied Upper Medina result HDF; that separate result defect is not the hydraulic source blocker. |
+
+San Gabriel retains `unsteady_start` evidence but has delivery-readiness status
+`critical_source_gap`. It must not be published as a runnable example until the
+original compiled terrain, or complete source-equivalent terrain/modification
+inputs, are recovered and verified and the remaining publication gates pass.
+The organizer normalizes all five
+`.rasmap` files so their 40 terrain and modification references resolve to the
+single expected organized target, `RAS Model\Terrain\Terrain.hdf`, and creates
+a durable [Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-05_san_gabriel_record_of_deficiencies.md)
+for any explicitly authorized reconstruction.
+
+Double Mountain Fork Brazos keeps its supplied compiled terrain intact. In
+particular, DMF2's modified `Terrain.Clone (1).hdf` is not missing and must not
+be silently replaced by the unmodified terrain. The first organizer incorrectly
+redirected valid outer terrain and land-cover references to incomplete `Input`
+copies; identical Geometry Writer failures on network and local-disk validation
+copies proved this was not a network/path-length problem. The specialized
+organizer now preserves the delivered outer references. Its
+[Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-11_double_mountain_fork_brazos_record_of_deficiencies.md)
+records the four-project chain, deterministic assembly repairs, 4/4 native
+unsteady-start qualification, and the remaining publication gates.
+
+Middle Chattahoochee–Lake Harding is deliberately represented by one outline
+and one table row, not 197 dashboard entries. Its combined geometry PMTiles
+must remain separate from the canonical, portable FIM inventory and will load
+only after the staged archive is published at a validated HTTP byte-range URL.
+The [Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-12_middle_chattahoochee_lake_harding_alabama_ble_record_of_deficiencies.md)
+records the source enumeration constraint, the orphan plan file, mixed version
+metadata, immutable source layout, and the current no-computation boundary.
+
+Austin–Oyster is qualified for source/geometry discovery and an unsteady-start
+example claim, but not for a completed-results viewer. The
+[Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-23_austin_oyster_record_of_deficiencies.md)
+reconciles the webmap's proposed 29 metadata edits with the independent finding
+that all 28 HDF attributes were already correct, records the two display-only
+omissions, and preserves the independent CEWS pre-compute evidence.
+
+Upper Guadalupe is represented by four exact project polygons and one grouped
+suite row. The [Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-25_upper_guadalupe_record_of_deficiencies.md)
+records the single-archive reconstruction, confirms delivery of hydraulically
+material terrain modifications, separates supplied result artifacts from fresh
+runtime evidence, records UPGU1's successful `p01` pre-compute gate, and keeps
+UPGU2–UPGU4 explicitly unqualified. Until a
+hosted viewer is requalified, the suite and its four subprojects link to that
+durable record rather than dead viewer manifests.
+
+Pedernales is represented by one exact union outline and one table row, not 530
+dashboard rows. The [Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-25_pedernales_record_of_deficiencies.md)
+keeps source organization, per-project execution, and corpus-wide acceptance
+as separate gates. A combined geometry archive remains a local staging product
+until it has a real immutable public URL and passes the PMTiles layer, zoom,
+metadata, and HTTP byte-range validators.
+
+Cibolo's [Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-25_cibolo_record_of_deficiencies.md)
+records the nested extraction, active DSS and projection repairs, delivered
+terrain finding, and bounded execution evidence. Its dashboard link remains a
+source-evidence link rather than a result-viewer link.
+
+Medina is represented by five exact polygons and one grouped suite row. Its
+[Record of Deficiencies](https://github.com/gpt-cmdr/ras-commander/blob/main/agent_tasks/2026-09-25_medina_record_of_deficiencies.md)
+distinguishes the four source-complete projects from Upper Medina Headwaters.
+The latter's footprint is useful discovery geometry, but does not make the
+model runnable: the missing compiled modified terrain is a critical 2D source
+gap.
 
 ## Related Workflows
 

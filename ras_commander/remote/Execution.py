@@ -13,12 +13,12 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from numbers import Integral, Real
-from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 from .RasWorker import RasWorker
 from ..LoggingConfig import get_logger
 from ..Decorators import log_call
+from ..RasCurrency import RasCurrency
 
 logger = get_logger(__name__)
 
@@ -32,7 +32,10 @@ class ExecutionResult:
         plan_number: Plan number that was executed
         worker_id: ID of worker that executed the plan
         success: True if execution completed successfully
-        hdf_path: Path to output HDF file (if successful)
+        hdf_path: Path to the output HDF when ``result_format == "hdf"``;
+            ``None`` for legacy results
+        result_path: Path to the selected HDF or legacy output artifact
+        result_format: ``"hdf"`` or ``"legacy"`` when one family exists
         error_message: Error message (if failed)
         execution_time: Time in seconds for execution
     """
@@ -42,6 +45,8 @@ class ExecutionResult:
     hdf_path: Optional[str] = None
     error_message: Optional[str] = None
     execution_time: float = 0.0
+    result_path: Optional[str] = None
+    result_format: Optional[str] = None
 
 
 def _effective_worker_capacity(worker: RasWorker, num_cores: int) -> int:
@@ -97,10 +102,10 @@ def compute_parallel_remote(
     Args:
         plan_numbers: Single plan number or list of plan numbers to execute
         workers: List of initialized worker objects (from init_ras_worker)
-        ras_object: RasPrj object for the project. If None, uses global ras.
+        ras_object (RasPrj, optional): RasPrj object for the project. If None, uses global ras.
         num_cores: Number of cores to allocate per plan execution
         clear_geompre: Clear geometry preprocessor files (.c## files) before execution
-        force_geompre: Force full geometry reprocessing (clears both .g##.hdf AND .c## files)
+        force_geompre: Clear cached geometry products in place and force execution
         force_rerun: Force execution even if results are current. When False (default),
             checks file modification times and skips if results are current.
         max_concurrent: Maximum concurrent executions (default: sum of all worker slots)
@@ -422,7 +427,7 @@ def _execute_single_plan(
         ras_object: RAS project object
         num_cores: Number of cores
         clear_geompre: Clear geompre files (.c## only)
-        force_geompre: Force full geometry reprocessing (clears .g##.hdf AND .c##)
+        force_geompre: Clear cached geometry products in place and force execution
         force_rerun: Force execution even if results are current
         sub_worker_id: Sub-worker ID for multi-slot workers
         autoclean: Delete temporary worker folder after execution
@@ -457,8 +462,7 @@ def _execute_single_plan(
             result.success = success
 
             if success:
-                project_name = ras_object.project_name
-                hdf_file = Path(ras_object.project_folder) / f"{project_name}.p{plan_number}.hdf"
+                hdf_file = RasCurrency.get_plan_hdf_path(plan_number, ras_object)
                 if hdf_file.exists():
                     result.hdf_path = str(hdf_file)
 
@@ -479,16 +483,9 @@ def _execute_single_plan(
             result.success = success
 
             if success:
-                project_name = ras_object.project_name
-                hdf_file = Path(ras_object.project_folder) / f"{project_name}.p{plan_number}.hdf"
+                hdf_file = RasCurrency.get_plan_hdf_path(plan_number, ras_object)
                 if hdf_file.exists():
                     result.hdf_path = str(hdf_file)
-
-        elif worker.worker_type == "ssh":
-            result.error_message = "SSH worker not yet implemented"
-
-        elif worker.worker_type == "winrm":
-            result.error_message = "WinRM worker not yet implemented"
 
         elif worker.worker_type == "docker":
             from .DockerWorker import execute_docker_plan
@@ -504,30 +501,33 @@ def _execute_single_plan(
             result.success = success
 
             if success:
-                project_name = ras_object.project_name
-                hdf_file = Path(ras_object.project_folder) / f"{project_name}.p{plan_number}.hdf"
+                hdf_file = RasCurrency.get_plan_hdf_path(plan_number, ras_object)
                 if hdf_file.exists():
                     result.hdf_path = str(hdf_file)
                 else:
                     # Check for .tmp.hdf (Linux container output)
-                    tmp_hdf = Path(ras_object.project_folder) / f"{project_name}.p{plan_number}.tmp.hdf"
+                    tmp_hdf = hdf_file.with_name(f"{hdf_file.stem}.tmp.hdf")
                     if tmp_hdf.exists():
                         result.hdf_path = str(tmp_hdf)
-
-        elif worker.worker_type == "slurm":
-            result.error_message = "Slurm worker not yet implemented"
-
-        elif worker.worker_type == "aws_ec2":
-            result.error_message = "AWS EC2 worker not yet implemented"
-
-        elif worker.worker_type == "azure_fr":
-            result.error_message = "Azure worker not yet implemented"
 
         else:
             result.error_message = f"Unknown worker type: {worker.worker_type}"
 
-    except NotImplementedError as e:
-        result.error_message = str(e)
+        if result.success:
+            project_name = ras_object.project_name
+            hdf_file = RasCurrency.get_plan_hdf_path(plan_number, ras_object)
+            project_folder = hdf_file.parent
+            canonical_plan = hdf_file.stem.removeprefix(f"{project_name}.p")
+            legacy_file = project_folder / f"{project_name}.O{canonical_plan}"
+            if hdf_file.is_file() and not legacy_file.is_file():
+                result.result_path = str(hdf_file)
+                result.result_format = "hdf"
+                result.hdf_path = str(hdf_file)
+            elif legacy_file.is_file() and not hdf_file.is_file():
+                result.result_path = str(legacy_file)
+                result.result_format = "legacy"
+                result.hdf_path = None
+
     except Exception as e:
         result.error_message = f"Execution error: {e}"
         logger.exception(f"Error executing plan {plan_number} on {worker.worker_id}")

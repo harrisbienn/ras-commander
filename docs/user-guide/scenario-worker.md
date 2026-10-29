@@ -1,5 +1,37 @@
 # Scenario Worker
 
+## Upstream integration compatibility
+
+Scenario preparation removes inactive inherited DSS boundaries through an
+owned editing stage. The stage inventories execution assets but always records
+`execution_readiness="not_ready"`; it cannot establish compute readiness.
+Project, plan, geometry-text and flow-text references, copied bytes, source
+identity and exact boundary checksums remain required. Selected removals use
+one atomic transaction. The preparer verifies the original clone before
+publishing the edited unsteady file and then runs workspace validation.
+
+When inactive boundaries exist, allow disk space for one additional temporary
+project copy. Successful preparation keeps `boundary-edit-evidence.json` with
+file counts, sizes, checksums and mutation evidence. Failed operations can
+retain an isolated `.boundary-edit-*` directory for diagnosis; they do not
+authorize execution.
+
+Materialized flow inputs retain exact-once QMult handling and newline
+preservation. DSS grid copying accepts a zero-length tail for copy/translation
+workflows. Long translations and hydraulic product exports retain Year 3000
+timestamps. Existing hydraulic product keys and hydrograph columns remain
+stable. Upstream square raster grids and physical-cell filtering can change
+pixels relative to older exports; compare and accept derivatives before
+replacing published products. Source HDF files remain read only.
+
+The historical direct-path `RasUnsteady.delete_boundary()` interface is rejected;
+use an owned stage and exact inventory evidence. Land-cover edits require the
+native writer's explicit HEC-RAS version or initialized project context. Legacy
+study scripts that omit this context need migration before using the candidate.
+Model execution and engineering acceptance remain separate gates.
+
+## Worker contract
+
 `ras-scenario-worker` is the package-owned process boundary for one isolated
 HEC-RAS scenario. It lets an orchestrator invoke RAS Commander from a dedicated
 RAS environment without importing RAS Commander into the orchestrator.

@@ -11,6 +11,18 @@
 #       category: project_management | workers | callbacks | data_containers | utilities
 
 exception_classes:
+  - class_name: FimPreparedSlopingModel
+    module: ras_commander.fim._sloping_context
+    reason: |
+      Owns immutable staged mesh/profile inputs, retained cell geometry, source
+      identities and a lock across repeated reach requests. Context-manager and
+      explicit close semantics release its temporary files and geometry.
+    category: utilities
+    instantiation_required: true
+    example: |
+      with RasFim.prepare_sloping_model(hdf_path, terrain_path) as model:
+          products = model.map_profiles(output_folder, bbox=bounds)
+
   # ============================================================================
   # PROJECT MANAGEMENT
   # ============================================================================
@@ -76,24 +88,6 @@ exception_classes:
           docker_image='hecras:6.6',
           preprocess_on_host=True
       )
-
-  - class_name: SshWorker
-    module: ras_commander.remote.SshWorker
-    reason: |
-      Future worker for SSH-based remote execution. Maintains SSH connection state,
-      remote file paths, and execution queue.
-    category: workers
-    instantiation_required: true
-    status: planned
-
-  - class_name: WinrmWorker
-    module: ras_commander.remote.WinrmWorker
-    reason: |
-      Future worker for Windows Remote Management execution. Maintains WinRM session
-      state and execution queue.
-    category: workers
-    instantiation_required: true
-    status: planned
 
   # ============================================================================
   # EXECUTION CALLBACKS
@@ -183,6 +177,21 @@ exception_classes:
     instantiation_required: false
     note: Enum class, typically not instantiated directly
 
+  - class_name: TerrainBuildError
+    module: ras_commander.terrain.Usgs3depAws
+    reason: |
+      Exception raised by Usgs3depAws.build_terrain_raster() when a single-raster
+      terrain cannot be delivered. Carries a stable reason_code and JSON-serializable
+      details (nodata pixel count, uncovered bounds, sample locations, receipt path)
+      so callers can branch on the failure without parsing messages.
+    category: data_containers
+    instantiation_required: true
+    example: |
+      try:
+          Usgs3depAws.build_terrain_raster("terrain.tif", "EPSG:2277", geom_path="Model.g01")
+      except TerrainBuildError as error:
+          print(error.reason_code, error.details["nodata_pixel_count"])
+
   # ============================================================================
   # UTILITY CLASSES (State Required)
   # ============================================================================
@@ -211,6 +220,90 @@ exception_classes:
     note: |
       Primarily used as static class: LoggingConfig.setup_logging()
       Instantiation allowed for advanced custom configurations
+
+# ============================================================================
+# MODULE-LEVEL FUNCTION EXCEPTIONS (Static Class Pattern)
+# ============================================================================
+# Public functions intentionally exported as module-level callables rather
+# than static-class methods. Each still uses @log_call and Union[str, Path].
+exception_functions:
+  - function_name: validate_steady_results
+    module: ras_commander.remote.PortableExecution
+    reason: |
+      Stable top-level contract (``from ras_commander import validate_steady_results``)
+      consumed by fim-commander's local plan execution backend, and the same
+      module-level definition used by the portable execution entry point on the
+      c05a-mesh-depth line. Keeping it a function avoids a second spelling of
+      the same API when that line is reconciled with main.
+    category: execution_validation
+    standardize_input: |
+      Not applied: the function converts both paths with Path() and must fail
+      closed (reason code STEADY_RESULTS_UNREADABLE) instead of raising on
+      unresolvable inputs.
+
+  - function_name: validate_unsteady_results
+    module: ras_commander.remote.PortableExecution
+    reason: |
+      Unsteady counterpart of validate_steady_results, chosen by the portable
+      execution entry point for plans whose flow file is .u##. Kept a
+      module-level function beside it so both validators share one spelling
+      and one top-level import (``from ras_commander import
+      validate_unsteady_results``).
+    category: execution_validation
+    standardize_input: |
+      Not applied: the function converts its paths with Path() and must fail
+      closed (reason code UNSTEADY_RESULTS_UNREADABLE) instead of raising on
+      unresolvable inputs.
+
+  - function_name: execute_request
+    module: ras_commander.remote.PortableExecution
+    reason: |
+      In-container entry point for one portable steady request, shared with the
+      c05a-mesh-depth line so that both lines have one definition to reconcile.
+      RasPortableDocker.execute_request and RasSlurm are the class-based callers.
+      Not re-exported from ras_commander.remote, where that name is the CLI module.
+    category: execution_contract
+    standardize_input: &portable_paths |
+      Not applied: request, receipt, bundle, and output paths are converted with
+      Path(...).resolve() and must be rejected (symbolic links, paths escaping
+      the request directory, mount delimiters) rather than normalized.
+
+  - function_name: validate_execution_receipt
+    module: ras_commander.remote.ExecutionContract
+    reason: |
+      Stateless check that binds a v1 receipt to its v1 request. Kept module-level
+      beside the request/receipt dataclasses so the JSON contract and its
+      validator live in one importable module used by Docker, Slurm, and callers.
+    category: execution_contract
+    standardize_input: *portable_paths
+
+  - function_name: sha256_file, sha256_tree, atomic_write_json, utc_now
+    module: ras_commander.remote.ExecutionContract
+    reason: |
+      Contract primitives imported by RasSlurm and PortableExecution and not
+      exported from ras_commander or ras_commander.remote. @log_call is omitted:
+      sha256_tree walks whole project trees and per-call debug logging adds noise
+      without caller value.
+    category: execution_contract
+    standardize_input: *portable_paths
+
+  - function_name: build_parser, main
+    module: ras_commander.remote.execute_request
+    reason: |
+      Command-line module run as `python -m ras_commander.remote.execute_request
+      execute-request <request.json>` by Docker and the Slurm launcher. main()
+      converts every exception to an exit code, so @log_call adds nothing.
+    category: cli
+
+  - function_name: run, main
+    module: ras_commander.remote.portable_slurm_launcher
+    reason: |
+      Standalone stdlib-only script copied byte-for-byte into each Slurm
+      submission (its SHA-256 is recorded in the batch and checked by sbatch).
+      It must not import ras_commander, so @log_call and @standardize_input
+      cannot be used, and its bytes are kept identical to the launcher used by
+      retained production submissions.
+    category: cli
 
 # ============================================================================
 # AUDITOR RULES

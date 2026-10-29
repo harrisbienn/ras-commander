@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import stat
+import tempfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
@@ -67,12 +70,40 @@ GEOMETRY_ASSOCIATION_FIELDS: Dict[str, Dict[str, Any]] = {
 FIELD_ORDER = tuple(GEOMETRY_ASSOCIATION_FIELDS)
 _WINDOWS_ENV_VAR_PATTERN = re.compile(r"%([^%]+)%")
 _PLAN_OR_RESULT_HDF_PATTERN = re.compile(r"\.[pou]\d{2}\.hdf$", re.IGNORECASE)
+_MAX_GLOBAL_TO_2D_EXTENT_SPAN_RATIO = 1000.0
 
 
 def safe_resolve_path(path: PathLike) -> Path:
     """Resolve a path without requiring it to exist."""
     return RasUtils.safe_resolve(Path(path))
 
+
+def _strip_extended_prefix(text: str) -> str:
+    """Drop a Windows extended-length prefix (\\\\?\\ or \\\\?\\UNC\\)."""
+    if text.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + text[8:]
+    if text.startswith("\\\\?\\"):
+        return text[4:]
+    return text
+
+
+def _unredirected_path(path: PathLike) -> Path:
+    """Return the supplied file's resolved path, refusing any redirection.
+
+    The fully resolved path must equal the absolute path as supplied (after
+    removing extended-length prefixes and normalizing case). Any redirection,
+    whether a symbolic link, a junction at any depth, a SUBST drive or another
+    mapped alias, changes the resolved path and raises ValueError before any
+    write. The file must exist. Nothing is written.
+    """
+    supplied = _strip_extended_prefix(os.path.abspath(os.fspath(path)))
+    resolved = _strip_extended_prefix(str(Path(os.fspath(path)).resolve(strict=True)))
+    if os.path.normcase(resolved) != os.path.normcase(supplied):
+        raise ValueError(
+            "infiltration clearing refuses a redirected path "
+            f"(supplied {supplied}, resolves to {resolved})"
+        )
+    return Path(resolved)
 
 def decode_hdf_attr(value: Any) -> Optional[str]:
     """Decode an HDF attribute value to a clean string."""
@@ -162,6 +193,88 @@ def ensure_geometry_group(hdf_path: PathLike) -> None:
             raise RuntimeError(f"HDF is missing the /Geometry group: {hdf_path}")
 
 
+def validate_geometry_extents_for_2d_classification(hdf_path: PathLike) -> None:
+    """Reject pathological global extents before spatial classification.
+
+    HEC-RAS uses the top-level ``/Geometry`` extents while preparing spatial
+    land-cover and infiltration values. An absurd but technically containing
+    viewing rectangle can leave a run partial and its placeholder class arrays
+    indistinguishable from real output. Compare the global span with the union
+    of authoritative per-2D-area extents and fail with a repair path.
+    """
+    import h5py
+
+    from .fast_hdf import read_attr
+
+    hdf_path = safe_resolve_path(hdf_path)
+    with h5py.File(str(hdf_path), "r") as hdf_file:
+        geometry = hdf_file.get("Geometry")
+        flow_areas = hdf_file.get("Geometry/2D Flow Areas")
+        if geometry is None or flow_areas is None:
+            return
+
+        area_extents: list[np.ndarray] = []
+        for area in flow_areas.values():
+            values = np.asarray(read_attr(area, "Extents", []), dtype=float)
+            if (
+                values.shape == (4,)
+                and np.isfinite(values).all()
+                and values[1] > values[0]
+                and values[3] > values[2]
+            ):
+                area_extents.append(values)
+        if not area_extents:
+            return
+
+        two_d_union = np.asarray(
+            [
+                min(values[0] for values in area_extents),
+                max(values[1] for values in area_extents),
+                min(values[2] for values in area_extents),
+                max(values[3] for values in area_extents),
+            ],
+            dtype=float,
+        )
+        global_extents = np.asarray(read_attr(geometry, "Extents", []), dtype=float)
+
+    invalid = (
+        global_extents.shape != (4,)
+        or not np.isfinite(global_extents).all()
+        or global_extents[1] <= global_extents[0]
+        or global_extents[3] <= global_extents[2]
+    )
+    if not invalid:
+        global_span = np.asarray(
+            [
+                global_extents[1] - global_extents[0],
+                global_extents[3] - global_extents[2],
+            ]
+        )
+        two_d_span = np.asarray(
+            [two_d_union[1] - two_d_union[0], two_d_union[3] - two_d_union[2]]
+        )
+        span_ratio = global_span / two_d_span
+        invalid = bool(
+            (span_ratio > _MAX_GLOBAL_TO_2D_EXTENT_SPAN_RATIO).any()
+            or global_extents[0] > two_d_union[0]
+            or global_extents[1] < two_d_union[1]
+            or global_extents[2] > two_d_union[2]
+            or global_extents[3] < two_d_union[3]
+        )
+
+    if invalid:
+        geom_text = Path(str(hdf_path)[:-4])
+        raise RuntimeError(
+            "Geometry global extents are invalid or pathological relative to "
+            f"the 2D flow areas in {hdf_path.name}. Global="
+            f"{global_extents.tolist()}, 2D union={two_d_union.tolist()}. "
+            "Repair the full mixed-geometry bounds, or for a confirmed 2D-only "
+            "project explicitly call "
+            "GeomStorage.repair_viewing_rectangle_from_2d_areas("
+            f"{str(geom_text)!r}) before associating classification layers."
+        )
+
+
 def _field_attr_names() -> tuple[str, ...]:
     attrs = ["SI Units"]
     for field in GEOMETRY_ASSOCIATION_FIELDS.values():
@@ -184,12 +297,14 @@ def read_geometry_association(
     hdf_path = safe_resolve_path(hdf_path)
     ensure_geometry_group(hdf_path)
 
+    from .fast_hdf import read_attr
+
     association: dict[str, Any] = {}
     with h5py.File(str(hdf_path), "r") as hdf_file:
-        attrs = hdf_file["Geometry"].attrs
+        geometry = hdf_file["Geometry"]
         raw_attrs = {}
         for attr_name in _field_attr_names():
-            attr_value = decode_hdf_attr(attrs.get(attr_name))
+            attr_value = decode_hdf_attr(read_attr(geometry, attr_name, None))
             if attr_value is not None:
                 raw_attrs[attr_name] = attr_value
 
@@ -229,21 +344,32 @@ def read_geometry_association(
 
 
 def _read_two_d_area_terrain_associations(hdf_file, hdf_path: Path, resolve_paths: bool):
+    import h5py
+
+    from .fast_hdf import read_attr
+
     area_records = []
     flow_areas = hdf_file.get("Geometry/2D Flow Areas")
     if flow_areas is None:
         return area_records
 
     for area_name, area_group in flow_areas.items():
-        raw_filename = decode_hdf_attr(area_group.attrs.get("Terrain Filename"))
+        # HEC-RAS stores collection-level tables (Attributes, Cell Info,
+        # Polygon Points, and related arrays) beside the named flow-area
+        # groups.  Only groups represent individual 2D flow areas.  Filtering
+        # by HDF object type also retains legitimate areas whose optional
+        # terrain-association attributes have not yet been populated.
+        if not isinstance(area_group, h5py.Group):
+            continue
+        raw_filename = decode_hdf_attr(read_attr(area_group, "Terrain Filename", None))
         record = {
             "flow_area": area_name,
             "terrain_raw_filename": raw_filename,
             "terrain_layer_name": decode_hdf_attr(
-                area_group.attrs.get("Terrain Layername")
+                read_attr(area_group, "Terrain Layername", None)
             ),
             "terrain_file_date": decode_hdf_attr(
-                area_group.attrs.get("Terrain File Date")
+                read_attr(area_group, "Terrain File Date", None)
             ),
         }
         if raw_filename:
@@ -263,6 +389,8 @@ def list_registered_rasmap_layers(
     rasmap_path: Optional[PathLike] = None,
 ) -> list[dict[str, Any]]:
     """List terrain and land-classification layer names registered in .rasmap."""
+    from . import _rasmap_layer_helper as _mlh
+
     project_folder = safe_resolve_path(project_folder)
     rasmap_path = Path(rasmap_path) if rasmap_path is not None else None
     if rasmap_path is None:
@@ -287,25 +415,23 @@ def list_registered_rasmap_layers(
             }
         )
 
-    map_layers = root.find("MapLayers")
-    if map_layers is not None:
-        for layer in map_layers.findall("Layer"):
-            if layer.attrib.get("Type") != "LandCoverLayer":
-                continue
-            filename = layer.attrib.get("Filename")
-            resolved_path = _resolve_rasmap_filename(project_folder, filename)
-            records.append(
-                {
-                    "name": layer.attrib.get("Name", ""),
-                    "type": layer.attrib.get("Type", ""),
-                    "filename": filename,
-                    "resolved_path": str(resolved_path) if resolved_path else None,
-                    "layer_kind": _infer_land_classification_kind(
-                        filename,
-                        _get_selected_parameter(layer),
-                    ),
-                }
-            )
+    for layer in _mlh.top_level_map_layers(root):
+        if layer.attrib.get("Type") not in _mlh.LAND_CLASSIFICATION_LAYER_TYPES:
+            continue
+        filename = layer.attrib.get("Filename")
+        resolved_path = _resolve_rasmap_filename(project_folder, filename)
+        records.append(
+            {
+                "name": layer.attrib.get("Name", ""),
+                "type": layer.attrib.get("Type", ""),
+                "filename": filename,
+                "resolved_path": str(resolved_path) if resolved_path else None,
+                "layer_kind": _infer_land_classification_kind(
+                    filename,
+                    _get_selected_parameter(layer),
+                ),
+            }
+        )
 
     return records
 
@@ -317,7 +443,11 @@ def resolve_registered_layer_name(
     project_folder: Optional[PathLike] = None,
     rasmap_path: Optional[PathLike] = None,
 ) -> str:
-    """Resolve the RASMapper layer name for a path, falling back to its stem."""
+    """Resolve a RASMapper display name for discovery and UI reporting.
+
+    Geometry-association attributes do not use this display label. Native
+    HEC-RAS derives those layer names from the associated HDF filename stem.
+    """
     target = safe_resolve_path(target_path)
     if project_folder is not None or rasmap_path is not None:
         project = safe_resolve_path(project_folder or Path(rasmap_path).parent)
@@ -357,12 +487,13 @@ def build_expected_geometry_association_attrs(
             continue
         field = GEOMETRY_ASSOCIATION_FIELDS[key]
         resolved_path = safe_resolve_path(path_value)
-        layer_name = layer_names.get(key) or resolve_registered_layer_name(
-            resolved_path,
-            field["layer_kind"],
-            project_folder=project_folder,
-            rasmap_path=rasmap_path,
-        )
+        # RasMapper's SetGeometryAssociation command constructs each associated
+        # layer from the HDF filename. Its /Geometry "... Layername" attributes
+        # therefore use Path.stem, not the independently configurable display
+        # label in the project .rasmap. This is consistent in HEC-RAS 6.6 and
+        # 7.0. Retain an explicit layer_names override for compatibility, but
+        # make the default authoring path native-equivalent.
+        layer_name = layer_names.get(key) or resolved_path.stem
         file_date = format_hec_file_date(resolved_path)
 
         expected[field["filename_attr"]] = format_hec_relative_path(
@@ -424,6 +555,11 @@ def write_geometry_association(
         resolved_paths[key] = resolved_path
 
     ensure_geometry_group(hdf_path)
+    if {
+        "landcover_hdf_path",
+        "infiltration_hdf_path",
+    }.intersection(resolved_paths):
+        validate_geometry_extents_for_2d_classification(hdf_path)
     expected_attrs = build_expected_geometry_association_attrs(
         hdf_path,
         resolved_paths,
@@ -539,6 +675,49 @@ def compare_geometry_association_paths(
     return mismatches
 
 
+def landcover_association_diagnostic(hdf_path: PathLike) -> Optional[str]:
+    """Return a non-fatal diagnostic for a missing or broken land-cover link.
+
+    HEC-RAS can successfully complete property-table generation while falling
+    back to the 2D flow area's scalar Manning value.  A registered layer in
+    ``.rasmap`` is not sufficient: the compiled geometry HDF must contain a
+    valid ``Land Cover Filename`` association.
+    """
+    hdf_path = safe_resolve_path(hdf_path)
+    try:
+        association = read_geometry_association(hdf_path, resolve_paths=True)
+    except Exception as exc:
+        from .fast_hdf import reraise_required
+
+        reraise_required(exc)
+        return (
+            f"Could not inspect the land-cover association on {hdf_path.name}: "
+            f"{exc}. Property-table completion alone does not prove that "
+            "spatial Manning values reached 'Cells Center Manning's n'."
+        )
+
+    raw_filename = association.get("landcover_raw_filename")
+    resolved_path = association.get("landcover_hdf_path")
+    if not raw_filename or not resolved_path:
+        return (
+            f"No land-cover association is stored on {hdf_path.name}. HEC-RAS "
+            "may still report property-table success while using the 2D flow "
+            "area's default Manning value for every cell. Associate the exact "
+            "land-cover HDF before recomputing and manually review the final "
+            "plan HDF 'Cells Center Manning's n' values."
+        )
+
+    if not Path(resolved_path).exists():
+        return (
+            f"The land-cover association on {hdf_path.name} resolves to a "
+            f"missing file: {resolved_path}. HEC-RAS may fall back to the 2D "
+            "flow area's default Manning value. Repair the association and "
+            "manually review the final plan HDF 'Cells Center Manning's n' "
+            "values."
+        )
+    return None
+
+
 def _resolve_rasmap_filename(
     project_folder: Path,
     filename: Optional[Union[str, Path]],
@@ -593,3 +772,220 @@ def _paths_equivalent(first: PathLike, second: PathLike) -> bool:
         return safe_resolve_path(first) == safe_resolve_path(second)
     except (OSError, RuntimeError, TypeError, ValueError):
         return os.path.normcase(str(first)) == os.path.normcase(str(second))
+
+
+def _protect_windows_backup_acl(source: Path, backup: Path) -> None:
+    """Apply the source DACL before writing backup contents on Windows."""
+    import ctypes
+    from ctypes import wintypes
+
+    api = ctypes.WinDLL("advapi32", use_last_error=True)
+    api.GetFileSecurityW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    api.GetFileSecurityW.restype = wintypes.BOOL
+    api.SetFileSecurityW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    )
+    api.SetFileSecurityW.restype = wintypes.BOOL
+    needed = wintypes.DWORD()
+    api.GetFileSecurityW(str(source), 4, None, 0, ctypes.byref(needed))
+    if not needed.value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    descriptor = ctypes.create_string_buffer(needed.value)
+    if not api.GetFileSecurityW(
+        str(source), 4, descriptor, len(descriptor), ctypes.byref(needed)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    # DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION:
+    # keep the source entries without adding the sibling directory's grants.
+    if not api.SetFileSecurityW(str(backup), 0x80000004, descriptor):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def clear_geometry_infiltration(hdf_path: PathLike) -> Path:
+    """Remove infiltration association from an attempt-owned geometry HDF.
+
+    Mutates only the supplied .gNN.hdf; rejects plan/result HDFs. Removes the
+    native infiltration filename, layer name and date attributes from
+    ``/Geometry`` and from every compiled ``/Geometry/2D Flow Areas/<area>``
+    group (which keeps its own copy, read first by the strict preprocessing
+    snapshot). Other area attributes, such as an override table hash, stay.
+    Every traversed member must be a hard link owned by the supplied file; a
+    soft or external link is rejected before any write, and so is a file
+    with more than one filesystem hard link (its bytes are shared) or a path
+    whose fully resolved form differs from the supplied absolute path (any
+    link, junction, SUBST drive or mapped alias). Existing
+    property tables remain stale until the caller rebuilds them. Terrain and
+    roughness associations, coordinates, CRS and units are unchanged.
+    Requires a directly linked /Geometry group owned by the supplied HDF.
+    Backs up the original bytes, edits and validates in place, and restores
+    those bytes on failure without replacing the original file object.
+    Returns the edited geometry path; an absent association is a byte-preserving
+    no-op. A process crash leaves .<stem>-infiltration-backup-*.hdf.bak beside
+    the geometry for recovery. Exclusive access by the caller is required.
+    """
+    import h5py
+
+    if not re.search(r"\.g\d{2}\.hdf$", Path(os.fspath(hdf_path)).name, re.IGNORECASE):
+        raise ValueError("infiltration clearing requires a .gNN.hdf geometry")
+    # Gates KU/KZ: any redirection (symbolic link, junction at any depth, SUBST
+    # drive, mapped alias) could send the edit to another geometry. Require the
+    # resolved path to be the supplied path, then edit only that path.
+    path = _unredirected_path(hdf_path)
+
+    def owned_geometry(handle):
+        # Inspect the link before dereferencing an external writable target.
+        link = handle.get("Geometry", getlink=True)
+        if link is None:
+            raise KeyError("Geometry")
+        if (
+            not isinstance(link, h5py.HardLink)
+            or handle.get("Geometry", getclass=True) is not h5py.Group
+        ):
+            raise ValueError("/Geometry must be a directly linked, file-owned HDF group")
+        geometry = handle["Geometry"]
+        if geometry.file.id != handle.id:
+            raise ValueError("/Geometry must be a directly linked, file-owned HDF group")
+        return geometry
+
+    field = GEOMETRY_ASSOCIATION_FIELDS["infiltration_hdf_path"]
+    attr_names = tuple(field[key] for key in ("filename_attr", "layer_attr", "date_attr"))
+    # Compiled 2D areas carry their own copy of the association; the strict
+    # preprocessing snapshot reads the area copy first, so clear both levels.
+    area_attr_names = (*attr_names, "Infiltration Date Last Modified")
+
+    def owned_member(group, name):
+        # Inspect each link before dereferencing it: a soft or external link
+        # could point into another file, which must never be read for editing.
+        link = group.get(name, getlink=True)
+        if not isinstance(link, h5py.HardLink):
+            # Documented API contract: layout problems raise ValueError.
+            raise ValueError(  # noqa: TRY004
+                f"{group.name}/{name} must be a directly linked, file-owned HDF object"
+            )
+        member = group[name]
+        if member.file.id != group.file.id:
+            raise ValueError(
+                f"{group.name}/{name} must be a directly linked, file-owned HDF object"
+            )
+        return member
+
+    def area_groups(geometry):
+        if geometry.get("2D Flow Areas", getlink=True) is None:
+            return []
+        areas = owned_member(geometry, "2D Flow Areas")
+        if not isinstance(areas, h5py.Group):
+            return []
+        members = [owned_member(areas, name) for name in areas]
+        return [member for member in members if isinstance(member, h5py.Group)]
+
+    def associated(geometry):
+        return any(name in geometry.attrs for name in attr_names) or any(
+            name in area.attrs for area in area_groups(geometry) for name in area_attr_names
+        )
+
+    with h5py.File(path, "r") as handle:
+        if not associated(owned_geometry(handle)):
+            return path
+
+    # Retain a handle to the original object for byte restoration; neither
+    # success nor rollback renames, replaces, or changes its security metadata.
+    with path.open("r+b") as original:
+        original_stat = os.fstat(original.fileno())
+        original_mode = stat.S_IMODE(original_stat.st_mode)
+        # A filesystem hard link shares bytes with another name (for example a
+        # delivered source geometry); editing it would edit that file too.
+        if original_stat.st_nlink > 1:
+            raise ValueError(
+                "infiltration clearing refuses a geometry with other hard links; "
+                "clear an independent copy"
+            )
+        # POSIX writes can clear set-ID bits. Refuse before writing if this
+        # user cannot reapply those bits to the existing file object.
+        if (
+            os.name != "nt"
+            and os.geteuid() != 0
+            and original_mode & (stat.S_ISUID | stat.S_ISGID)
+            and (
+                original_stat.st_uid != os.geteuid()
+                or (
+                    original_mode & stat.S_ISGID
+                    and original_stat.st_gid not in {*os.getgroups(), os.getegid()}
+                )
+            )
+        ):
+            raise PermissionError(
+                "geometry set-ID mode cannot be preserved by this user"
+            )
+
+        def flush_original():
+            original.flush()
+            if (
+                os.name != "nt"
+                and stat.S_IMODE(os.fstat(original.fileno()).st_mode) != original_mode
+            ):
+                os.fchmod(original.fileno(), original_mode)
+                if stat.S_IMODE(os.fstat(original.fileno()).st_mode) != original_mode:
+                    raise PermissionError("geometry mode could not be restored")
+            os.fsync(original.fileno())
+
+        descriptor, backup_name = tempfile.mkstemp(
+            prefix=f".{path.stem}-infiltration-backup-",
+            suffix=".hdf.bak",
+            dir=path.parent,
+        )
+        backup_path = Path(backup_name)
+        mutated = False
+        retain_backup = False
+        try:
+            with os.fdopen(descriptor, "w+b") as backup:
+                if os.name == "nt":
+                    _protect_windows_backup_acl(path, backup_path)
+                # mkstemp restricts POSIX backups to the current user. Do not
+                # copy mode/read-only flags onto the owned temporary sibling.
+                shutil.copyfileobj(original, backup)
+                backup.flush()
+                os.fsync(backup.fileno())
+                mutated = True  # Opening r+ can itself change HDF bytes.
+                with h5py.File(path, "r+") as handle:
+                    geometry = owned_geometry(handle)
+                    for name in attr_names:
+                        if name in geometry.attrs:
+                            del geometry.attrs[name]
+                    for area in area_groups(geometry):
+                        for name in area_attr_names:
+                            if name in area.attrs:
+                                del area.attrs[name]
+                with h5py.File(path, "r") as handle:
+                    if associated(owned_geometry(handle)):
+                        raise RuntimeError("infiltration association remained after clearing")
+                observed = read_geometry_association(path)
+                if observed.get("infiltration_hdf_path"):
+                    raise RuntimeError("infiltration association remained after clearing")
+                flush_original()
+            backup_path.unlink()
+        except BaseException:
+            if mutated:
+                try:
+                    with backup_path.open("rb") as backup:
+                        original.seek(0)
+                        original.truncate(0)
+                        shutil.copyfileobj(backup, original)
+                        flush_original()
+                except BaseException as restore_error:
+                    retain_backup = True
+                    raise RuntimeError(
+                        f"geometry byte restoration failed; recovery backup: {backup_path}"
+                    ) from restore_error
+            raise
+        finally:
+            if not retain_backup:
+                backup_path.unlink(missing_ok=True)
+    return path

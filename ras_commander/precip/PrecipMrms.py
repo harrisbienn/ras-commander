@@ -384,9 +384,27 @@ class PrecipMrms:
         Convert MRMS QPE grids to a spatial-mean HEC-RAS hyetograph.
 
         ``grib2_files`` may be GRIB2 paths or an already loaded xarray/numpy
-        grid stack. The output DataFrame matches
-        ``RasUnsteady.set_precipitation_hyetograph()`` with ``hour``,
-        ``incremental_depth``, and ``cumulative_depth`` columns.
+        grid stack. The output DataFrame contains absolute interval-ending
+        ``time`` values and the writer columns ``hour``, ``incremental_depth``,
+        and ``cumulative_depth``. Column compatibility does not set the native
+        boundary's absolute start time.
+
+        For a regular series with interval ``dt``, ``hour`` is ``dt, 2*dt, ...``
+        relative to ``time.iloc[0] - dt``. The interval is inferred from the
+        first two timestamps, or defaults to one hour for a single frame.
+        Callers must check regular, ordered source timestamps and the actual
+        accumulation period; this method does not align a simulation clock.
+
+        ``RasUnsteady.set_precipitation_hyetograph()`` uses the existing native
+        boundary start and ignores the optional ``time`` column. Align that
+        start with ``time.iloc[0] - dt``, or remove source frames ending at or
+        before the desired boundary start before conversion. If filtering the
+        returned DataFrame instead, rebase ``hour`` from that boundary start
+        and recompute ``cumulative_depth`` from the retained increments.
+        Do not apply a frame ending at the simulation start to the following
+        interval: its accumulation belongs to the preceding period. Check
+        absolute-time native cumulative output after writing; totals and peaks
+        alone cannot detect a one-interval timing shift.
         """
         import numpy as np
         import pandas as pd
@@ -430,26 +448,127 @@ class PrecipMrms:
         target_crs: Optional[str] = "EPSG:5070",
         resolution: Optional[float] = 2000.0,
         output_variable: str = "APCP_surface",
+        first_timestep_hours: Optional[float] = None,
+        end_time: Optional[Union[str, datetime]] = None,
     ) -> Path:
         """
         Export MRMS QPE grids to a HEC-RAS GDAL-raster NetCDF input.
 
-        The export path is intended for ``RasUnsteady.set_gridded_precipitation``.
-        MRMS depths are written in millimeters. When ``target_crs`` is provided,
-        rioxarray reprojects the WGS84 MRMS grid to that CRS before writing.
+        The export path is intended for ``RasUnsteady.set_gridded_precipitation``
+        with ``historic=True`` so a cloned design-storm plan cannot retain an
+        areal-reduction ratio.
+        MRMS interval-ending depths are accumulated in millimeters and a zero
+        cumulative frame is prepended so HEC-RAS does not treat the first QPE
+        amount as the import datum. When ``first_timestep_hours`` is omitted it
+        is inferred from a regular multi-frame time coordinate. ``end_time`` may
+        extend the forcing with flat cumulative frames through the plan end.
+        When ``target_crs`` is provided, rioxarray reprojects the WGS84 MRMS grid
+        before writing.
         """
+        import numpy as np
+        import pandas as pd
+        import xarray as xr
+
+        from ..RasPrecipHdf import RasPrecipHdf
+
         precip = PrecipMrms._prepare_precipitation_data(
             grib2_files,
             bounds=bounds,
             variable=variable,
         )
         precip_mm = PrecipMrms._convert_precip_units(precip, "mm")
+        if "time" not in precip_mm.dims:
+            raise ValueError("MRMS precipitation must include a time dimension")
+        source_times = pd.DatetimeIndex(pd.to_datetime(precip_mm["time"].values))
+        if source_times.has_duplicates or not source_times.is_monotonic_increasing:
+            raise ValueError("MRMS timestamps must be unique and strictly increasing")
+        if first_timestep_hours is None:
+            if len(source_times) < 2:
+                raise ValueError(
+                    "first_timestep_hours is required for a single MRMS frame"
+                )
+            interval_hours = np.asarray(
+                (source_times[1:] - source_times[:-1]) / pd.Timedelta(hours=1),
+                dtype=float,
+            )
+            if np.any(interval_hours <= 0.0) or not np.allclose(
+                interval_hours, interval_hours[0]
+            ):
+                raise ValueError(
+                    "first_timestep_hours is required when MRMS timestamps are irregular"
+                )
+            first_timestep_hours = float(interval_hours[0])
+        elif not np.isfinite(first_timestep_hours) or first_timestep_hours <= 0.0:
+            raise ValueError("first_timestep_hours must be a positive finite value")
+
+        cumulative, cumulative_times = RasPrecipHdf.convert_to_cumulative(
+            np.asarray(precip_mm.values),
+            source_times,
+            "amount",
+            first_timestep_hours=first_timestep_hours,
+        )
+        precip_mm = xr.DataArray(
+            cumulative,
+            dims=precip_mm.dims,
+            coords={
+                name: (
+                    pd.DatetimeIndex(cumulative_times)
+                    if name == "time"
+                    else precip_mm.coords[name]
+                )
+                for name in precip_mm.dims
+            },
+            name=output_variable,
+        )
+        storm_end = pd.Timestamp(source_times[-1])
+        zero_tail_frames = 0
+        if end_time is not None:
+            forcing_end = pd.Timestamp(end_time)
+            if forcing_end < storm_end:
+                raise ValueError("end_time cannot precede the last MRMS timestamp")
+            interval = pd.to_timedelta(float(first_timestep_hours), unit="h")
+            tail_times = pd.date_range(
+                storm_end + interval,
+                forcing_end,
+                freq=interval,
+            )
+            if len(tail_times) and tail_times[-1] != forcing_end:
+                raise ValueError(
+                    "end_time must align with the MRMS precipitation interval"
+                )
+            if forcing_end > storm_end and not len(tail_times):
+                raise ValueError(
+                    "end_time must align with the MRMS precipitation interval"
+                )
+            if len(tail_times):
+                tail_values = np.repeat(
+                    precip_mm.isel(time=-1).values[np.newaxis, ...],
+                    len(tail_times),
+                    axis=0,
+                )
+                tail = xr.DataArray(
+                    tail_values,
+                    dims=precip_mm.dims,
+                    coords={
+                        name: tail_times if name == "time" else precip_mm.coords[name]
+                        for name in precip_mm.dims
+                    },
+                    name=output_variable,
+                )
+                precip_mm = xr.concat([precip_mm, tail], dim="time")
+                zero_tail_frames = len(tail_times)
+        else:
+            forcing_end = storm_end
+
         precip_mm = precip_mm.rename(output_variable)
         precip_mm.attrs.update(
             {
                 "units": "mm",
-                "long_name": "MRMS QPE precipitation depth",
+                "long_name": "MRMS QPE cumulative precipitation depth",
+                "standard_name": "lwe_thickness_of_precipitation_amount",
                 "source": "NOAA Multi-Radar Multi-Sensor QPE",
+                "source_value_type": "amount",
+                "value_type": "cumulative",
             }
         )
 
@@ -473,7 +592,18 @@ class PrecipMrms:
 
         output_path = Path(output_netcdf)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        precip_mm.to_dataset(name=output_variable).to_netcdf(output_path)
+        output_dataset = precip_mm.to_dataset(name=output_variable)
+        output_dataset.attrs.update(
+            {
+                "first_timestep_hours": float(first_timestep_hours),
+                "storm_start": source_times[0].isoformat(),
+                "storm_end": storm_end.isoformat(),
+                "forcing_end": forcing_end.isoformat(),
+                "zero_tail_frames": int(zero_tail_frames),
+            }
+        )
+        output_dataset.to_netcdf(output_path)
+        output_dataset.close()
         return output_path
 
     @staticmethod
@@ -515,7 +645,7 @@ class PrecipMrms:
             title=title,
             value_label=f"Precipitation ({units})",
             units=units,
-            terrain=PrecipMrms._prepare_terrain_data(terrain) if terrain is not None else None,
+            terrain=terrain,
             boundary=boundary,
             mesh_boundary=mesh_boundary,
             pump_stations=pump_stations,
@@ -583,6 +713,12 @@ class PrecipMrms:
             )
 
         if isinstance(flood_data, (str, Path)):
+            if terrain is not None:
+                raise ValueError(
+                    "terrain overlays are not supported for the HDF point-cloud "
+                    "animation route. Export stored-map rasters and use the raster "
+                    "route, or omit terrain."
+                )
             return PrecipMrms.animate_flood_inundation_from_hdf(
                 plan_hdf=flood_data,
                 output_mp4=output_mp4,
@@ -615,7 +751,7 @@ class PrecipMrms:
             title=title,
             value_label=f"Depth ({units})",
             units=units,
-            terrain=PrecipMrms._prepare_terrain_data(terrain) if terrain is not None else None,
+            terrain=terrain,
             boundary=boundary,
             mesh_boundary=mesh_boundary,
             pump_stations=pump_stations,
@@ -772,7 +908,7 @@ class PrecipMrms:
             title=title,
             value_label=f"Depth ({units})",
             units=units,
-            terrain=PrecipMrms._prepare_terrain_data(terrain) if terrain is not None else None,
+            terrain=terrain,
             boundary=boundary,
             mesh_boundary=mesh_boundary,
             pump_stations=pump_stations,
@@ -810,6 +946,10 @@ class PrecipMrms:
         max_frames: Optional[int] = 24,
         cell_size: Optional[float] = None,
         resampling: str = "nearest",
+        precip_value_semantics: str = "rate",
+        precip_alignment: str = "latest_completed",
+        precip_interval: Optional[Any] = None,
+        coverage_policy: str = "hold",
     ) -> Path:
         """
         Generate a synchronized split-screen precipitation and flood animation.
@@ -818,6 +958,15 @@ class PrecipMrms:
         DataArray. ``flood_data`` can be a gridded array, xarray DataArray,
         HEC-RAS plan HDF path, or flat/grouped stored-map raster frames.
         ``bounds`` is accepted as an alias for ``precip_bounds``.
+
+        ``precip_alignment='latest_completed'`` with
+        ``coverage_policy='hold'`` preserves the historical display behavior.
+        For interval-ending accumulations, use
+        ``precip_value_semantics='interval_amount'``,
+        ``precip_alignment='covering_interval'``, and provide
+        ``precip_interval``. ``coverage_policy='error'`` rejects frames outside
+        source coverage; ``'dry_tail'`` permits explicit zero display only after
+        the final source interval.
         """
         _check_animation_dependencies()
         import matplotlib.pyplot as plt
@@ -831,7 +980,14 @@ class PrecipMrms:
             precip_data,
             bounds=precip_bounds,
         )
-        precip_in = PrecipMrms._convert_precip_units(precip, "in/hr")
+        semantics = precip_value_semantics.strip().lower()
+        if semantics not in {"rate", "interval_amount", "instantaneous"}:
+            raise ValueError(
+                "precip_value_semantics must be 'rate', 'interval_amount', "
+                "or 'instantaneous'"
+            )
+        display_units = "in/hr" if semantics == "rate" else "in"
+        precip_in = PrecipMrms._convert_precip_units(precip, display_units)
 
         if PrecipMrms._looks_like_raster_paths(flood_data):
             flood = PrecipMrms.load_stored_map_stack(
@@ -864,6 +1020,10 @@ class PrecipMrms:
                 fps=fps,
                 dpi=dpi,
                 title=title,
+                precip_value_semantics=semantics,
+                precip_alignment=precip_alignment,
+                precip_interval=precip_interval,
+                coverage_policy=coverage_policy,
             )
         else:
             flood = PrecipMrms._coerce_grid_data(
@@ -882,9 +1042,12 @@ class PrecipMrms:
         n_frames = int(flood.sizes["time"])
         if n_frames < 1 or len(precip_times) < 1:
             raise ValueError("Combined animation requires at least one frame")
-        precip_frame_indices = PrecipMrms._nearest_previous_time_indices(
+        precip_frame_indices, precip_frame_status = PrecipMrms._align_precipitation_frames(
             source_times=precip_times,
             target_times=flood_times_index,
+            alignment=precip_alignment,
+            interval=precip_interval,
+            coverage_policy=coverage_policy,
         )
         flood_values = np.asarray(flood.values, dtype=float)
         precip_vmax = PrecipMrms._robust_vmax(np.asarray(precip_in.values), 0.1)
@@ -894,8 +1057,13 @@ class PrecipMrms:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         fig, (ax_p, ax_f) = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
+        first_precip = (
+            np.zeros_like(np.asarray(precip_in.isel(time=0).values, dtype=float))
+            if int(precip_frame_indices[0]) < 0
+            else np.asarray(precip_in.isel(time=int(precip_frame_indices[0])).values, dtype=float)
+        )
         im_p = ax_p.imshow(
-            np.asarray(precip_in.isel(time=int(precip_frame_indices[0])).values, dtype=float),
+            first_precip,
             extent=precip_extent,
             origin=precip_origin,
             cmap="turbo",
@@ -914,7 +1082,14 @@ class PrecipMrms:
             alpha=raster_alpha,
             zorder=2,
         )
-        fig.colorbar(im_p, ax=ax_p, shrink=0.8).set_label("Precipitation (in/hr)")
+        precip_label = (
+            "Precipitation rate (in/hr)"
+            if semantics == "rate"
+            else "Precipitation interval amount (in)"
+            if semantics == "interval_amount"
+            else "Precipitation value (in)"
+        )
+        fig.colorbar(im_p, ax=ax_p, shrink=0.8).set_label(precip_label)
         fig.colorbar(im_f, ax=ax_f, shrink=0.8).set_label("Depth (ft)")
         ax_p.set_title("MRMS QPE")
         ax_f.set_title("Flood Inundation")
@@ -938,11 +1113,16 @@ class PrecipMrms:
 
         def update(frame_idx: int) -> list:
             precip_idx = int(precip_frame_indices[frame_idx])
-            im_p.set_data(np.asarray(precip_in.isel(time=precip_idx).values, dtype=float))
+            if precip_idx < 0:
+                im_p.set_data(np.zeros_like(first_precip))
+                precip_time_text = "authorized dry tail"
+            else:
+                im_p.set_data(np.asarray(precip_in.isel(time=precip_idx).values, dtype=float))
+                precip_time_text = precip_times[precip_idx].strftime('%Y-%m-%d %H:%M')
             im_f.set_data(np.asarray(flood.isel(time=frame_idx).values, dtype=float))
             timestamp.set_text(
                 f"{title}\n"
-                f"Precip: {precip_times[precip_idx].strftime('%Y-%m-%d %H:%M')} | "
+                f"Precip: {precip_time_text} [{precip_frame_status[frame_idx]}] | "
                 f"Flood: {flood_times_index[frame_idx].strftime('%Y-%m-%d %H:%M')}"
             )
             return [im_p, im_f, timestamp]
@@ -987,7 +1167,10 @@ class PrecipMrms:
         from ..hdf.HdfResultsMesh import HdfResultsMesh
 
         plan_hdf = Path(plan_hdf)
-        cell_points = HdfMesh.get_mesh_cell_points(plan_hdf)
+        # Physical cells only, matching the ghost-free get_mesh_timeseries().
+        cell_points = HdfMesh.get_mesh_cell_points(
+            plan_hdf, include_ghost_cells=False, include_geometry=False
+        )
         if cell_points.empty:
             raise ValueError(f"No 2D mesh cell centers found in {plan_hdf}")
 
@@ -1031,8 +1214,8 @@ class PrecipMrms:
             time_values = time_values[frame_indices]
 
         return {
-            "x": mesh_points.geometry.x.to_numpy(dtype=float),
-            "y": mesh_points.geometry.y.to_numpy(dtype=float),
+            "x": mesh_points["x"].to_numpy(dtype=float),
+            "y": mesh_points["y"].to_numpy(dtype=float),
             "values": value_array,
             "times": time_values,
             "mesh_name": mesh_name,
@@ -1056,6 +1239,10 @@ class PrecipMrms:
         fps: int,
         dpi: int,
         title: str,
+        precip_value_semantics: str,
+        precip_alignment: str,
+        precip_interval: Optional[Any],
+        coverage_policy: str,
     ) -> Path:
         import matplotlib.pyplot as plt
         import numpy as np
@@ -1067,9 +1254,12 @@ class PrecipMrms:
         n_frames = int(flood_values.shape[0])
         if n_frames < 1 or len(precip_times) < 1:
             raise ValueError("Combined animation requires at least one frame")
-        precip_frame_indices = PrecipMrms._nearest_previous_time_indices(
+        precip_frame_indices, precip_frame_status = PrecipMrms._align_precipitation_frames(
             source_times=precip_times,
             target_times=flood_times,
+            alignment=precip_alignment,
+            interval=precip_interval,
+            coverage_policy=coverage_policy,
         )
 
         precip_extent, precip_origin = PrecipMrms._data_extent(precip)
@@ -1083,8 +1273,13 @@ class PrecipMrms:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         fig, (ax_p, ax_f) = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
+        first_precip = (
+            np.zeros_like(np.asarray(precip.isel(time=0).values, dtype=float))
+            if int(precip_frame_indices[0]) < 0
+            else np.asarray(precip.isel(time=int(precip_frame_indices[0])).values, dtype=float)
+        )
         im_p = ax_p.imshow(
-            np.asarray(precip.isel(time=int(precip_frame_indices[0])).values, dtype=float),
+            first_precip,
             extent=precip_extent,
             origin=precip_origin,
             cmap="turbo",
@@ -1105,7 +1300,14 @@ class PrecipMrms:
             alpha=raster_alpha,
             zorder=2,
         )
-        fig.colorbar(im_p, ax=ax_p, shrink=0.8).set_label("Precipitation (in/hr)")
+        precip_label = (
+            "Precipitation rate (in/hr)"
+            if precip_value_semantics == "rate"
+            else "Precipitation interval amount (in)"
+            if precip_value_semantics == "interval_amount"
+            else "Precipitation value (in)"
+        )
+        fig.colorbar(im_p, ax=ax_p, shrink=0.8).set_label(precip_label)
         flood_label = flood_points["variable"]
         flood_units = flood_points["units"]
         fig.colorbar(scat, ax=ax_f, shrink=0.8).set_label(
@@ -1134,11 +1336,16 @@ class PrecipMrms:
 
         def update(frame_idx: int) -> list:
             precip_idx = int(precip_frame_indices[frame_idx])
-            im_p.set_data(np.asarray(precip.isel(time=precip_idx).values, dtype=float))
+            if precip_idx < 0:
+                im_p.set_data(np.zeros_like(first_precip))
+                precip_time_text = "authorized dry tail"
+            else:
+                im_p.set_data(np.asarray(precip.isel(time=precip_idx).values, dtype=float))
+                precip_time_text = precip_times[precip_idx].strftime('%Y-%m-%d %H:%M')
             scat.set_array(flood_values[frame_idx])
             timestamp.set_text(
                 f"{title}\n"
-                f"Precip: {precip_times[precip_idx].strftime('%Y-%m-%d %H:%M')} | "
+                f"Precip: {precip_time_text} [{precip_frame_status[frame_idx]}] | "
                 f"Flood: {flood_times[frame_idx].strftime('%Y-%m-%d %H:%M')}"
             )
             return [im_p, scat, timestamp]
@@ -1760,17 +1967,26 @@ class PrecipMrms:
         if extent is None:
             x_coords = np.arange(x_size)
             y_coords = np.arange(y_size)
+            grid_bounds = None
         else:
             west, east, south, north = extent
-            x_coords = np.linspace(west, east, x_size)
-            y_coords = np.linspace(south, north, y_size)
+            if not west < east or not south < north:
+                raise ValueError("extent must be ordered as west < east, south < north")
+            x_step = (east - west) / x_size
+            y_step = (north - south) / y_size
+            x_coords = west + (np.arange(x_size) + 0.5) * x_step
+            y_coords = south + (np.arange(y_size) + 0.5) * y_step
+            grid_bounds = (float(west), float(east), float(south), float(north))
 
         da = xr.DataArray(
             array,
             dims=("time", "y", "x"),
             coords={"time": time_index, "y": y_coords, "x": x_coords},
             name=name,
-            attrs={"units": units},
+            attrs={
+                "units": units,
+                **({"grid_bounds": grid_bounds} if grid_bounds is not None else {}),
+            },
         )
         return da
 
@@ -1800,12 +2016,16 @@ class PrecipMrms:
 
         Frame limiting occurs before any selected raster metadata or data is
         read. The returned DataArray has ``time``, ``y``, and ``x`` dimensions
-        and includes ``units`` and ``crs`` attributes. The returned stack is
-        allocated eagerly; specify both ``cell_size`` and ``max_frames`` for
-        large multi-terrain domains to bound memory use.
+        and includes ``units``, ``crs``, and pixel-edge ``grid_bounds``
+        attributes. North-up and south-up rasters are supported. West-up,
+        rotated, and sheared transforms fail explicitly because a one-dimensional
+        x/y grid cannot represent them without changing data orientation. The
+        returned stack is allocated eagerly; specify both ``cell_size`` and
+        ``max_frames`` for large multi-terrain domains to bound memory use.
         """
         try:
             import rasterio
+            from rasterio.coords import BoundingBox
             from rasterio.transform import from_origin
             from rasterio.warp import Resampling, reproject
         except ImportError as exc:
@@ -1905,17 +2125,36 @@ class PrecipMrms:
                             f"frame {frame_index} raster {raster_path} uses {src.crs}, "
                             f"expected {common_crs}"
                         )
+                    if not np.isclose(src.transform.b, 0.0) or not np.isclose(
+                        src.transform.d, 0.0
+                    ):
+                        raise ValueError(
+                            "Rotated or sheared stored-map rasters are not supported; "
+                            f"rectify the raster before loading: {raster_path}"
+                        )
+                    if src.transform.a <= 0:
+                        raise ValueError(
+                            "West-up stored-map rasters are not supported; rectify "
+                            f"the raster to east-increasing columns: {raster_path}"
+                        )
 
                     src_nodata = src.nodata
                     if src_nodata is None and np.issubdtype(
                         np.dtype(src.dtypes[0]), np.floating
                     ):
                         src_nodata = np.nan
+                    native_bounds = src.bounds
+                    normalized_bounds = BoundingBox(
+                        left=min(native_bounds.left, native_bounds.right),
+                        bottom=min(native_bounds.bottom, native_bounds.top),
+                        right=max(native_bounds.left, native_bounds.right),
+                        top=max(native_bounds.bottom, native_bounds.top),
+                    )
                     meta = {
                         "path": raster_path,
                         "shape": (src.height, src.width),
                         "transform": src.transform,
-                        "bounds": src.bounds,
+                        "bounds": normalized_bounds,
                         "res": (abs(src.res[0]), abs(src.res[1])),
                         "nodata": src_nodata,
                     }
@@ -1997,7 +2236,28 @@ class PrecipMrms:
             dims=("time", "y", "x"),
             coords={"time": time_index, "y": y_coords, "x": x_coords},
             name=name,
-            attrs={"units": units, "crs": common_crs.to_string()},
+            attrs={
+                "units": units,
+                "crs": common_crs.to_string(),
+                "grid_bounds": (
+                    float(min(
+                        ref_transform.c,
+                        ref_transform.c + cols * ref_transform.a,
+                    )),
+                    float(max(
+                        ref_transform.c,
+                        ref_transform.c + cols * ref_transform.a,
+                    )),
+                    float(min(
+                        ref_transform.f,
+                        ref_transform.f + rows * ref_transform.e,
+                    )),
+                    float(max(
+                        ref_transform.f,
+                        ref_transform.f + rows * ref_transform.e,
+                    )),
+                ),
+            },
         )
 
     @staticmethod
@@ -2072,23 +2332,109 @@ class PrecipMrms:
         )
 
     @staticmethod
-    def _prepare_terrain_data(terrain: Any) -> Any:
+    def _prepare_terrain_data(
+        terrain: Any,
+        target_data: Optional[Any] = None,
+        target_crs: Optional[Any] = None,
+    ) -> Any:
+        """Prepare hillshade on the displayed grid without losing georeferencing.
+
+        Georeferenced raster paths are warped only to the target animation grid,
+        which bounds both memory use and hillshade work. Raw arrays have no
+        spatial metadata and are accepted only when their shape already matches
+        the target grid.
+        """
+        import numpy as np
+
         if terrain is None:
             return None
         if isinstance(terrain, (str, Path)):
             try:
                 import rasterio
+                from rasterio.enums import Resampling
+                from rasterio.transform import from_bounds
+                from rasterio.warp import reproject
             except ImportError as exc:
                 raise ImportError(
                     "rasterio is required to use a terrain raster overlay. "
                     "Install with: pip install rasterio"
                 ) from exc
             with rasterio.open(terrain) as src:
-                terrain_data = src.read(1).astype(float)
-                if src.nodata is not None:
-                    terrain_data[terrain_data == src.nodata] = float("nan")
-            return PrecipMrms._hillshade(terrain_data)
-        return terrain
+                if src.crs is None:
+                    raise ValueError(
+                        f"Terrain raster has no CRS and cannot be aligned: {terrain}"
+                    )
+                if target_data is None:
+                    terrain_data = src.read(1).astype(float)
+                    if src.nodata is not None:
+                        terrain_data[terrain_data == src.nodata] = float("nan")
+                    return {
+                        "values": PrecipMrms._hillshade(terrain_data),
+                        "extent": (
+                            src.bounds.left,
+                            src.bounds.right,
+                            src.bounds.bottom,
+                            src.bounds.top,
+                        ),
+                        "origin": "upper" if src.transform.e < 0 else "lower",
+                        "crs": src.crs.to_string(),
+                    }
+
+                resolved_crs = target_crs or PrecipMrms._data_crs(target_data)
+                if resolved_crs is None:
+                    raise ValueError(
+                        "Animation data must provide a CRS when terrain is a "
+                        "georeferenced raster path"
+                    )
+                target_extent, target_origin = PrecipMrms._data_extent(target_data)
+                target_shape = tuple(target_data.isel(time=0).shape)
+                destination = np.full(target_shape, np.nan, dtype=np.float32)
+                destination_transform = from_bounds(
+                    target_extent[0],
+                    target_extent[2],
+                    target_extent[1],
+                    target_extent[3],
+                    width=target_shape[1],
+                    height=target_shape[0],
+                )
+                reproject(
+                    source=rasterio.band(src, 1),
+                    destination=destination,
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    src_nodata=src.nodata,
+                    dst_transform=destination_transform,
+                    dst_crs=resolved_crs,
+                    dst_nodata=np.nan,
+                    resampling=Resampling.bilinear,
+                )
+                if target_origin == "lower":
+                    destination = np.flipud(destination)
+                return {
+                    "values": PrecipMrms._hillshade(destination),
+                    "extent": target_extent,
+                    "origin": target_origin,
+                    "crs": str(resolved_crs),
+                }
+
+        terrain_data = np.asarray(terrain, dtype=float)
+        if target_data is not None:
+            target_shape = tuple(target_data.isel(time=0).shape)
+            if terrain_data.shape != target_shape:
+                raise ValueError(
+                    "Raw terrain arrays have no georeferencing and must match "
+                    f"the animation grid shape {target_shape}; got {terrain_data.shape}"
+                )
+            target_extent, target_origin = PrecipMrms._data_extent(target_data)
+        else:
+            target_extent = (0.0, float(terrain_data.shape[1]), 0.0, float(terrain_data.shape[0]))
+            target_origin = "lower"
+        return {
+            "values": terrain_data,
+            "extent": target_extent,
+            "origin": target_origin,
+            "crs": str(target_crs) if target_crs is not None else None,
+        }
 
     @staticmethod
     def _hillshade(values: Any, azimuth: float = 315.0, altitude: float = 45.0) -> Any:
@@ -2097,7 +2443,10 @@ class PrecipMrms:
         data = np.asarray(values, dtype=float)
         if data.ndim != 2:
             return data
-        filled = np.where(np.isfinite(data), data, np.nanmean(data))
+        valid = np.isfinite(data)
+        if not valid.any():
+            return np.full(data.shape, np.nan, dtype=float)
+        filled = np.where(valid, data, np.nanmean(data))
         dy, dx = np.gradient(filled)
         slope = np.pi / 2.0 - np.arctan(np.hypot(dx, dy))
         aspect = np.arctan2(-dx, dy)
@@ -2107,7 +2456,9 @@ class PrecipMrms:
             np.sin(altitude_rad) * np.sin(slope)
             + np.cos(altitude_rad) * np.cos(slope) * np.cos(azimuth_rad - aspect)
         )
-        return np.clip((shaded + 1.0) / 2.0, 0.0, 1.0)
+        result = np.clip((shaded + 1.0) / 2.0, 0.0, 1.0)
+        result[~valid] = np.nan
+        return result
 
     @staticmethod
     def _convert_precip_units(data: Any, units: str) -> Any:
@@ -2166,16 +2517,21 @@ class PrecipMrms:
 
         extent, origin = PrecipMrms._data_extent(plot_data)
         data_crs = crs or PrecipMrms._data_crs(plot_data)
+        terrain_overlay = PrecipMrms._prepare_terrain_data(
+            terrain,
+            target_data=plot_data,
+            target_crs=data_crs,
+        ) if terrain is not None else None
         vmax = PrecipMrms._robust_vmax(values, 0.1)
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
 
         fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
-        if terrain is not None:
+        if terrain_overlay is not None:
             ax.imshow(
-                terrain,
-                extent=extent,
-                origin=origin,
+                terrain_overlay["values"],
+                extent=terrain_overlay["extent"],
+                origin=terrain_overlay["origin"],
                 cmap="gray",
                 alpha=0.35,
                 zorder=1,
@@ -2275,6 +2631,47 @@ class PrecipMrms:
     def _data_extent(data: Any) -> Tuple[Tuple[float, float, float, float], str]:
         import numpy as np
 
+        attrs = getattr(data, "attrs", {}) or {}
+        explicit_bounds = attrs.get("grid_bounds")
+        if explicit_bounds is not None:
+            if len(explicit_bounds) != 4:
+                raise ValueError("grid_bounds must contain west, east, south, north")
+            bounds = tuple(float(value) for value in explicit_bounds)
+            if not bounds[0] < bounds[1] or not bounds[2] < bounds[3]:
+                raise ValueError("grid_bounds must be ordered west < east, south < north")
+            y_coord = data.coords.get("y") if "y" in data.coords else None
+            origin = (
+                "upper"
+                if y_coord is not None
+                and y_coord.ndim == 1
+                and y_coord.size > 1
+                and float(y_coord.values[0]) > float(y_coord.values[-1])
+                else "lower"
+            )
+            return bounds, origin
+
+        def coordinate_edge_bounds(values: Any) -> Tuple[float, float]:
+            """Return outer pixel edges for a one-dimensional center coordinate."""
+            centers = np.asarray(values, dtype=float)
+            finite = centers[np.isfinite(centers)]
+            if finite.size == 0:
+                raise ValueError("Animation coordinates contain no finite values")
+            if finite.size == 1:
+                raise ValueError(
+                    "A one-cell coordinate cannot define pixel-edge bounds; "
+                    "provide grid_bounds metadata or an explicit extent"
+                )
+            steps = np.diff(finite)
+            if not np.allclose(steps, steps[0], rtol=1e-7, atol=1e-12):
+                raise ValueError(
+                    "Nonuniform center coordinates require explicit grid_bounds metadata"
+                )
+            edges = np.empty(finite.size + 1, dtype=float)
+            edges[1:-1] = (finite[:-1] + finite[1:]) / 2.0
+            edges[0] = finite[0] - (finite[1] - finite[0]) / 2.0
+            edges[-1] = finite[-1] + (finite[-1] - finite[-2]) / 2.0
+            return float(np.nanmin(edges)), float(np.nanmax(edges))
+
         lat_name = PrecipMrms._find_coord_name(data, ("latitude", "lat"))
         lon_name = PrecipMrms._find_coord_name(data, ("longitude", "lon"))
         if lat_name is not None and lon_name is not None:
@@ -2282,23 +2679,26 @@ class PrecipMrms:
             lon = np.asarray(data[lon_name].values, dtype=float)
             lon = np.where(lon > 180, lon - 360, lon)
             origin = "upper" if lat.ndim == 1 and lat[0] > lat[-1] else "lower"
-            return (
-                float(np.nanmin(lon)),
-                float(np.nanmax(lon)),
-                float(np.nanmin(lat)),
-                float(np.nanmax(lat)),
-            ), origin
+            if lat.ndim == 1 and lon.ndim == 1:
+                left, right = coordinate_edge_bounds(lon)
+                bottom, top = coordinate_edge_bounds(lat)
+                return (left, right, bottom, top), origin
+            raise ValueError(
+                "Nonrectilinear latitude/longitude grids require explicit "
+                "grid_bounds metadata"
+            )
 
         if "x" in data.coords and "y" in data.coords:
             x = np.asarray(data.coords["x"].values, dtype=float)
             y = np.asarray(data.coords["y"].values, dtype=float)
             origin = "upper" if y.ndim == 1 and y[0] > y[-1] else "lower"
-            return (
-                float(np.nanmin(x)),
-                float(np.nanmax(x)),
-                float(np.nanmin(y)),
-                float(np.nanmax(y)),
-            ), origin
+            if x.ndim == 1 and y.ndim == 1:
+                left, right = coordinate_edge_bounds(x)
+                bottom, top = coordinate_edge_bounds(y)
+                return (left, right, bottom, top), origin
+            raise ValueError(
+                "Nonrectilinear x/y grids require explicit grid_bounds metadata"
+            )
 
         shape = data.isel(time=0).shape
         return (0.0, float(shape[1]), 0.0, float(shape[0])), "lower"
@@ -2333,6 +2733,119 @@ class PrecipMrms:
             raise ValueError("source_times must contain at least one timestamp")
         positions = np.searchsorted(source.values, target.values, side="right") - 1
         return np.clip(positions, 0, len(source) - 1).astype(int)
+
+    @staticmethod
+    def _align_precipitation_frames(
+        source_times: Any,
+        target_times: Any,
+        alignment: str = "latest_completed",
+        interval: Optional[Any] = None,
+        coverage_policy: str = "hold",
+    ) -> Tuple[Any, Any]:
+        """Map hydraulic frames to precipitation frames with explicit semantics."""
+        import numpy as np
+        import pandas as pd
+
+        source = pd.DatetimeIndex(pd.to_datetime(source_times))
+        target = pd.DatetimeIndex(pd.to_datetime(target_times))
+        if len(source) == 0:
+            raise ValueError("source_times must contain at least one timestamp")
+        if source.hasnans:
+            raise ValueError("source_times must contain only finite timestamps")
+        if not source.is_monotonic_increasing or source.has_duplicates:
+            raise ValueError("source_times must be unique and increasing")
+        if len(target) == 0:
+            raise ValueError("target_times must contain at least one timestamp")
+        if target.hasnans:
+            raise ValueError("target_times must contain only finite timestamps")
+        if not target.is_monotonic_increasing or target.has_duplicates:
+            raise ValueError("target_times must be unique and increasing")
+
+        alignment_clean = alignment.strip().lower()
+        policy = coverage_policy.strip().lower()
+        if alignment_clean not in {"latest_completed", "covering_interval"}:
+            raise ValueError(
+                "precip_alignment must be 'latest_completed' or 'covering_interval'"
+            )
+        if policy not in {"hold", "error", "dry_tail"}:
+            raise ValueError("coverage_policy must be 'hold', 'error', or 'dry_tail'")
+
+        if alignment_clean == "latest_completed":
+            indices = np.searchsorted(source.values, target.values, side="right") - 1
+            coverage_start = source[0]
+        else:
+            if interval is None:
+                raise ValueError(
+                    "precip_interval is required for covering_interval alignment"
+                )
+            interval_delta = pd.Timedelta(interval)
+            if pd.isna(interval_delta) or interval_delta <= pd.Timedelta(0):
+                raise ValueError("precip_interval must be a finite positive duration")
+            if len(source) > 1:
+                cadence = source[1:] - source[:-1]
+                gaps = cadence > interval_delta
+                overlaps = cadence < interval_delta
+                if gaps.any():
+                    raise ValueError(
+                        "Precipitation source intervals contain an internal gap; "
+                        "covering_interval requires continuous fixed-interval coverage"
+                    )
+                if overlaps.any():
+                    raise ValueError(
+                        "Precipitation source intervals overlap; covering_interval "
+                        "requires continuous fixed-interval coverage"
+                    )
+            indices = np.searchsorted(source.values, target.values, side="left")
+            coverage_start = source[0] - interval_delta
+
+        # Interval-ending amounts use the half-open convention (start, end].
+        before = (
+            target <= coverage_start
+            if alignment_clean == "covering_interval"
+            else target < coverage_start
+        )
+        after = target > source[-1]
+        if policy == "error" and (before.any() or after.any()):
+            raise ValueError(
+                "Hydraulic animation times extend outside precipitation source coverage"
+            )
+        if policy == "dry_tail" and before.any():
+            raise ValueError(
+                "dry_tail authorizes zeros only after precipitation coverage, not before it"
+            )
+
+        statuses = np.full(len(target), alignment_clean, dtype=object)
+        if policy == "hold":
+            indices = np.clip(indices, 0, len(source) - 1)
+            statuses[before | after] = "held outside source coverage"
+        elif policy == "dry_tail":
+            indices = np.asarray(indices, dtype=int)
+            indices[after] = -1
+            statuses[after] = "authorized dry tail"
+        else:
+            indices = np.asarray(indices, dtype=int)
+
+        invalid = (indices >= len(source)) & ~after
+        if alignment_clean == "covering_interval":
+            in_coverage = ~(before | after)
+            selected = np.asarray(indices, dtype=int)[in_coverage]
+            selected_ends = source.take(selected)
+            selected_starts = selected_ends - interval_delta
+            target_in_coverage = target[in_coverage]
+            membership_invalid = ~(
+                (target_in_coverage > selected_starts)
+                & (target_in_coverage <= selected_ends)
+            )
+            if membership_invalid.any():
+                raise ValueError(
+                    "Target times do not fall within the declared precipitation "
+                    "intervals using the (start, end] convention"
+                )
+        if invalid.any():
+            raise ValueError(
+                "Target times do not fall within the declared precipitation intervals"
+            )
+        return indices.astype(int), statuses
 
     @staticmethod
     def _robust_vmax(values: Any, minimum: float) -> float:

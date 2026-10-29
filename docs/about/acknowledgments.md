@@ -47,6 +47,47 @@ RAS Commander represents a practical demonstration of LLM Forward principles app
 
 ## Technical Contributors
 
+### Spatial Results Queries and Rivia
+
+**Gyan Basyal (gyanz)** and [Rivia](https://github.com/gyanz/rivia) provided the
+conceptual basis for `HdfResultsQuery`. Rivia's elegant spatial, profile,
+velocity, and flow query functions inspired this design. We gratefully
+acknowledge Gyan and WEST Consultants, Inc., credited by Rivia's license.
+Rivia also supplied the StoreAllMaps approach used by `RasProcess`.
+See [Related libraries](related-libraries.md) for a comparison and demonstrations
+of Rivia capabilities that remain useful alongside RAS Commander.
+
+### pyHMT2D HDF Extraction and Spatial Probing
+
+**Xiaofeng Liu and the pyHMT2D contributors**, through
+[pyHMT2D](https://github.com/psu-efd/pyHMT2D), influenced early HDF extraction
+and the spatial probing, transect, calibration, and uncertainty workflows
+explored during development. Its VTK-based analysis motivated useful direct
+HDF/scipy query workflows in RAS Commander. See
+[Related libraries](related-libraries.md#pyhmt2d-recent-release-and-complementary-workflows)
+for release context and complementary ParaView/SRH-2D workflows.
+
+### Native HEC-DSS Access
+
+**Gyan Basyal (gyanz)** maintains
+[pydsstools](https://github.com/gyanz/pydsstools), the MIT-licensed Python/Cython
+interface to HEC-DSS. RAS Commander's optional direct precipitation-array
+writer calls pydsstools' native grid API. We gratefully acknowledge this work;
+the upstream implementation is used as a dependency and is not copied into
+RAS Commander. See the [upstream project](https://github.com/gyanz/pydsstools)
+for its documentation, contribution, and sponsorship options.
+
+### HDF Readers and the Java DSS Bridge
+
+[FEMA-FFRD's rashdf](https://github.com/fema-ffrd/rashdf) provided HDF readers
+that were incorporated, revised, adapted, and extended where noted in RAS
+Commander's HDF modules. We acknowledge the upstream authors and contributors.
+
+**Michael Koohafkan's [dssrip2](https://github.com/mkoohafkan/dssrip2)** is an R
+HEC-DSS library. Its HEC Monolith JAR download, platform-native library, and
+cache-management approach was replicated in RAS Commander's
+`_hec_monolith.py` Java bridge. We gratefully acknowledge that foundation.
+
 ### HDF Data Access & Structure Analysis
 
 **Sean Micek, P.E.**
@@ -122,6 +163,29 @@ Chris's book remains the definitive reference for COM-based automation of HEC-RA
 
 ## Community Testing & Feedback
 
+### Community Contributors
+
+- [Harris Bienn (`@harrisbienn`)](https://github.com/harrisbienn) identified
+  the retained-request identity mismatch in the governed scenario-worker retry
+  workflow and authored the original correction and regression coverage in
+  [#310](https://github.com/gpt-cmdr/ras-commander/issues/310) and
+  [#311](https://github.com/gpt-cmdr/ras-commander/pull/311). That finding was
+  generalized in the portable execution contract as separate retained-payload
+  and normalized-specification identities, without coupling the public API to
+  any application-specific orchestration workflow.
+- [`@PMacAddress`](https://github.com/PMacAddress) supplied detailed,
+  reproducible Windows/Wine reports and follow-up testing for headless mesh
+  generation, refinement-region activation, Manning's n geometry associations,
+  and solver-readable gridded precipitation in
+  [#361](https://github.com/gpt-cmdr/ras-commander/issues/361),
+  [#369](https://github.com/gpt-cmdr/ras-commander/issues/369),
+  [#370](https://github.com/gpt-cmdr/ras-commander/issues/370), and
+  [#371](https://github.com/gpt-cmdr/ras-commander/issues/371).
+- [`@jacobrbeatty`](https://github.com/jacobrbeatty) reported that
+  `RasControl.run_plan()` could accept a current-plan signal without a result
+  HDF, motivating stronger result-artifact and completion-evidence checks in
+  [#323](https://github.com/gpt-cmdr/ras-commander/issues/323).
+
 ### Early Adopters & Testers
 
 The following individuals and organizations provided valuable testing feedback during beta releases:
@@ -189,4 +253,4 @@ contributors. See [Cite and Support RAS Commander](../cite.md).
 
 ---
 
-**Last Updated**: 2026-07-19
+**Last Updated**: 2026-10-13

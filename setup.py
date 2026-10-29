@@ -3,6 +3,61 @@ from setuptools.command.build_py import build_py
 import subprocess
 from pathlib import Path
 
+
+# The native (Rust) HDF engine is ras-commander's default HDF engine. It is
+# published as binary wheels only for CPython on Windows x64, Linux x64
+# (manylinux_2_28) and macOS arm64, so the marker limits the dependency to those
+# platforms and pip never tries to compile the Rust source distribution
+# elsewhere. Where the extension is not installed, every read uses h5py.
+FAST_HDF_REQUIREMENT = 'ras-commander-fast-hdf>=0.2.3,<0.3'
+FAST_MAP_REQUIREMENT = 'ras-commander-fast-map>=0.8,<0.11'
+FAST_MAP_WHEEL_MARKER = (
+    '(platform_system == "Windows" and platform_machine == "AMD64")'
+    ' or (platform_system == "Linux" and platform_machine == "x86_64")'
+)
+FAST_HDF_WHEEL_MARKER = (
+    'platform_python_implementation == "CPython" and ('
+    '(platform_system == "Windows" and platform_machine == "AMD64")'
+    ' or (platform_system == "Linux" and platform_machine == "x86_64")'
+    ' or (platform_system == "Darwin" and platform_machine == "arm64"))'
+)
+
+# Keep the default installation import-safe and suitable for inventory/HDF work.
+# Feature groups are additive so batch runners can install only what they use.
+CORE_DEPENDENCIES = [
+    'h5py',
+    'numpy',
+    'pandas',
+    f'{FAST_HDF_REQUIREMENT}; {FAST_HDF_WHEEL_MARKER}',
+]
+
+COMPUTE_DEPENDENCIES = [
+    'psutil>=5.6.6',  # Process supervision and the default dialog watchdog
+    'pywin32>=227; sys_platform == "win32"',  # Windows dialog watchdog primitives
+]
+
+FULL_FEATURE_DEPENDENCIES = [
+    f'{FAST_MAP_REQUIREMENT}; {FAST_MAP_WHEEL_MARKER}',
+    'requests',
+    'tqdm',
+    'scipy',
+    'xarray',
+    'geopandas',
+    'matplotlib',
+    'shapely>=2.0',
+    'rasterio',
+    'rioxarray',
+    'cfgrib>=0.9.10',
+    'eccodes>=2.28',
+    'pyarrow>=14.0',
+    'pyproj',
+    'rasterstats',
+    'rtree',
+    'fsspec>=2023.0.0',
+    'hms-commander>=0.3.1',
+]
+
+
 class CustomBuildPy(build_py):
     def run(self):
         # Clean up __pycache__ folders
@@ -34,7 +89,7 @@ class CustomBuildPy(build_py):
 
 setup(
     name="ras-commander",
-    version="0.99.1",
+    version="0.110.1",
     packages=find_packages(include=['ras_commander', 'ras_commander.*']),
     include_package_data=True,
     package_data={
@@ -45,10 +100,20 @@ setup(
             "resources/land_classification/*.hdf",
             "resources/templates/RAS_6.6/*",
             "resources/templates/RAS_7.0/*",
+            "fim/THIRD_PARTY_NOTICES.md",
+            "resources/*.json",
+            "resources/templates/*/*",
         ],
         "ras_commander.native": [
+            "InvokeRas5GeometryLandCover.ps1",
+            "InvokeRas5LandCover.ps1",
             "RasStoreMapHelper.exe",
+            "RasStoreMapHelper.exe.config",
             "RasStoreMapHelper.cs",
+            "RasMetImportHelper.cs",
+            "RasMapperTerrainExportHelper.exe",
+            "RasMapperTerrainExportHelper.cs",
+            "BuildRasMapperTerrainExportHelper.ps1",
         ],
     },
     python_requires='>=3.10',
@@ -68,61 +133,73 @@ setup(
     cmdclass={
         'build_py': CustomBuildPy,
     },
-    entry_points={
-        'console_scripts': [
-            'ras-scenario-worker=ras_commander.RasScenarioWorker:main',
-        ],
-    },
-    install_requires=[
-        'h5py',
-        'numpy',
-        'pandas',
-        'requests',
-        'tqdm',
-        'scipy',
-        'xarray',
-        'geopandas',
-        'matplotlib',
-        'shapely>=2.0',
-        'rasterio',
-        'pyarrow>=14.0',
-        'pyproj',
-        'rasterstats',
-        'rtree',
-        'fsspec>=2023.0.0',  # Required for Atlas14Grid remote HTTP access
-        'pywin32>=227; sys_platform == "win32"',    # Required for RasControl COM interface (Windows only)
-        'psutil>=5.6.6',   # Required for RasControl process management
-        'hms-commander>=0.3.1',  # Storm generator updates and Atlas 14 DataFrame API
-    ],
+    entry_points={'console_scripts': ['ras-scenario-worker=ras_commander.RasScenarioWorker:main']},
+    install_requires=CORE_DEPENDENCIES,
     extras_require={
+        # No longer needed: the native HDF engine is a core dependency on the
+        # platforms that have wheels. Kept so existing install commands work.
+        # Without the platform marker, these extras also request the engine on
+        # other platforms, where pip builds it from source (needs Rust).
+        # "fast-hdf" is an alias.
+        'fast': [FAST_HDF_REQUIREMENT],
+        'fast-hdf': [FAST_HDF_REQUIREMENT],
+        # Lean Windows/Wine batch execution through RasCmdr.compute_plan().
+        # This intentionally excludes the RasControl COM interface and the
+        # geospatial/plotting stack. "execution" is a descriptive alias.
+        'compute': COMPUTE_DEPENDENCIES,
+        'execution': COMPUTE_DEPENDENCIES,
+        # Preserve the historical default feature dependency surface for
+        # users who need every ras-commander module.
+        'full': FULL_FEATURE_DEPENDENCIES + COMPUTE_DEPENDENCIES,
         # Remote execution backends (PsExec worker has no extra deps)
         'remote': [],  # Base remote - PsExec only, no additional deps
-        'remote-ssh': ['paramiko>=3.0'],
-        'remote-winrm': ['pywinrm>=0.4.3'],
         'remote-docker': ['docker>=6.0'],
-        'remote-aws': ['boto3>=1.28'],
-        'remote-azure': ['azure-identity>=1.14', 'azure-mgmt-compute>=30.0'],
+        # paramiko backs DockerWorker SSH/SFTP staging for ssh:// Docker hosts.
         'remote-all': [
             'paramiko>=3.0',
-            'pywinrm>=0.4.3',
             'docker>=6.0',
-            'boto3>=1.28',
-            'azure-identity>=1.14',
-            'azure-mgmt-compute>=30.0',
         ],
         # GUI automation and screenshot capture (Windows only)
-        'gui': ['Pillow>=9.0', 'comtypes>=1.4.0; sys_platform == "win32"'],
+        'gui': [
+            'Pillow>=9.0',
+            'psutil>=5.6.6',
+            'comtypes>=1.4.0; sys_platform == "win32"',
+        ],
+        # Optional mapping engine and Python preparation/delivery stack.
+        # Runtime calls never download or compile the engine.
+        'fast-map': [f'{FAST_MAP_REQUIREMENT}; {FAST_MAP_WHEEL_MARKER}'],
+        'fim': ['scipy', 'geopandas', 'shapely>=2.0', 'rasterio', 'pyproj',
+                f'{FAST_MAP_REQUIREMENT}; {FAST_MAP_WHEEL_MARKER}'],
         # USGS gauge data integration
         'usgs': ['dataretrieval>=1.0'],
+        # FEMA eBFE archives that use Deflate64 compression (ZIP method 9).
+        # Upstream publishes wheels only through CPython 3.10; keep this out of
+        # the broad ``all`` extra so current Python installs do not require an
+        # unqualified native source build.
+        'ebfe': ['zipfile-deflate64; python_version < "3.11"'],
         # Precipitation enhancements
-        'precip': ['zarr>=2.14.0', 's3fs>=2023.0.0', 'netCDF4>=1.6.0'],
+        'precip': [
+            'xarray',
+            'h5netcdf',
+            'scipy',
+            'rasterio',
+            'rioxarray',
+            'cfgrib>=0.9.10',
+            'eccodes>=2.28',
+            'pyproj',
+            'zarr>=2.14.0',
+            's3fs>=2023.0.0',
+            'netCDF4>=1.6.0',
+        ],
         'precip-huc12': ['pygeohydro>=0.19.0'],  # HUC12 watershed boundaries for Atlas14Variance
-        # Kept for installation-command compatibility; pyarrow is now core
-        # because deterministic hydraulic product manifests include Parquet.
-        'geoparquet': [],
+        # GeoParquet support without the rest of the full feature stack.
+        'geoparquet': ['pyarrow>=14.0'],
         # Notebook dependencies (raster visualization, coordinate systems, precipitation examples)
         'notebooks': [
             'rasterio',
+            'rioxarray',
+            'cfgrib>=0.9.10',
+            'eccodes>=2.28',
             'pyproj',
             'aiohttp',
             'dataretrieval>=1.0',
@@ -137,14 +214,12 @@ setup(
         'mesh': ['pythonnet>=3.0.5'],
         # DSS file operations (requires Java JRE/JDK 8+)
         'dss': ['pyjnius'],
+        # Native direct NumPy -> DSS7 grids, without Java/Vortex (optional wheels).
+        'dss-native': ['pydsstools>=3.1.0,<4', 'pyproj', 'affine'],
         # Everything (all optional dependencies)
-        'all': [
+        'all': FULL_FEATURE_DEPENDENCIES + COMPUTE_DEPENDENCIES + [
             'paramiko>=3.0',
-            'pywinrm>=0.4.3',
             'docker>=6.0',
-            'boto3>=1.28',
-            'azure-identity>=1.14',
-            'azure-mgmt-compute>=30.0',
             'Pillow>=9.0',
             'comtypes>=1.4.0; sys_platform == "win32"',
             'dataretrieval>=1.0',
@@ -153,11 +228,13 @@ setup(
             'netCDF4>=1.6.0',
             'pygeohydro>=0.19.0',
             'rasterio',
+            'rioxarray',
+            'cfgrib>=0.9.10',
+            'eccodes>=2.28',
             'pyproj',
             'aiohttp',
             'pythonnet>=3.0.5',
             'pyjnius',
-            'pyarrow>=14.0',
         ],
     })
 

@@ -4,16 +4,9 @@ Core classes for HEC-RAS project management and execution.
 
 ## Important Notes
 
-!!! warning "Static Class Pattern"
-    All primary classes use static methods - do NOT instantiate:
-    ```python
-    # Correct
-    RasCmdr.compute_plan("01")
-
-    # Wrong - will fail
-    cmd = RasCmdr()
-    cmd.compute_plan("01")
-    ```
+Most operation classes are static namespaces: call `RasCmdr.compute_plan()` or
+`RasPlan` methods directly. `RasPrj` project objects, workers, result records,
+and configuration types are instances. Construct those as documented.
 
 !!! warning "RASMapper Flag Inversion"
     When using `RasPlan.update_run_flags()`, note that RASMapper flags have **inverted logic**:
@@ -24,9 +17,10 @@ Core classes for HEC-RAS project management and execution.
     This is a HEC-RAS quirk, not a library bug.
 
 !!! tip "Input Flexibility"
-    Most methods accept multiple input types via `@standardize_input`:
+    Decorated HDF readers accept the input forms documented for each method.
+    Project selectors require initialization; direct paths are also supported:
     ```python
-    # All valid for HDF methods:
+    # Accepted by this reader:
     HdfResultsMesh.get_mesh_max_ws("01")           # Plan number
     HdfResultsMesh.get_mesh_max_ws(1)              # Integer
     HdfResultsMesh.get_mesh_max_ws(Path("x.hdf")) # Path object
@@ -36,6 +30,14 @@ Core classes for HEC-RAS project management and execution.
 
 ### init_ras_project
 
+<a id="ras_commander.init_ras_project--create-a-new-rasprj-instance-with-prj-file"></a>
+
+<a id="ras_commander.init_ras_project--initialize-using-direct-prj-file-path-new-feature"></a>
+
+<a id="ras_commander.init_ras_project--initialize-using-project-folder-existing-behavior"></a>
+
+<a id="ras_commander.init_ras_project--skip-results-loading-for-faster-initialization"></a>
+
 ::: ras_commander.init_ras_project
     options:
       show_root_heading: true
@@ -43,41 +45,351 @@ Core classes for HEC-RAS project management and execution.
 
 ### RasPrj
 
-::: ras_commander.RasPrj
+Project initialization populates paths and metadata tables on a `RasPrj` instance.
+See the [DataFrame reference](../reference/dataframe-reference.md) for those
+instance attributes; the operations below are the source-derived methods.
+
+<a id="ras_commander.RasPrj"></a>
+
+::: ras_commander.RasPrj.RasPrj
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - check_initialized
+        - find_ras_prj
+        - get_boundary_conditions
+        - get_flow_entries
+        - get_geom_entries
+        - get_hdf_entries
+        - get_hdf_paths
+        - get_plan_entries
+        - get_plan_info
+        - get_plan_value
+        - get_plans_with_results
+        - get_plans_without_results
+        - get_prj_entries
+        - get_project_name
+        - get_project_units
+        - get_results_entries
+        - get_unsteady_entries
+        - initialize
+        - print_data
+        - refresh_project_crs
+        - set_current_plan
+        - update_results_df
+
+### Project asset inspection
+
+`inspect_project_assets()` builds a read-only, PyArrow-backed inventory of a
+project's declared components, plan dependency closure, HDF sidecars,
+RASMapper references, DSS links, restart/prior-water-surface inputs, and
+gridded precipitation inputs. Use an explicit inspection depth rather than
+assuming every file beside a project is required by the current plan.
+The shallow `project` depth initializes project tables without opening HDF or
+raster datasets for geometry metadata or CRS discovery.
+
+Relative references accept both slash styles, with paired quotes removed.
+Native absolute paths resolve on their host; Windows drive/UNC anchors cannot
+be mapped on POSIX. Unresolved Windows anchors retain
+raw-reference inventory evidence with null local paths and file facts.
+The shared RASMapper resolver preserves foreign references as lexical paths
+without a project-folder prefix; these are not native host resolutions.
+Inventory diagnoses both structured and raw references before reading file facts.
+Resolved `%NAME%` and host `$NAME`/`${NAME}` variables
+expand from the current environment. Unresolved environment-variable handling
+retains legacy lexical behavior and is outside this host-anchor contract.
+See the [inventory reason codes](../reference/dataframe-reference.md#project-asset-inventory).
+Finding a terrain file leaves its readiness `unknown` until its plan dependency
+is established; path resolution alone does not establish hydraulic acceptance.
+
+```python
+from ras_commander import inspect_project_assets
+
+assets = inspect_project_assets(
+    r"C:\Models\Source\Model.prj",
+    depth="current_plan",
+    hash_files=True,
+    dss_inspection="none",
+)
+
+not_ready = assets.loc[
+    (assets["required"] == True) & (assets["readiness"] == "not_ready")
+]
+```
+
+::: ras_commander.RasProject.inspect_project_assets
     options:
       show_root_heading: true
       heading_level: 3
-      members:
-        - project_folder
-        - project_name
-        - prj_file
-        - ras_exe_path
-        - plan_df
-        - geom_df
-        - flow_df
-        - unsteady_df
-        - boundaries_df
-        - rasmap_df
-        - get_hdf_entries
-        - get_boundary_conditions
+
+### Atomic project staging
+
+`stage_project()` copies a complete project tree into a unique temporary
+sibling, verifies every source and copied file with streaming SHA-256, creates
+an explicit `RasPrj`, inventories the staged dependencies, writes a stage
+manifest, and publishes with one final directory rename. It never runs or
+preprocesses HEC-RAS.
+
+The destination's parent must already exist and the destination itself must
+not exist. The operation fails closed on overlap, reparse/symlink ambiguity,
+lock artifacts, source or copy drift, an invalid project population, and
+destination races. Failures use typed `ProjectStageError` subclasses with a
+machine-readable `reason_code`; an initially existing destination retains the
+standard `FileExistsError`. Existing `RasCmdr` copy behavior is unchanged.
+
+```python
+from ras_commander import stage_project
+
+staged = stage_project(
+    r"C:\Models\Source\Model.prj",
+    r"D:\Runs\model-2026-08-23",
+)
+
+print(staged.destination_project_file)
+print(staged.execution_readiness)
+print(staged.fingerprint_algorithm)
+```
+
+The four `StageProjectResult` fingerprint fields share the explicitly versioned
+`ras_commander.stage_project.framed_tree.v1` algorithm. That digest covers the
+staged tree's directory population and framed file records. It is deliberately
+not interchangeable with a qualification-harness source snapshot, whose
+canonical-JSON digest has a separate algorithm identifier. Consumers should
+compare fingerprints only when their algorithm identifiers also match. The
+same stage algorithm identifier is persisted in `.ras-commander/stage.json`.
+
+::: ras_commander.RasProject.stage_project
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: ras_commander.RasProject.StageProjectResult
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+### Exact boundary-block deletion
+
+`RasUnsteady.delete_boundary()` intentionally requires an atomically staged
+project. First inspect the staged unsteady file, select one unique row, and
+pass back all of its exact evidence. Preview is the default and does not write.
+
+```python
+from ras_commander import RasUnsteady, stage_project
+
+staged = stage_project(
+    r"C:\Models\Source\Model.prj",
+    r"D:\Runs\model-boundary-edit",
+)
+blocks = RasUnsteady.inspect_boundary_blocks(staged, unsteady_number="01")
+
+candidate = blocks.loc[
+    (blocks["bc_type"] == "Lateral Inflow Hydrograph")
+    & (blocks["river"] == "River A")
+    & (blocks["reach"] == "Reach 1")
+    & (blocks["river_station"] == "1200")
+]
+if len(candidate) != 1:
+    raise RuntimeError(f"Expected one exact boundary, found {len(candidate)}")
+row = candidate.iloc[0]
+
+evidence = {
+    "unsteady_number": str(row["unsteady_number"]),
+    "boundary_id": str(row["boundary_id"]),
+    "expected_source_sha256": str(row["owner_sha256"]),
+    "expected_block_sha256": str(row["block_sha256"]),
+    "expected_bc_type": str(row["bc_type"]),
+    "expected_location_raw": str(row["boundary_location_raw"]),
+}
+preview = RasUnsteady.delete_boundary(staged, **evidence)
+assert preview.state == "previewed"
+
+applied = RasUnsteady.delete_boundary(staged, **evidence, dry_run=False)
+assert applied.state == "applied"
+```
+
+The operation is generic across recognized 1D and 2D boundary types; it does
+not encode a protected-type policy. It rejects direct paths, partial or
+index-only selectors, ambiguous encodings/types, reparse points, stale file or
+block evidence, and non-local apply targets. Apply performs one verified byte
+splice, CRLF newline serialization, and atomic replacement without creating a
+`.bak` file. Retained content and encoding are preserved apart from newline
+normalization; source selectors remain bound to the original bytes. Any mutation
+invalidates the stage snapshot, so another edit requires a fresh stage and
+inventory. If an exception exposes `mutation_applied=True`, the replacement
+committed before a later verification/refresh failure and the stage must be
+treated as requiring manual review.
 
 ## Plan Execution
 
 ### RasCmdr
 
-::: ras_commander.RasCmdr
+<a id="ras_commander.RasCmdr"></a>
+
+::: ras_commander.RasCmdr.RasCmdr
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - cancel_plan
+        - cancel_plan_exact
+        - compute_parallel
+        - compute_plan
+        - compute_plan_linux
+        - compute_test_mode
+        - inspect_execution_evidence
+        - inspect_plan_processes
+        - preprocess_geometry_linux
+        - remove_plan_execution_artifacts
+
+### Structured execution evidence
+
+`RasCmdr.inspect_execution_evidence()` reads existing plan-result artifacts
+without executing HEC-RAS or opening COM. It keeps HDF attributes, embedded
+messages, stored message sidecars, legacy output files, process outcome, and
+COM outcome as separate observations. Mechanical completion does not imply
+hydraulic acceptance or an error-free computation.
+
+`result_modified_after`, when provided, must be a timezone-aware `datetime`.
+`result_artifact_structural_state` narrowly reports whether the plan-
+information group is present; it does not claim that a readable HDF is a
+complete result. Embedded HDF messages take precedence for health parsing,
+with stored messages used as a fallback.
+
+When HDF and `.O##` results coexist, selection follows the current plan-file
+`Program Version=` declaration. Unsafe combinations raise
+`ResultArtifactAmbiguityError`; the inspector never combines completion or
+runtime evidence from two result families. Use
+`RasCmdr.remove_plan_execution_artifacts()` for explicit, permanent,
+plan-scoped remediation, or rerun through ras-commander so the selected engine
+normalizes the artifacts. Actual runs clean before and after execution;
+skipped runs do not delete result artifacts. Cleanup requires a resolvable selected engine
+version and fails before mutation when that version is unknown. Worker and
+Docker promotion accepts only a successful plan's exact final result family;
+Linux preprocessing `.tmp.hdf` files are never published as results.
+
+#### Batch promotion safety
+
+`compute_parallel()` and `compute_test_mode()` treat destination promotion as
+one batch safety decision. Immediately before copying any plan result, message
+sidecar, or shared geometry HDF, ras-commander acquires an exact-create,
+tokenized destination lock and requires a complete, globally empty strict
+HEC-RAS process inventory. This intentionally blocks promotion when *any*
+recognized HEC-RAS launcher, solver, or preprocessor is active, even when it
+belongs to another plan: shared geometry makes plan-only occupancy checks
+insufficient.
+
+If the lock is already held, process inspection is incomplete, or the strict
+inventory is nonempty, no candidate in the batch is promoted or finalized.
+Every otherwise successful candidate is returned as unsuccessful with the
+lock and process-gate evidence in `execution_details_by_plan`. Fresh outputs
+remain available for explicit review or recovery at the exact
+`retained_worker_folder` or `retained_test_folder` path recorded there.
+
+The same recoverability rule applies after the gate succeeds. A missing
+primary result, any artifact copy that raises or returns `False`, or a
+finalization error marks the affected plan unsuccessful and retains its worker
+or test folder. Each candidate plan uses a destination-local publication
+transaction. Ras-commander first copies and hash-verifies the primary result,
+same-run message sidecars, and any selected shared geometry HDF under a unique
+hidden stage, without changing any recognized destination artifact. It then
+quarantines both result families, every known plan-message sidecar, and the
+shared geometry artifact being replaced. Only after that quarantine succeeds
+does it commit the fresh same-run set and run finalization.
+
+If staging, commit, verification, or finalization fails, ras-commander first
+removes every fresh artifact from recognized names. It restores the complete
+prior primary-family set as one safety group, then restores supporting
+artifacts. If either group cannot be completed, every artifact restored so far
+is re-quarantined; this avoids exposing one primary family with an ambiguous
+or partial sidecar set. Hash verification must prove the exact prior
+destination state before the transaction is discarded. When that proof
+succeeds, `rollback_confirmed` is true and no partial publication remains.
+When it cannot be proved, later publication in that batch is refused,
+`partial_promotion_possible` is true, and the hidden transaction, backup
+paths, and fresh worker or test folder remain available for explicit recovery.
+This ordering prevents an old result primary from being paired with a message
+sidecar from the failed new run.
+
+The lock prevents two cooperative ras-commander promotion batches from racing.
+It cannot prevent a person or unrelated program from launching HEC-RAS after
+the process snapshot, so do not open or compute the destination project in the
+GUI during promotion.
+
+#### WSL solver supervision
+
+On Windows, `compute_plan_linux()` uses a fail-closed WSL adapter. Before any
+solver launch it atomically acquires a per-plan lease and verifies that Bash,
+`setsid --wait`, `/proc` identity, durable sync, and process-group signalling
+are available. The solver runs as a session/process-group leader and publishes
+the lease token, its Linux PID, `/proc` start-time tick, and process-group ID
+before `exec`. Recovery rejects state that is not bound to the held lease.
+
+On timeout or Python interruption, ras-commander kills only its Windows WSL
+launcher and invokes a separate WSL recovery command. Recovery sends TERM and,
+if needed, KILL only after the current `/proc` identity exactly matches the
+published PID, start time, and process group; it then waits for positive group
+absence. Identity mismatch, unavailable identity, or incomplete recovery is
+recorded as indeterminate and never authorizes a signal.
+
+The WSL path deliberately does not remove an opposing result family before
+launch. It finalizes result artifacts only after exact solver quiescence is
+proved. If that proof or owned-state cleanup is uncertain, both visible result
+families and the per-plan lease are preserved, result validation/promotion and
+retry are refused, and a subsequent duplicate execution fails closed.
+
+### Structured process safety
+
+`RasControl.inspect_processes()` returns a strict host-wide inventory of
+recognized HEC-RAS launchers, solvers, preprocessors, sediment, and
+water-quality engines. `RasCmdr.inspect_plan_processes()` narrows that evidence
+to one initialized project and plan using exact path/token signatures. Both
+records expose `complete` and explicit query errors; callers making safety
+decisions must fail closed when inspection is incomplete.
+
+`RasCmdr.cancel_plan_exact()` revalidates process identity as `(pid,
+create_time)` before signalling and returns matched, stopped, survivor, query-
+error, timing, and tri-state quiescence evidence. Use this structured method
+for supervision and recovery. An incomplete exact-plan inventory is returned
+as indeterminate without sending any signal. The older Boolean
+`cancel_plan()` remains a compatibility wrapper: it returns `True` only when
+it found an exact match and quiescence was positively proved. Process creation,
+observation, and cancellation start/finish times are Unix epoch seconds.
+
+::: ras_commander.ExecutionEvidence.ExecutionEvidence
     options:
       show_root_heading: true
-      heading_level: 3
-      members:
-        - compute_plan
-        - cancel_plan
-        - compute_parallel
-        - compute_test_mode
+      heading_level: 4
+
+::: ras_commander.ExecutionEvidence.EvidenceObservation
+    options:
+      show_root_heading: true
+      heading_level: 4
+
+::: ras_commander.ExecutionArtifacts.PlanExecutionCleanup
+    options:
+      show_root_heading: true
+      heading_level: 4
+
+::: ras_commander.ExecutionArtifacts.PlanExecutionCleanupError
+    options:
+      show_root_heading: true
+      heading_level: 4
+
+::: ras_commander.ExecutionArtifacts.ResultArtifactAmbiguityError
+    options:
+      show_root_heading: true
+      heading_level: 4
 
 #### Real-Time Execution Monitoring (v0.88.0+)
 
-The `stream_callback` parameter enables real-time progress monitoring during HEC-RAS execution:
+The `compute_plan()` `stream_callback` parameter enables real-time progress
+monitoring during HEC-RAS execution. The
+[execution capability and return table](../user-guide/plan-execution.md#execution-capabilities-and-return-values)
+distinguishes the single-plan and batch entry points.
 
 ```python
 from ras_commander import RasCmdr
@@ -102,9 +414,9 @@ RasCmdr.compute_plan("01", stream_callback=callback)
 
 Callbacks receive notifications at key execution points:
 
-1. `on_prep_start(plan_number)` - Before geometry preprocessing
-2. `on_prep_complete(plan_number)` - After preprocessing
-3. `on_exec_start(plan_number, command)` - When HEC-RAS subprocess starts
+1. `on_prep_start(plan_number)` - Before plan setup, including requested preprocessor-file clearing and core settings
+2. `on_prep_complete(plan_number)` - After plan setup; engine preprocessing may still be required
+3. `on_exec_start(plan_number, command)` - Immediately before launching the HEC-RAS subprocess
 4. `on_exec_message(plan_number, message)` - Each .bco file message (real-time)
 5. `on_exec_complete(plan_number, success, duration)` - After execution
 6. `on_verify_result(plan_number, verified)` - After HDF verification (if `verify=True`)
@@ -147,25 +459,64 @@ class CustomCallback:
 RasCmdr.compute_plan("01", stream_callback=CustomCallback())
 ```
 
-!!! warning "Thread Safety for Parallel Execution"
-    Callbacks used with `compute_parallel()` must be thread-safe. Use `threading.Lock` for shared state:
+`compute_parallel()` and `compute_test_mode()` do not accept `stream_callback`.
+For serial monitoring, call `compute_plan()` in a loop.
+`SynchronizedCallback` protects callbacks shared by caller-managed threads; it
+does not enable callbacks on the batch APIs. Callback completion notifications
+are distinct from the final `ComputeResult` and its artifact-handling outcome.
 
-    ```python
-    from threading import Lock
+##### Linux-Hosted Unsteady Preparation
 
-    class ThreadSafeCallback:
-        def __init__(self):
-            self.lock = Lock()
-            self.results = {}
+<a id="ras_commander.RasPreprocess"></a>
 
-        def on_exec_complete(self, plan_number, success, duration):
-            with self.lock:
-                self.results[plan_number] = (success, duration)
-    ```
+::: ras_commander.RasPreprocess.RasPreprocess
+    options:
+      show_root_heading: true
+      heading_level: 6
+      members:
+        - preprocess_plan
+        - run_ras_geom_preprocess
+        - verify_preprocessing
+
+`preprocess_plan()` runs Windows HEC-RAS through native Windows Python or
+Windows Python hosted by Wine. For ordinary plans it stops at either the
+detailed `.bco` signal or an owned `RasUnsteady.exe` descendant after
+`.tmp.hdf`, `.b##`, and `.x##` are all non-empty. The returned
+`PreprocessResult.signal_source` records which path was used. First-run
+legal-assent dialogs are reported as blockers and are never accepted
+automatically.
+
+Gridded precipitation has a stricter readiness gate. The unsteady-flow HDF
+contains the authored source payload under
+`Event Conditions/Meteorology/Precipitation/Imported Raster Data`; HEC-RAS
+preprocessing must materialize the solver-facing `Precipitation/Values` and
+`Precipitation/Timestamp` datasets in the temporary plan HDF. The `.bco`
+marker can precede that handoff, so `preprocess_plan()` waits for fresh,
+complete preprocessing artifacts and validates both materialized datasets
+before reporting success. Plans without gridded precipitation retain the owned
+solver-process fallback. Treat a failed `PreprocessResult` as a failed
+precompute; do not launch
+the native solver with an incomplete temporary HDF.
+
+Point precipitation can be missing because HEC-RAS's own
+`RasProcess.exe CompletePreProcess` intermittently writes none ("No valid
+precipitation time-series data found for this time-window") while Ras.exe
+exits 0. `preprocess_plan()` then re-runs only that step on the same
+temporary HDF, from the project folder, up to `precipitation_repair_attempts`
+times (default 6; 0 disables) and re-validates after each attempt.
+`PreprocessResult.precipitation_repair_attempts` records each attempt, and a
+repaired result reports `signal_source="completepreprocess_repair"`. See
+[point precipitation repair](../user-guide/slurm-apptainer-execution.md#point-precipitation-repair).
+
+`run_ras_geom_preprocess()` performs the matching vendor geometry-preprocessor
+step with a bounded timeout, executable hash, before/after HDF hashes,
+compute-message parsing, and HDF readability/`Geometry`-group validation.
 
 ##### BcoMonitor Utility
 
-::: ras_commander.BcoMonitor
+<a id="ras_commander.BcoMonitor"></a>
+
+::: ras_commander.RasBco.BcoMonitor
     options:
       show_root_heading: true
       heading_level: 6
@@ -175,7 +526,9 @@ RasCmdr.compute_plan("01", stream_callback=CustomCallback())
 
 ##### ExecutionCallback Protocol
 
-::: ras_commander.ExecutionCallback
+<a id="ras_commander.ExecutionCallback"></a>
+
+::: ras_commander.ExecutionCallback.ExecutionCallback
     options:
       show_root_heading: true
       heading_level: 6
@@ -184,15 +537,26 @@ All callback methods are **optional** - implement only what you need. The protoc
 
 ### RasControl
 
-::: ras_commander.RasControl
+<a id="ras_commander.RasControl"></a>
+
+::: ras_commander.RasControl.RasControl
     options:
-      show_root_heading: true
+      show_root_heading: false
       heading_level: 3
+      show_source: false
       members:
-        - run_plan
+        - cleanup_orphans
+        - force_cleanup_all
+        - get_comp_msgs
+        - get_controller_progid
+        - get_output_times
+        - get_plans
         - get_steady_results
         - get_unsteady_results
-        - get_output_times
+        - inspect_processes
+        - list_processes
+        - run_plan
+        - scan_orphans
         - set_current_plan
 
 #### RasControl Details
@@ -278,103 +642,325 @@ The `get_comp_msgs()` method attempts to read computation messages from multiple
 
 ### RasPlan
 
-::: ras_commander.RasPlan
+<a id="ras_commander.RasPlan"></a>
+
+::: ras_commander.RasPlan.RasPlan
     options:
-      show_root_heading: true
+      show_root_heading: false
       heading_level: 3
+      show_source: false
       members:
+        - add_hdf_output_variable
+        - apply_hdf_output_profile
+        - clone_geom
         - clone_plan
-        - get_plan_path
-        - get_results_path
-        - get_restart_output_settings
-        - set_restart_output_settings
-        - set_geom
-        - set_flow
-        - set_num_cores
+        - clone_steady
+        - clone_unsteady
+        - create_plan_variants
+        - delete_geom
+        - delete_plan
+        - delete_steady
+        - delete_unsteady
+        - disable_hdf_output_variable
+        - enable_hdf_output_variable
         - get_2d_flow_options
-        - set_2d_flow_options
-        - set_2d_equation_set
+        - get_flow_path
+        - get_geom_path
+        - get_hdf_output_options
+        - get_hdf_output_variables
+        - get_hdf_write_parameters
+        - get_next_number
+        - get_plan_flow_type
+        - get_plan_path
+        - get_plan_title
+        - get_plan_value
+        - get_restart_output_settings
+        - get_results_path
+        - get_sediment_output_variables
+        - get_shortid
+        - get_unsteady_path
+        - is_plan_steady_state
         - list_2d_flow_option_names
-        - set_computation_interval
-        - set_output_interval
-        - set_description
-        - get_value
-        - set_value
+        - list_available_hdf_output_variables
+        - list_hdf_output_setting_profiles
+        - read_flow_description
+        - read_geom_description
+        - read_plan_description
+        - remove_hdf_output_variable
+        - renumber_geom
+        - renumber_plan
+        - renumber_steady
+        - renumber_unsteady
+        - set_2d_equation_set
+        - set_2d_flow_options
+        - set_geom
+        - set_geom_preprocessor
+        - set_hdf_output_options
+        - set_hdf_output_variable
+        - set_hdf_output_variables
+        - set_hdf_write_parameters
+        - set_num_cores
+        - set_plan_title
+        - set_restart_output_settings
+        - set_sediment_output_variables
+        - set_shortid
+        - set_steady
+        - set_unsteady
+        - update_flow_description
+        - update_geom_description
+        - update_plan_description
+        - update_plan_intervals
+        - update_run_flags
+        - update_simulation_date
+        - use_optimal_hdf_settings
 
 ### RasFlowOptimization
 
-::: ras_commander.RasFlowOptimization
+<a id="ras_commander.RasFlowOptimization"></a>
+
+::: ras_commander.RasFlowOptimization.RasFlowOptimization
     options:
-      show_root_heading: true
+      show_root_heading: false
       heading_level: 3
+      show_source: false
       members:
-        - copy_plan_with_optimization
-        - enable_plan
-        - set_settings
-        - get_settings
-        - disable_plan
-        - list_flow_hydrographs
         - compute_plan_and_get_trials
+        - copy_plan_with_optimization
+        - disable_plan
+        - enable_plan
+        - get_settings
         - get_trial_results
+        - list_flow_hydrographs
         - parse_compute_messages
+        - set_settings
 
 ### RasGeo
 
-::: ras_commander.RasGeo
+`RasGeo` is a deprecated compatibility namespace. Prefer the
+[geometry APIs](geometry.md), including `GeomLandCover` for roughness editing.
+
+
+<a id="ras_commander.RasGeo"></a>
+
+::: ras_commander.RasGeo.RasGeo
     options:
-      show_root_heading: true
+      show_root_heading: false
       heading_level: 3
+      show_source: false
       members:
         - clear_geompre_files
-        - get_base_mannings_table
-        - get_regional_mannings
-        - set_base_mannings_table
+        - clone_geom
+        - get_mannings_baseoverrides
+        - get_mannings_regionoverrides
+        - set_mannings_baseoverrides
+        - set_mannings_regionoverrides
 
 ### RasUnsteady
 
-::: ras_commander.RasUnsteady
+`RasUnsteady.set_boundary_inline_hydrograph(..., max_decimals=6)` retains
+fractional flow or stage ordinates using the existing eight-character field
+formatter. The keyword-only setting accepts integers from zero through six;
+precision is reduced where a value needs more room. Omitting it retains the
+two-decimal default. Invalid settings fail before changing the unsteady file.
+Native preprocessing and result readback remain separate validation steps.
+
+`RasUnsteady.set_constant_precipitation(path, value=0.01, units="in/hr", ratio=1.0)`
+sets a uniform rate without an inherited rainfall reduction multiplier. The
+keyword-only `ratio` is dimensionless and must round to a positive finite
+native Single. That rounded value is written consistently to the text and
+existing HDF sidecar. Overflow and underflow to zero fail before either write.
+Omit `ratio` to preserve existing ratio records. Rates may use `in/hr` or
+`mm/hr`; native preprocessing and readback remain separate checks.
+
+`disable_meteorology(..., remove_source_references=True)` prepares an owned
+boundary-only child without inherited gridded or point meteorological sources.
+It removes met station/source records and resets the sidecar meteorology groups
+to disabled. Boundary hydrographs, boundary DSS links, and infiltration are
+retained. The default preserves inactive sidecar sources. A valid empty
+unsteady sidecar is initialized with disabled meteorology groups; an owned
+compiled `*.tmp.hdf` still requires an existing Event Conditions group.
+
+The operation retains the existing CRLF text serialization and preserves
+legacy filename bytes.
+Records split only on CRLF, CR or LF. Unicode separators, form feeds and
+vertical tabs remain part of filenames and other record content.
+`boundary_conditions_unchanged` compares boundary bytes
+with only CR/LF record separators normalized. `boundary_conditions_byte_identical`
+also compares separators. Returned evidence includes flow-text hashes and all
+removed meteorological source keys, including primary precipitation keys.
+
+Changes are staged and validated before application. Original file objects,
+ACLs, ownership, permissions and hard links are retained, and an application
+exception restores original bytes. Use exclusive access. This is exception
+rollback, not crash atomicity. A crash or failed restoration leaves each
+original in the sibling `.<filename>.meteorology-*/original` recovery file;
+a restoration error reports these paths.
+
+<a id="ras_commander.RasUnsteady"></a>
+
+::: ras_commander.RasUnsteady.RasUnsteady
     options:
-      show_root_heading: true
+      show_root_heading: false
       heading_level: 3
+      show_source: false
       members:
-        - clone_unsteady
-        - get_unsteady_path
-        - get_restart_settings
-        - set_flow_title
-        - set_restart_settings
+        - batch_update_dss_references
+        - configure_gridded_dss_precipitation
+        - delete_boundary
+        - disable_meteorology
+        - ensure_2d_boundary_location
+        - extract_boundary_and_tables
+        - extract_tables
+        - get_dss_boundaries
+        - get_gate_openings
+        - get_gridded_precipitation_capabilities
+        - get_groundwater_interflow
         - get_initial_conditions
-        - set_initial_conditions
-        - get_boundary_tables
-        - set_normal_depth_boundary
+        - get_initial_flow_method
+        - get_initial_storage_elevations
+        - get_inline_hydrograph_boundaries
+        - get_lateral_inflow_hydrograph
+        - get_met_precipitation_config
+        - get_meteorological_stations
+        - get_min_storage_elevations
+        - get_navigation_dam
+        - get_non_newtonian_clastic
+        - get_non_newtonian_concentration
+        - get_non_newtonian_herschel_bulkley
+        - get_non_newtonian_method
+        - get_non_newtonian_shear
+        - get_point_evapotranspiration
+        - get_prior_ws_filename
+        - get_rating_curve
+        - get_restart_settings
+        - get_rules_bc
+        - get_stage_flow_hydrograph
+        - get_uniform_lateral_inflow_hydrograph
+        - get_unique_dss_subbasins
+        - identify_tables
+        - inspect_boundary_blocks
+        - parse_fixed_width_table
+        - preview_dss_references
+        - print_boundaries_and_tables
+        - read_unsteady_description
+        - replace_2d_boundary_locations
+        - set_boundary_dss_link
+        - set_boundary_inline_hydrograph
+        - set_constant_precipitation
+        - set_flow_hydrograph_qmin
         - set_flow_hydrograph_slope
+        - set_gate_openings
+        - set_gridded_precipitation
+        - set_gridded_precipitation_geotiff
+        - set_gridded_precipitation_grib
+        - set_groundwater_interflow
+        - set_hydrograph_fixed_start_time
+        - set_ic_from_output_profile
+        - set_initial_conditions
+        - set_initial_flow_method
+        - set_initial_storage_elevation
+        - set_lateral_inflow_hydrograph
+        - set_met_precipitation_mode
+        - set_meteorological_station
+        - set_navigation_dam
+        - set_non_newtonian_clastic
+        - set_non_newtonian_concentration
+        - set_non_newtonian_herschel_bulkley
+        - set_non_newtonian_method
+        - set_non_newtonian_shear
+        - set_normal_depth_boundary
+        - set_point_evapotranspiration
         - set_precipitation_hyetograph
+        - set_prior_ws_filename
+        - set_rating_curve
+        - set_restart_settings
+        - set_rules_bc
+        - set_stage_flow_hydrograph
+        - set_stage_hydrograph_initial_stage
+        - set_stage_hydrograph_tw_check
+        - set_uniform_lateral_inflow_hydrograph
+        - update_boundary_dss_paths
+        - update_dss_path_by_station
+        - update_dss_run_identifier
+        - update_flow_multiplier_by_station
+        - update_flow_title
+        - update_restart_settings
+        - update_unsteady_description
+        - validate_initial_flow_stations
+        - write_table_to_file
 
 ### RasSteady
 
-::: ras_commander.RasSteady
+<a id="ras_commander.RasSteady"></a>
+
+::: ras_commander.RasSteady.RasSteady
     options:
-      show_root_heading: true
+      show_root_heading: false
       heading_level: 3
+      show_source: false
       members:
-        - read_flow_file
-        - write_flow_file
-        - create_flow_file
-        - update_flow_file
-        - validate_flow_file_data
         - boundary
+        - create_flow_file
+        - critical_depth
         - known_water_surface
         - normal_depth
-        - critical_depth
         - rating_curve
+        - read_flow_file
+        - update_flow_file
+        - validate_flow_file_data
+        - write_flow_file
+
+Compatibility aliases: `create` → `create_flow_file`, `known_ws` → `known_water_surface`, `parse_flow_file` → `read_flow_file`, `read` → `read_flow_file`, `update` → `update_flow_file`, `validate` → `validate_flow_file_data`, `write` → `write_flow_file`, `write_file` → `write_flow_file`.
 
 ## Utilities
 
 ### RasUtils
 
-::: ras_commander.RasUtils
+<a id="ras_commander.RasUtils"></a>
+
+::: ras_commander.RasUtils.RasUtils
     options:
-      show_root_heading: true
+      show_root_heading: false
       heading_level: 3
+      show_source: false
+      members:
+        - backup_files
+        - calculate_error_metrics
+        - calculate_percent_bias
+        - calculate_rmse
+        - check_file_access
+        - clone_file
+        - consolidate_dataframe
+        - convert_to_dataframe
+        - create_directory
+        - decode_byte_strings
+        - discover_ras_versions
+        - dos2unix
+        - find_files_by_extension
+        - find_nearest_neighbors
+        - find_nearest_value
+        - find_valid_ras_folders
+        - get_file_modification_time
+        - get_file_size
+        - get_next_number
+        - get_plan_path
+        - horizontal_distance
+        - ignore_windows_reserved
+        - is_valid_ras_folder
+        - is_windows_reserved_name
+        - normalize_ras_number
+        - perform_kdtree_query
+        - remove_prj_entry
+        - remove_with_retry
+        - rename_prj_entry
+        - rollback_geometry
+        - safe_resolve
+        - safe_write_geometry
+        - save_to_excel
+        - update_file
+        - update_plan_file
+        - update_project_file
+        - validate_geometry_file_basic
 
 #### Method Categories
 
@@ -458,50 +1044,38 @@ indices = RasUtils.perform_kdtree_query(
 
 ### RasExamples
 
-::: ras_commander.RasExamples
+<a id="ras_commander.RasExamples"></a>
+
+::: ras_commander.RasExamples.RasExamples
     options:
-      show_root_heading: true
+      show_root_heading: false
       heading_level: 3
+      show_source: false
       members:
-        - list_projects
-        - list_categories
-        - list_sciencebase_models
-        - get_sciencebase_model_info
-        - inspect_sciencebase_model
-        - validate_sciencebase_model
+        - clean_projects_directory
+        - download_fema_ble_model
         - download_sciencebase_model
         - extract_project
-        - get_project_path
+        - get_example_projects
+        - get_sciencebase_model_info
+        - inspect_sciencebase_model
+        - is_project_extracted
+        - list_categories
+        - list_projects
+        - list_sciencebase_models
+        - organize_ebfe_model
+        - validate_sciencebase_model
+
+<a id="ras_commander.RasMap"></a>
 
 ### RasMap
 
-::: ras_commander.RasMap
-    options:
-      show_root_heading: true
-      heading_level: 3
-      members:
-        - parse_rasmap
-        - list_terrain_layers
-        - list_terrain_display_settings
-        - get_terrain_display_settings
-        - set_terrain_display_settings
-        - list_land_classification_layers
-        - list_landcover_layers
-        - list_soils_layers
-        - list_infiltration_layers
-        - list_land_classification_polygons
-        - add_land_classification_polygon
-        - update_land_classification_polygon
-        - delete_land_classification_polygon
-        - get_terrain_path
-        - get_landcover_path
-        - associate_geometry_layers
-        - get_hdf_geometry_association
-        - list_results_plans
-        - list_calculated_layers
-        - add_calculated_layer
-        - remove_calculated_layer
-        - add_wse_comparison_layers
+See the [RASMapper API section](rasmapper/index.md) for the complete task-grouped
+reference for display, classification authoring, and geometry completion.
+[Meshing](meshing.md), [Results Queries](results-queries.md), and
+[Stored Maps](stored-maps.md) have dedicated reference pages.
+
+Full method reference: [RasMap](rasmapper/index.md).
 
 #### RASMapper Layer Discovery
 
@@ -521,25 +1095,32 @@ infiltration_layers = RasMap.list_infiltration_layers(project_path)
 
 #### Classification Polygon Overrides
 
-`RasMap.add_land_classification_polygon()` authors the RAS Mapper `Classification Polygons` sidecar group used by land-cover, soils, and infiltration layers. It also upserts the affected `Raster Map` and `Variables` class rows when those datasets exist.
+`RasMap.list_land_classification_polygons()` provides read-only extraction for
+land-classification sidecars. For HEC-RAS 6.x and 7.0.x
+`LC Type=LandCover` sidecars, `add_land_classification_polygon()`,
+`update_land_classification_polygon()`, and
+`delete_land_classification_polygon()` persist one polygon through the native
+RASMapper feature-layer API. The selected class must already exist; these
+methods do not remap raster classifications or create/remove classes.
 
-```python
-from shapely.geometry import box
-from ras_commander import RasMap
+Polygon input must contain one effective polygon. A one-member `MultiPolygon`
+is normalized, while true multipart input and interior rings are rejected
+before mutation. HEC-RAS 6.0 through 7.0.1 persists native polygon holes but
+its land-cover classification resampler flattens them; accepting them would
+therefore misrepresent their hydraulic effect. Model an exclusion by splitting
+the intended coverage into explicit, non-overlapping hole-free polygons.
+GeoPandas inputs must use the sidecar CRS; raw Shapely and GeoJSON coordinates
+are assumed to already use that CRS. Every supported mutation creates a durable
+backup, saves through RASMapper, and validates a fresh reload.
 
-polygons = RasMap.add_land_classification_polygon(
-    "Land Classification/LandCover.hdf",
-    box(2083000, 370500, 2083500, 371000),
-    class_name="Parking Lot",
-    class_id=99,
-    variable_values={
-        "mannings_n": 0.105,
-        "percent_impervious": 95.0,
-    },
-)
-```
+HEC-RAS 5.x, soils/infiltration polygon mutation, and
+`remove_unused_class=True` fail with migration guidance. Geometry Manning
+regions remain the supported 5.x override route, while soils and infiltration
+sidecars should be rebuilt through their native authoring APIs when their
+classification structure changes.
 
-Use `list_land_classification_polygons()`, `update_land_classification_polygon()`, and `delete_land_classification_polygon()` for extraction and maintenance. After editing sidecar polygons for an already-associated geometry, rerun preprocessing/property-table workflows so compiled geometry HDFs consume the new override.
+This is separate from polygon inputs accepted by `restrict_to_extent`: those
+inputs define a single buffered processing extent and remain supported.
 
 #### Terrain Display Settings
 
@@ -561,7 +1142,11 @@ CLB-272 owns these terrain display toggles. CLB-253 remains the separate terrain
 
 #### Geometry HDF Layer Associations
 
-`RasMap.get_hdf_geometry_association()` reads `/Geometry` association attributes from geometry HDFs and plan/result HDFs without mutation. `RasMap.associate_geometry_layers()` writes the geometry HDF attributes through Python-native `h5py`.
+`RasMap.get_hdf_geometry_association()` reads `/Geometry` association
+attributes from geometry HDFs and plan/result HDFs without mutation.
+`RasMap.associate_geometry_layers()` delegates association changes to the
+selected HEC-RAS generation's native geometry-association API and validates
+the native readback.
 
 ```python
 association = RasMap.get_hdf_geometry_association("MyModel.g01.hdf")
@@ -577,21 +1162,55 @@ RasMap.associate_geometry_layers(
 ```
 
 !!! warning "Compiled HDF only"
-    `associate_geometry_layers()` updates an existing `.g##.hdf`. It does not compile plain-text `.g##` geometry into HDF or create missing geometry datasets.
+    `associate_geometry_layers()` updates an existing `.g##.hdf` through
+    HEC-RAS. It does not compile plain-text `.g##` geometry into HDF or create
+    missing geometry datasets.
+
+To exclude infiltration from a derived child, call
+`RasMap.clear_geometry_infiltration("Child.g02.hdf")` on a cloned geometry.
+It removes only the compiled geometry's infiltration filename, layer name,
+and file-date attributes, verifies the association is absent, and returns the
+resolved `Path`. It accepts `str` or `Path`, is idempotent, and rejects filenames
+other than `.gNN.hdf` before opening them. Terrain, land-cover, and other
+attributes are preserved. Existing infiltration property tables remain stale;
+rebuild native geometry/property tables before using the child. The method
+requires a directly linked `/Geometry` group owned by the supplied HDF;
+external links, soft links, and non-group objects are rejected before writable
+access. It writes a byte-exact backup in the same directory and flushes it
+before editing the original in place. It verifies all three attributes are
+absent and validates the association reader's result. On deletion, validation,
+or final-flush failure, it truncates and writes the backup bytes into the same
+original file, then flushes and synchronizes that file before removing the
+backup. Success also removes the backup. The original file object is never
+replaced or renamed: its ACL/security descriptor, owner, mode, hard-link count,
+and identity are preserved on success and rollback. An absent association
+leaves the file byte-identical. The directory must allow backup creation and
+removal; the original must be writable. Windows backups receive the source
+access-control entries before content is copied, without additional inherited
+grants; POSIX backups are restricted to the current user.
+On POSIX, writes can clear set-ID mode bits; the method reapplies them to the
+original object before its final flush. It refuses before mutation if the
+current user cannot restore the original set-ID mode.
+
+Use exclusive access while calling this method. Other readers can observe the
+in-place edit before validation or rollback; concurrent writers are unsupported.
+This guarantee covers exceptions when restoration I/O succeeds, not process
+crashes or power loss. A crash between editing and restoration leaves
+`.<stem>-infiltration-backup-<random>.hdf.bak` beside the geometry, for example
+`.Child.g02-infiltration-backup-<random>.hdf.bak`. For recovery, close HDF users
+and truncate and copy the backup bytes into the original file, then flush and
+synchronize it; do not replace or rename over the original. If restoration
+itself fails, the method retains the backup and reports its path in a
+`RuntimeError`. The method does not edit a RAS Mapper file or plan.
+
+<a id="ras_commander.RasProcess"></a>
 
 ### RasProcess
 
-::: ras_commander.RasProcess
-    options:
-      show_root_heading: true
-      heading_level: 3
-      members:
-        - find_rasprocess
-        - get_plan_timestamps
-        - store_maps
-        - store_all_maps
-        - validate_geometry_association_cli
-        - run_command
+See [stored maps](stored-maps.md) and
+[geometry completion](rasmapper/index.md) for the full method reference.
+
+Full method reference: [RasProcess](stored-maps.md).
 
 #### RasProcess Details
 
@@ -694,6 +1313,33 @@ results = RasProcess.store_maps(
     wse=True
 )
 ```
+
+##### Steady Profile Batch
+
+`RasProcess.store_maps_at_steady_profiles()` configures all requested profile
+products in one `.rasmap` update and invokes aggregate `StoreAllMaps` exactly
+once. `profiles=None` selects all HDF profiles; exact names and zero-based
+indexes can be mixed. One inundation boundary for the final selected profile is
+included by default. Supported profile rasters are `wse`, `depth`, `velocity`,
+`froude`, `shear_stress`, `depth_x_velocity`, `depth_x_velocity_sq`, and
+`flow`.
+
+```python
+frame = RasProcess.store_maps_at_steady_profiles(
+    "01",
+    profiles=None,
+    map_types=("depth",),
+    output_path="steady_maps",
+)
+```
+
+Rows carry `status` (`generated` or `missing`). When a requested product is
+missing, generated products are preserved and
+`StoredMapProductsIncompleteError` is raised with the full frame in
+`error.frame` (`raise_on_missing=False` returns the frame instead).
+
+Use `RasMap.store_all_maps(mode="steady_profiles", ...)` when a directly
+JSON-serializable project summary is preferred.
 
 !!! warning "Georeferencing Fix"
     RasProcess.exe has a known bug where generated TIFs may lack proper CRS information.

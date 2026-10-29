@@ -17,6 +17,21 @@ def _write_unsteady_file(path: Path, content: str) -> Path:
     return path
 
 
+def test_hdf_failure_does_not_advertise_new_dss_configuration(tmp_path, monkeypatch):
+    from ras_commander import RasUnsteady
+
+    path = _write_unsteady_file(tmp_path / "Model.u01", "Flow Title=Rain\nProgram Version=6.60\n")
+    before = path.read_bytes()
+
+    def locked_hdf(**kwargs):
+        raise PermissionError("HDF locked by another application")
+
+    monkeypatch.setattr(RasUnsteady, "_update_gridded_dss_precipitation_hdf", locked_hdf)
+    with pytest.raises(PermissionError, match="HDF locked"):
+        RasUnsteady.configure_gridded_dss_precipitation(path, "rain.dss", "/A/B/PRECIP///F/", ratio=1.0)
+    assert path.read_bytes() == before
+
+
 def test_configures_official_baldeagle_gridded_dss_structure_and_round_trips(tmp_path):
     from ras_commander import RasUnsteady
 
@@ -56,6 +71,9 @@ Boundary Location=                ,                ,        ,        ,          
     assert lines[start_idx:start_idx + len(expected_block)] == expected_block
     assert not any("Gridded GDAL" in line for line in lines)
     assert not any("Gridded Interpolation=" in line for line in lines)
+    assert "Met BC=Evapotranspiration|Mode=None" in lines
+    assert "Met BC=Air Density|Mode=Constant" in lines
+    assert "Met BC=Air Pressure|Mode=Constant" in lines
 
     config = RasUnsteady.get_met_precipitation_config(unsteady_file)
     assert config["precipitation_mode"] == "Enable"
@@ -95,6 +113,107 @@ Program Version=6.60
     assert config["interpolation"] == "Nearest"
     assert config["dss_filename"] == ".\\Precipitation\\precip.dss"
     assert config["hdf_attributes"]["Interpolation Method"] == "Nearest"
+
+    lines = unsteady_file.read_text(encoding="utf-8").splitlines()
+    assert "Met BC=Evapotranspiration|Mode=None" in lines
+    assert "Met BC=Air Density|Mode=Constant" in lines
+    assert "Met BC=Air Pressure|Mode=Constant" in lines
+
+
+def test_configure_gridded_dss_preserves_explicit_nonprecipitation_modes(tmp_path):
+    from ras_commander import RasUnsteady
+
+    unsteady_file = _write_unsteady_file(
+        tmp_path / "preserve_modes.u01",
+        "Flow Title=Preserve modes\n"
+        "Program Version=7.00\n"
+        "Met Point Raster Parameters=,,,,\n"
+        "Precipitation Mode=Disable\n"
+        "Wind Mode=No Wind Forces\n"
+        "Air Density Mode=Specified\n"
+        "Wave Mode=No Wave Forcing\n"
+        "Met BC=Precipitation|Mode=Constant\n"
+        "Met BC=Evapotranspiration|Mode=Point Gage\n"
+        "Met BC=Air Density|Mode=Gridded\n"
+        "Met BC=Air Pressure|Mode=Point\n"
+        "Non-Newtonian Method= 0\n",
+    )
+
+    RasUnsteady.configure_gridded_dss_precipitation(
+        unsteady_file,
+        "rain.dss",
+        BALD_EAGLE_DSS_PATHNAME,
+    )
+
+    lines = unsteady_file.read_text(encoding="utf-8").splitlines()
+    assert lines.count("Met BC=Evapotranspiration|Mode=Point Gage") == 1
+    assert lines.count("Met BC=Air Density|Mode=Gridded") == 1
+    assert lines.count("Met BC=Air Pressure|Mode=Point") == 1
+    assert "Met BC=Evapotranspiration|Mode=None" not in lines
+    assert "Met BC=Air Density|Mode=Constant" not in lines
+    assert "Met BC=Air Pressure|Mode=Constant" not in lines
+
+
+def test_configure_gridded_dss_completes_blank_nonprecipitation_modes(tmp_path):
+    from ras_commander import RasUnsteady
+
+    unsteady_file = _write_unsteady_file(
+        tmp_path / "blank_modes.u01",
+        "Flow Title=Blank modes\n"
+        "Program Version=7.00\n"
+        "Met BC=Evapotranspiration|Mode=\n"
+        "Met BC=Air Density|Mode=  \n"
+        "Met BC=Air Pressure|Mode=\n",
+    )
+
+    RasUnsteady.configure_gridded_dss_precipitation(
+        unsteady_file,
+        "rain.dss",
+        BALD_EAGLE_DSS_PATHNAME,
+    )
+
+    lines = unsteady_file.read_text(encoding="utf-8").splitlines()
+    assert lines.count("Met BC=Evapotranspiration|Mode=None") == 1
+    assert lines.count("Met BC=Air Density|Mode=Constant") == 1
+    assert lines.count("Met BC=Air Pressure|Mode=Constant") == 1
+
+
+def test_configure_gridded_dss_keeps_met_block_contiguous_after_wave_mode(tmp_path):
+    from ras_commander import RasUnsteady
+
+    unsteady_file = _write_unsteady_file(
+        tmp_path / "ordered_modes.u01",
+        "Flow Title=Ordering\n"
+        "Program Version=7.00\n"
+        "Met BC=Evapotranspiration|Expanded View=0\n"
+        "Met Point Raster Parameters=,,,,\n"
+        "Precipitation Mode=Disable\n"
+        "Wind Mode=No Wind Forces\n"
+        "Air Density Mode=Specified\n"
+        "Wave Mode=No Wave Forcing\n"
+        "Met BC=Precipitation|Mode=Constant\n"
+        "Met BC=Air Density|Expanded View=0\n"
+        "Non-Newtonian Method= 0\n",
+    )
+
+    RasUnsteady.configure_gridded_dss_precipitation(
+        unsteady_file,
+        "rain.dss",
+        BALD_EAGLE_DSS_PATHNAME,
+    )
+
+    lines = unsteady_file.read_text(encoding="utf-8").splitlines()
+    met_indexes = [i for i, line in enumerate(lines) if line.startswith("Met BC=")]
+    assert met_indexes == list(range(min(met_indexes), max(met_indexes) + 1))
+    assert min(met_indexes) > lines.index("Wave Mode=No Wave Forcing")
+    assert max(met_indexes) < lines.index("Non-Newtonian Method= 0")
+    assert lines.index("Met BC=Evapotranspiration|Mode=None") < lines.index(
+        "Met BC=Evapotranspiration|Expanded View=0"
+    )
+    assert lines.index("Met BC=Air Density|Mode=Constant") < lines.index(
+        "Met BC=Air Density|Expanded View=0"
+    )
+    assert "Met BC=Air Pressure|Mode=Constant" in lines
 
 
 def test_absolute_dss_path_inside_unsteady_folder_is_written_relative(tmp_path):
@@ -139,6 +258,34 @@ def test_absolute_dss_path_outside_unsteady_folder_is_preserved(tmp_path):
     assert config["hdf_attributes"]["DSS Filename"] == str(absolute_dss)
 
 
+def test_configure_gridded_dss_accepts_string_and_safe_resolves_project_path(
+    tmp_path, monkeypatch
+):
+    from ras_commander import RasUnsteady, RasUtils
+
+    unsteady_file = _write_unsteady_file(
+        tmp_path / "mapped_drive.u01",
+        "Flow Title=Mapped Drive\nProgram Version=6.60\n",
+    )
+    resolved = []
+
+    def tracked_safe_resolve(path):
+        resolved.append(Path(path))
+        return Path(path)
+
+    monkeypatch.setattr(RasUtils, "safe_resolve", staticmethod(tracked_safe_resolve))
+
+    RasUnsteady.configure_gridded_dss_precipitation(
+        unsteady_file=str(unsteady_file),
+        dss_filename="Precipitation/precip.dss",
+        dss_pathname=BALD_EAGLE_DSS_PATHNAME,
+    )
+
+    assert resolved == [unsteady_file]
+    config = RasUnsteady.get_met_precipitation_config(unsteady_file)
+    assert config["dss_filename"] == ".\\Precipitation\\precip.dss"
+
+
 def test_invalid_gridded_dss_interpolation_raises(tmp_path):
     from ras_commander import RasUnsteady
 
@@ -154,3 +301,120 @@ def test_invalid_gridded_dss_interpolation_raises(tmp_path):
             dss_pathname=BALD_EAGLE_DSS_PATHNAME,
             interpolation="Kriging",
         )
+
+
+def test_hec_ras_61_rejects_retained_dss_ratio_before_mutation(tmp_path):
+    from ras_commander import RasUnsteady
+
+    unsteady_file = _write_unsteady_file(
+        tmp_path / "ratio.u01",
+        "Flow Title=Ratio\n"
+        "Program Version=6.10\n"
+        "Met BC=Precipitation|Ratio=1.25\n",
+    )
+    before = unsteady_file.read_bytes()
+
+    with pytest.raises(ValueError, match="does not apply that ratio"):
+        RasUnsteady.configure_gridded_dss_precipitation(
+            unsteady_file,
+            "rain.dss",
+            BALD_EAGLE_DSS_PATHNAME,
+        )
+
+    assert unsteady_file.read_bytes() == before
+    assert not Path(str(unsteady_file) + ".hdf").exists()
+
+
+def test_hec_ras_61_explicit_unit_dss_ratio_clears_retained_value(tmp_path):
+    from ras_commander import RasUnsteady
+
+    unsteady_file = _write_unsteady_file(
+        tmp_path / "ratio.u01",
+        "Flow Title=Ratio\n"
+        "Program Version=6.10\n"
+        "Met BC=Precipitation|Ratio=1.25\n",
+    )
+
+    RasUnsteady.configure_gridded_dss_precipitation(
+        unsteady_file,
+        "rain.dss",
+        BALD_EAGLE_DSS_PATHNAME,
+        ratio=1.0,
+    )
+
+    text = unsteady_file.read_text(encoding="utf-8")
+    assert text.count("Met BC=Precipitation|Ratio=") == 1
+    assert "Met BC=Precipitation|Ratio=1\n" in text
+    with h5py.File(Path(str(unsteady_file) + ".hdf"), "r") as hdf:
+        ratio = hdf["Event Conditions/Meteorology/Precipitation"].attrs["Ratio"]
+        assert ratio == pytest.approx(1.0)
+
+
+def test_historic_dss_precipitation_resets_cloned_ratio_in_text_and_hdf(
+    tmp_path, caplog
+):
+    from ras_commander import RasUnsteady
+
+    unsteady_file = _write_unsteady_file(
+        tmp_path / "historic_dss.u01",
+        "Flow Title=Ratio\n"
+        "Program Version=6.60\n"
+        "Met BC=Precipitation|Ratio=0.8768\n",
+    )
+    hdf_path = Path(str(unsteady_file) + ".hdf")
+    with h5py.File(hdf_path, "w") as hdf:
+        hdf.require_group("Event Conditions/Meteorology/Precipitation").attrs[
+            "Ratio"
+        ] = 0.8768
+
+    with caplog.at_level("WARNING"):
+        RasUnsteady.configure_gridded_dss_precipitation(
+            unsteady_file,
+            "rain.dss",
+            BALD_EAGLE_DSS_PATHNAME,
+            historic=True,
+        )
+
+    assert "Met BC=Precipitation|Ratio=1\n" in unsteady_file.read_text(
+        encoding="utf-8"
+    )
+    with h5py.File(hdf_path, "r") as hdf:
+        ratio = hdf["Event Conditions/Meteorology/Precipitation"].attrs["Ratio"]
+        assert ratio == pytest.approx(1.0)
+    warnings = "\n".join(record.getMessage() for record in caplog.records)
+    assert unsteady_file.name in warnings
+    assert "0.8768" in warnings
+
+
+def test_explicit_dss_ratio_preserves_native_crlf_line_endings(tmp_path):
+    """HEC-RAS may reject otherwise valid boundary blocks after LF conversion."""
+    from ras_commander import RasUnsteady
+
+    unsteady_file = tmp_path / "native_crlf.u01"
+    unsteady_file.write_bytes(
+        b"Flow Title=CRLF\r\n"
+        b"Program Version=7.00\r\n"
+        b"Precipitation Mode=Disable\r\n"
+        b"Met BC=Precipitation|Mode=None\r\n"
+        b"Boundary Location=,BaldEagleCr,Upstream Inflow\r\n"
+        b"Interval=1HOUR\r\n"
+        b"Flow Hydrograph= 2\r\n"
+        b"       1       2\r\n"
+    )
+
+    RasUnsteady.configure_gridded_dss_precipitation(
+        unsteady_file,
+        "rain.dss",
+        BALD_EAGLE_DSS_PATHNAME,
+        interpolation="Bilinear",
+        ratio=1.0,
+    )
+
+    written = unsteady_file.read_bytes()
+    assert b"\r\n" in written
+    assert written.count(b"\n") == written.count(b"\r\n")
+    assert b"Met BC=Precipitation|Ratio=1\r\n" in written
+    assert b"Met BC=Evapotranspiration|Mode=None\r\n" in written
+    assert b"Met BC=Air Density|Mode=Constant\r\n" in written
+    assert b"Met BC=Air Pressure|Mode=Constant\r\n" in written
+    assert b"Boundary Location=,BaldEagleCr,Upstream Inflow\r\n" in written

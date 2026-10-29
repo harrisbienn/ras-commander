@@ -37,6 +37,8 @@ from shapely.ops import unary_union
 
 from .Decorators import log_call
 from .LoggingConfig import get_logger
+from .fast_hdf import read_attr
+from ._execution_types import BenefitAreaConfig
 
 logger = get_logger(__name__)
 
@@ -177,44 +179,6 @@ BENEFIT_COLORMAP = {
     BenefitCategory.PARTIALLY_BENEFITED: (255, 191, 0, 255),
     BenefitCategory.FULLY_BENEFITED: (35, 139, 69, 255),
 }
-
-
-@dataclass(frozen=True)
-class BenefitAreaConfig:
-    """Pair-aware configuration used by :meth:`RasProcess.store_maps`.
-
-    ``pre_plan_number`` is the baseline plan; the ``plan_number`` supplied to
-    ``store_maps`` is the post-project plan.
-    """
-
-    pre_plan_number: str
-    terrain_tif: Union[str, Path]
-    terrain_name: Optional[str] = None
-    include_wse: bool = False
-    flood_min_depth: float = 0.05
-    benefit_min_depth: float = 0.25
-    minimum_region_pixels: Optional[int] = 16
-    analysis_boundary: Any = None
-    improvement_boundary: Any = None
-    polygon_output: Optional[Union[bool, str, Path]] = None
-    polygon_simplify_tolerance: Optional[float] = None
-
-    def __post_init__(self) -> None:
-        if self.pre_plan_number is None or not str(self.pre_plan_number).strip():
-            raise ValueError("pre_plan_number is required for BenefitArea mapping")
-        if self.terrain_tif is None or not str(self.terrain_tif).strip():
-            raise ValueError(
-                "terrain_tif is required for BenefitArea mapping. "
-                f"{RasBenefits.TERRAIN_REMEDIATION}"
-            )
-        RasBenefits._validate_thresholds(
-            self.flood_min_depth,
-            self.benefit_min_depth,
-        )
-        RasBenefits._validate_minimum_region_pixels(self.minimum_region_pixels)
-        RasBenefits._validate_polygon_simplify_tolerance(
-            self.polygon_simplify_tolerance
-        )
 
 
 @dataclass(frozen=True)
@@ -402,7 +366,7 @@ class RasBenefits:
                 terrain_group = hdf.get("Terrain")
                 if terrain_group is not None:
                     def collect_file_attribute(_name, obj) -> None:
-                        value = obj.attrs.get("File")
+                        value = read_attr(obj, "File", None)
                         if value is None:
                             return
                         if isinstance(value, (bytes, np.bytes_)):
@@ -1220,15 +1184,15 @@ class RasBenefits:
 
     @staticmethod
     def _require_geoparquet_support() -> None:
-        """Fail early with the installation command required for GeoParquet."""
+        """Fail early when the required core GeoParquet dependency is absent."""
 
         try:
             import pyarrow  # noqa: F401
         except ImportError as exc:
             raise ImportError(
-                "GeoParquet polygon output requires the optional 'pyarrow' "
-                "dependency. Install it with "
-                "`pip install 'ras-commander[geoparquet]'`."
+                "GeoParquet polygon output requires ras-commander's core "
+                "'pyarrow' dependency, but it is unavailable. Reinstall or "
+                "repair the ras-commander environment."
             ) from exc
 
     @staticmethod

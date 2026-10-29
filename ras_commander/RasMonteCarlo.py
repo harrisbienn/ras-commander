@@ -39,6 +39,7 @@ Scope and limitations
 from __future__ import annotations
 
 import re
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -114,15 +115,36 @@ _FLOW_MULTIPLIER_COLUMNS = (
 
 _BREACH_GEOM_INDEX = {
     "centerline": 0,
-    "initial_width": 1,
+    "final_bottom_width": 1,
     "final_bottom_elev": 2,
     "left_slope": 3,
     "right_slope": 4,
-    "active": 5,
-    "weir_coef": 6,
-    "top_elev": 7,
-    "formation_method": 8,
-    "formation_time": 9,
+    "failure_mode": 5,
+    "piping_coefficient": 6,
+    "initial_piping_elevation": 7,
+    "formation_time": 8,
+    "weir_coefficient": 9,
+}
+
+_BREACH_GEOM_SAFE_ALIASES = {
+    "initial_width": "final_bottom_width",
+    "weir_coef": "weir_coefficient",
+}
+
+_BREACH_GEOM_UNSAFE_LEGACY_TARGETS = {
+    "active": (
+        "'active' was incorrectly mapped to the Breach Geom failure-mode flag. "
+        "Use 'failure_mode' for piping/overtopping, or 'is_active' for the "
+        "stored Breach Loc activation flag."
+    ),
+    "top_elev": (
+        "'top_elev' was incorrectly mapped to initial piping elevation. "
+        "Use 'initial_piping_elevation'."
+    ),
+    "formation_method": (
+        "'formation_method' was incorrectly mapped to breach formation time. "
+        "Use 'formation_time'; breach method/trigger settings are separate fields."
+    ),
 }
 
 _BREACH_SCALAR_FIELDS = {
@@ -145,7 +167,6 @@ _SUPPORTED_BREACH_TARGETS = (
 _BREACH_INT_FIELDS = {
     "method",
     "progression_mode",
-    "formation_method",
     "user_growth_flag",
     "mass_wasting_option",
     "dlb_soil_type",
@@ -154,10 +175,10 @@ _BREACH_INT_FIELDS = {
     "dlb_breach_direction",
 }
 
-_BREACH_BOOL_FIELDS = {"active", "is_active"}
+_BREACH_BOOL_FIELDS = {"is_active"}
 
 _DEFAULT_BREACH_COLUMN_MAP = {
-    "initial_width": "breach_width",
+    "final_bottom_width": "breach_width",
     "final_bottom_elev": "breach_bottom_elev",
     "left_slope": "breach_left_slope",
     "right_slope": "breach_right_slope",
@@ -1176,7 +1197,7 @@ class RasMonteCarlo:
         """Extract sorted cell-level maximum WSE values from one HDF."""
         from .hdf import HdfResultsMesh
 
-        mesh_df = HdfResultsMesh.get_mesh_max_ws(hdf_path)
+        mesh_df = HdfResultsMesh.get_mesh_max_ws(hdf_path, include_geometry=False)
         if mesh_df.empty:
             raise ValueError(f"No mesh max WSE rows found in {hdf_path}")
 
@@ -1377,14 +1398,17 @@ class RasMonteCarlo:
                 f"Could not resolve geometry HDF for {hdf_path}"
             )
 
-        cell_points = HdfMesh.get_mesh_cell_points(geom_hdf_path)
+        # Physical cells only, matching the other full-domain extractors.
+        cell_points = HdfMesh.get_mesh_cell_points(
+            geom_hdf_path, include_ghost_cells=False, include_geometry=False
+        )
         if cell_points.empty:
             raise ValueError(f"No mesh cell points found in {geom_hdf_path}")
 
         query_points = np.column_stack(
             (
-                cell_points.geometry.x.to_numpy(dtype=float),
-                cell_points.geometry.y.to_numpy(dtype=float),
+                cell_points["x"].to_numpy(dtype=float),
+                cell_points["y"].to_numpy(dtype=float),
             )
         )
         queried = HdfResultsQuery.query_points(
@@ -1570,6 +1594,9 @@ class RasMonteCarlo:
                 sample_weights.append(float(sample_weight))
 
             except Exception as exc:
+                from .fast_hdf import reraise_required
+
+                reraise_required(exc)
                 logger.debug(
                     "Dropping sample %s during %s extraction from %s: %s",
                     sample_id,
@@ -1759,23 +1786,75 @@ class RasMonteCarlo:
         if not param_column_map:
             return normalized
 
+        explicit_targets = set()
         for left, right in param_column_map.items():
             left_str = str(left).strip()
             right_str = str(right).strip()
 
-            if left_str in _SUPPORTED_BREACH_TARGETS:
-                normalized[left_str] = right_str
-                continue
-
-            if right_str in _SUPPORTED_BREACH_TARGETS:
-                normalized[right_str] = left_str
-                continue
-
-            raise ValueError(
-                "Breach mappings must use supported targets such as "
-                "'initial_width', 'final_bottom_elev', 'method', "
-                "'formation_time', etc."
+            recognized_targets = (
+                _SUPPORTED_BREACH_TARGETS
+                | set(_BREACH_GEOM_SAFE_ALIASES)
+                | set(_BREACH_GEOM_UNSAFE_LEGACY_TARGETS)
             )
+            if (
+                left_str in recognized_targets
+                and right_str in recognized_targets
+            ):
+                raise ValueError(
+                    "Breach mapping is ambiguous because both sides are "
+                    f"recognized targets: '{left_str}' and '{right_str}'. "
+                    "Use a sample-column name that is not also a breach target."
+                )
+
+            if left_str in _SUPPORTED_BREACH_TARGETS:
+                target, column_name = left_str, right_str
+            elif right_str in _SUPPORTED_BREACH_TARGETS:
+                target, column_name = right_str, left_str
+            else:
+                alias_target = None
+                alias_column = None
+                legacy_target = None
+
+                if left_str in _BREACH_GEOM_SAFE_ALIASES:
+                    alias_target = left_str
+                    alias_column = right_str
+                elif right_str in _BREACH_GEOM_SAFE_ALIASES:
+                    alias_target = right_str
+                    alias_column = left_str
+                elif left_str in _BREACH_GEOM_UNSAFE_LEGACY_TARGETS:
+                    legacy_target = left_str
+                elif right_str in _BREACH_GEOM_UNSAFE_LEGACY_TARGETS:
+                    legacy_target = right_str
+
+                if legacy_target is not None:
+                    raise ValueError(
+                        _BREACH_GEOM_UNSAFE_LEGACY_TARGETS[legacy_target]
+                    )
+
+                if alias_target is None:
+                    raise ValueError(
+                        "Breach mappings must use supported targets such as "
+                        "'final_bottom_width', 'final_bottom_elev', 'method', "
+                        "'formation_time', etc."
+                    )
+
+                target = _BREACH_GEOM_SAFE_ALIASES[alias_target]
+                column_name = alias_column
+                warnings.warn(
+                    f"Breach target '{alias_target}' is deprecated; use "
+                    f"'{target}'.",
+                    FutureWarning,
+                    stacklevel=3,
+                )
+
+            if target in explicit_targets:
+                raise ValueError(
+                    f"Breach target '{target}' is mapped more than once; use "
+                    "only its canonical name."
+                )
+
+            explicit_targets.add(target)
+            normalized[target] = column_name
 
         return normalized
 
@@ -1796,6 +1875,29 @@ class RasMonteCarlo:
     @staticmethod
     def _coerce_breach_value(target: str, value: Any) -> Any:
         """Coerce param_row values onto expected breach scalar types."""
+        if target == "failure_mode":
+            if isinstance(value, (bool, np.bool_)):
+                return bool(value)
+
+            if isinstance(value, (int, float, np.number)):
+                if float(value) == 1.0:
+                    return True
+                if float(value) == 0.0:
+                    return False
+                raise ValueError(
+                    "failure_mode numeric values must be exactly 1 or 0"
+                )
+
+            text = str(value).strip().lower()
+            if text in {"piping", "true", "1"}:
+                return True
+            if text in {"overtopping", "false", "0"}:
+                return False
+            raise ValueError(
+                "failure_mode must be 'piping'/'overtopping' or a 1/0 "
+                "boolean equivalent"
+            )
+
         if target in _BREACH_BOOL_FIELDS:
             return RasMonteCarlo._coerce_boolean_like(value)
 
@@ -1958,7 +2060,7 @@ class RasMonteCarlo:
         num_cores: int = 2,
         max_plans_per_batch: int = 99,
         ras_object: Any = None,
-        timeout_sec: Optional[int] = None,
+        timeout_sec: Optional[float] = None,
         clear_geompre: bool = False,
         clone_geom: bool = False,
         workers: Optional[list] = None,
@@ -1975,7 +2077,8 @@ class RasMonteCarlo:
             num_cores: HEC-RAS core count per plan execution.
             max_plans_per_batch: Limit per batch project.
             ras_object: Optional project object for multi-project workflows.
-            timeout_sec: Optional per-plan timeout in seconds.
+            timeout_sec: Optional local per-plan engine deadline in seconds,
+                excluding setup and preprocessing. Remote overrides are rejected.
             clear_geompre: Clear .c## preprocessor files before execution.
             clone_geom: Clone geometry file per sample.
             workers: Optional list of remote worker objects from
@@ -1998,6 +2101,11 @@ class RasMonteCarlo:
         the Post-Execution Protocol; this module does not wire that scan into
         every sample automatically.
         """
+        from .RasCmdr import RasCmdr
+
+        timeout_sec = RasCmdr._normalize_max_runtime(timeout_sec)
+        if workers and timeout_sec is not None:
+            raise ValueError("timeout_sec is not supported for remote workers; configure worker runtime limits instead")
         prepared_samples = RasMonteCarlo._prepare_samples_df(samples_df)
 
         plan_matrix = RasPermutation.generate_plans(
@@ -2090,15 +2198,22 @@ class RasMonteCarlo:
         1. ``run_ensemble(..., clone_geom=True)`` — clone the geometry PER sample
            so each ``.g##`` is independent; otherwise all samples share one
            geometry and the apply_fn writes collide.
-        2. ``run_ensemble(..., clear_geompre=True)`` — the per-cell ``Cells Center
-           Manning's n`` is a geometry-preprocessing product cached in the
-           ``.g##.hdf``; ``clear_geompre`` (now including the in-HDF preprocessor
-           tables, association preserved) forces HEC-RAS to re-derive it from the
-           perturbed ``LCMann`` on each sample. ``force_geompre`` is NOT needed and
-           would collapse per-cell n to the uniform default.
+        2. Run a native HEC-RAS geometry/plan computation after changing the
+           text geometry. ``clear_geompre=True`` may be used to remove the
+           corresponding ``.c##`` cache, but ras-commander no longer deletes
+           selected datasets inside ``.g##.hdf``. ``force_geompre`` is not
+           needed for a cloned Manning-table change because the fresh ``.g##``
+           mtime already defeats the smart results skip.
 
         Without both, the ensemble runs but shows ZERO roughness sensitivity
         (identical per-cell n / WSE across all samples).
+
+        Note: ``clear_geompre`` is evaluated AFTER the smart skip, so it only runs
+        when the plan is not already current. That is safe here because condition 1
+        refreshes the ``.g##`` mtime every sample. An ensemble that perturbs only a
+        land-cover sidecar in place, without cloning the geometry, would leave the
+        ``.g##`` mtime untouched, be skipped, and silently reuse the cached n --
+        use ``force_geompre=True`` (which implies ``force_rerun``) for that shape.
         """
         if not isinstance(zone_column_map, dict) or not zone_column_map:
             raise ValueError(
@@ -2185,7 +2300,7 @@ class RasMonteCarlo:
                     zone_name: float(param_row[column_name])
                     for zone_name, column_name in normalized_map.items()
                 }
-                HdfLandCover.set_landcover_raster_map(
+                HdfLandCover.set_landcover_mannings_n(
                     landcover_hdf,
                     class_mapping,
                     ras_object=ras_object,
@@ -2199,7 +2314,15 @@ class RasMonteCarlo:
         structure_name: str,
         param_column_map: Optional[Dict[str, str]] = None,
     ) -> Callable[[Path, pd.Series, Any], None]:
-        """Factory: return an apply_fn that modifies breach parameters."""
+        """Return an apply function for canonical breach parameters.
+
+        ``param_column_map`` may use target-to-column or column-to-target
+        orientation only when exactly one side is a recognized target. The
+        deprecated ``initial_width`` and ``weir_coef`` aliases warn and map to
+        their corrected canonical targets; unsafe legacy targets fail closed.
+        Valid nine-field records retain their arity unless a weir coefficient
+        is requested, which appends the optional tenth field.
+        """
         if not isinstance(structure_name, str) or not structure_name.strip():
             raise ValueError("structure_name must be a non-empty string")
 
@@ -2241,13 +2364,16 @@ class RasMonteCarlo:
                             value.strip()
                             for value in str(raw_geom).split(",")
                         ]
-                        if len(geom_values) < 10:
+                        if len(geom_values) not in {9, 10}:
                             raise ValueError(
                                 f"Breach Geom for '{structure_name}' has "
-                                f"{len(geom_values)} fields; expected 10"
+                                f"{len(geom_values)} fields; expected 9 or 10"
                             )
 
-                    geom_values[_BREACH_GEOM_INDEX[target]] = coerced_value
+                    geom_index = _BREACH_GEOM_INDEX[target]
+                    if geom_index == 9 and len(geom_values) == 9:
+                        geom_values.append("")
+                    geom_values[geom_index] = coerced_value
                 else:
                     update_kwargs[target] = coerced_value
 

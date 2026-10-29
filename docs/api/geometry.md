@@ -2,6 +2,202 @@
 
 Classes for parsing and modifying HEC-RAS geometry files.
 
+## Native property tables and regional mapping recovery
+
+Use `RasMap.recompute_property_tables(project, geometry, hecras_version="6.6")`
+on a disposable model copy. For modern HEC-RAS versions, the computation runs
+in a separate Python process launched with `-I` to ignore `PYTHONPATH` and
+user-site startup hooks. It rejects preloaded foreign HDF5 DLLs, loads the
+selected installation's `bin64` DLLs by absolute path, and checks their module
+handles and filenames. A native object probe verifies that managed HDF calls
+share reference-count changes with that exact DLL; version and thread-safety
+checks also run before computation. Installation, geometry, and recovery-source
+paths become absolute in the caller before the worker changes directories;
+mapped drive letters are preserved.
+The call raises on a native process failure or a 1,800-second timeout, then
+checks the existing complete-geometry and nonempty table-pair postconditions.
+It preserves the geometry's source CRS and units and does not establish
+hydraulic acceptance. The HEC-RAS 5.x route is unchanged.
+The isolated worker requires Windows Python, either on Windows or under Wine,
+and the `mesh` extra (`pythonnet>=3.0.5`). Native run qualification here covers
+HEC-RAS 6.6; other modern releases require their own qualification.
+
+A compiled child with regional roughness polygons but no calibration table
+can fail in the native land-cover resampler. Recover a missing regional
+mapping from a same-source geometry whose native region attributes and polygon
+datasets are byte-identical:
+
+```python
+from ras_commander import GeomLandCover, RasMap
+
+recovery = GeomLandCover.restore_mannings_region_mappings(
+    "reference.g02.hdf", "child.g02.hdf", hecras_version="6.6"
+)
+RasMap.recompute_property_tables("study.prj", "child.g02", hecras_version="6.6")
+```
+
+The recovery is qualified with HEC-RAS 6.6. The caller must use geometries from
+the same source CRS and unit system; the method performs no coordinate or unit
+conversion. It refuses an existing target calibration table, changed region
+identities, duplicate class names, or finite base-table overrides.
+The method accepts only float32 numeric calibration columns. HEC-RAS
+writes the original regional mappings through its native mapping methods;
+the method verifies class names and float32 value bytes afterward. Native
+string storage widths may differ, so the returned source/target table hashes
+need not match. The receipt dictionary records those hashes, the backup path,
+class count, identity checks, and `recompute_required=True`.
+Native writing may also resize region-name storage and add an empty `2D Area
+Name` attribute. Existing attribute values and all polygon datasets must
+remain unchanged; other attribute additions fail verification and roll back.
+Postwrite verification also preserves `Complete Geometry`, permits only the
+new calibration dataset, and compares every unrelated dataset with the backup.
+
+The source remains read-only. The target is backed up and restored if recovery
+fails. No cell or face hydraulic dataset is copied, and recovery does not mark
+an incomplete geometry complete. Run native geometry/property computation and
+normal QA before accepting the child. These operations do not repair a changed
+mesh or establish equivalence between full and cropped terrains.
+
+## Unified Cross-Section Points
+
+`RasCrossSections.get_points(project, geometry)` exports the same stable point
+schema from a plain-text `.g##` geometry or compiled `.g##.hdf`. Pass a
+`RasPrj`, project folder, or `.prj` file for `project`; pass a geometry number,
+title, text path, or HDF path for `geometry`. `source="auto"` prefers an
+available HDF for project geometry selectors, while an explicit source path
+keeps its source type.
+
+```python
+from ras_commander import RasCrossSections
+
+points = RasCrossSections.get_points("Muncie.prj", "01")
+points.to_csv("muncie-xs-points.csv", index=False)
+```
+
+The frame includes model/geometry/reach/XS identifiers; exact river, reach, and
+river-station strings; native and station order; cut-line relative distance;
+XYZ; Manning's n and bank fields; horizontal CRS/units; vertical units/datum;
+`vertical_units_source`; and source/extraction provenance. Native elevations are preserved by default.
+A vertical datum is never inferred from a horizontal CRS or a model centroid.
+When the source does not store a datum, pass `vertical_datum=` explicitly;
+`vertical_units=` is the highest-priority override, followed by the full
+project's text `.prj` marker. A direct `HdfXsec.get_xs_coords()` call uses only
+genuinely explicit HDF vertical-unit metadata and does not infer units from
+generic HDF unit-system flags. The source column reports `explicit`,
+`project_text`, `geometry_hdf_explicit`, or `unknown`.
+
+The identifiers are deterministic within one export; collection-wide model
+identity remains the responsibility of the consuming catalog. Prefer Parquet
+for large exports because the complete transform-provenance JSON is repeated
+per point and can make CSV files unnecessarily large.
+
+Vertical conversion is opt-in through `VerticalTransform`. Use either an exact
+PROJ pipeline or explicit source and target 3D/compound CRSs. The operation is
+run against every point's own X/Y/Z coordinate, and the requested operation,
+resolved PROJ definition, datum/unit labels, and PROJ/pyproj versions are
+stored in `vertical_transform_provenance` and `DataFrame.attrs`.
+
+```python
+from ras_commander import RasCrossSections, VerticalTransform
+
+transform = VerticalTransform(
+    source_vertical_datum="NAVD88",
+    target_vertical_datum="Local project datum",
+    source_vertical_units="ft",
+    target_vertical_units="ft",
+    pipeline="+proj=pipeline +step +proj=affine +zoff=1.25",
+)
+
+adjusted = RasCrossSections.get_points(
+    "Muncie.prj",
+    "01",
+    vertical_datum="NAVD88",
+    vertical_transform=transform,
+)
+```
+
+An affine offset is shown only to make the explicit operation easy to inspect.
+For geodetic vertical transformations, use the project-approved PROJ pipeline
+or full compound CRS definitions and confirm required grid files are installed.
+
+## RAS Mapper Reach-Length QA
+
+`RasGeometryCompute.assess_flow_path_policy()` determines whether a joined 1D
+reach may safely regenerate its overbank flow paths. It copies the whole project,
+forces RAS Mapper to regenerate flow paths on the copy, recomputes LOB/channel/ROB
+reach lengths, and compares them with the stored values. The source project is
+never modified.
+
+```python
+from ras_commander import RasGeometryCompute
+
+policy = RasGeometryCompute.assess_flow_path_policy(
+    "JoinedModel.g01.hdf",
+    tolerance_fraction=0.01,
+)
+
+print(policy.recommended_policy)
+display(policy.reach_metrics_df)
+display(policy.xs_metrics_df)
+```
+
+The recommendation is `regenerate_and_recompute` only when every usable LOB and
+ROB interval reproduces its stored length within 1%. Otherwise it is
+`preserve_and_recompute_only_at_join_boundary`. The preserve policy is also selected
+when no source flow paths span a reach but its stored overbank lengths differ
+from the channel lengths. This prevents an automatically generated path from
+silently replacing evidence of intentionally different overbank routing.
+
+For a provisional joined reach, pass the two cross sections adjacent to the
+join. The method returns exactly one regenerated left and right segment clipped
+between those cut lines. Save the review evidence directly as GeoParquet when
+desired:
+
+```python
+policy = RasGeometryCompute.assess_flow_path_policy(
+    "JoinedModel.g01.hdf",
+    join_upstream_xs=("Walnut", "Main", "5304.8"),
+    join_downstream_xs=("Walnut", "Main", "4884.4"),
+    review_segments_path="working/walnut_join_flow_paths.parquet",
+)
+
+display(policy.join_segments_gdf[["side", "length", "geometry"]])
+```
+
+Join selectors may use the full-precision restationed values returned by
+`RasBreakout1D.assemble_network_edge().seams_gdf`. Compiled geometry HDF files
+can store those values at a shorter displayed precision; the selector accepts a
+unique match within one unit of that displayed precision and still fails closed
+when more than one cross section could match.
+
+The clipped segment lengths supply only the new join interval's LOB/ROB values;
+the remaining stored source lengths stay unchanged under the preserve policy.
+The returned geometries should be retained for visual review.
+
+`audit_main_channel_lengths()` is the independent, read-only informative QA
+check. It accepts either a plain-text `.g##` geometry or a compiled `.g##.hdf`,
+measures the distance between adjacent cross-section intersections along the
+river centerline, and compares that distance with the stored channel reach
+length. It flags non-terminal intervals outside the supplied relative tolerance
+or with an invalid centerline intersection.
+
+```python
+channel_audit = RasGeometryCompute.audit_main_channel_lengths(
+    "WALNUT 0229.g01",
+    tolerance_fraction=0.01,
+)
+display(channel_audit[channel_audit["main_channel_flagged"]])
+```
+
+These APIs follow HEC's documented distinction: channel length comes from the
+river line, while LOB/ROB lengths come from flow paths. Automatically generated
+flow paths are review starting points rather than reconstructions of engineering
+judgment. See the official HEC-RAS Mapper pages for
+[Cross Sections](https://www.hec.usace.army.mil/confluence/rasdocs/rmum/latest/geometry-data/cross-sections)
+[Rivers](https://www.hec.usace.army.mil/confluence/rasdocs/rmum/latest/geometry-data/rivers),
+[River Station Markers](https://www.hec.usace.army.mil/confluence/rasdocs/rmum/latest/geometry-data/river-station-markers),
+and [Flow Path Lines](https://www.hec.usace.army.mil/confluence/rasdocs/rmum/latest/geometry-data/flow-path-lines).
+
 ## GeomProjection
 
 Model geometry reprojection helpers for copied HEC-RAS projects and plain-text
@@ -163,6 +359,7 @@ reference-line output.
 
 - `add_reference_lines(geom_file, lines, storage_area)` - Insert manually
   supplied reference lines into a `.g##` file
+- `replace_reference_lines(geom_file, storage_area, reference_lines, *, expected_existing_names=..., create_backup=True)` - Atomically replace or remove one existing 2D area's complete reference-line collection while preserving other areas; returns the backup path, or `None` when backups are disabled
 - `generate_reference_lines_from_longitudinal_line(...)` - Generate
   transverse reference-line dictionaries at regular station intervals along a
   named longitudinal line
@@ -196,38 +393,41 @@ back to normal-to-line orientation unless `orientation_fallback="raise"` is set.
 
 ## GeomMesh
 
-Headless 2D mesh generation helpers and compiled geometry HDF refinement-region
-utilities.
+See [Meshing: Generation, Diagnostics and Repair](meshing.md) for the complete
+method reference, runtime matrix, diagnostics, and repair evidence.
 
-### Refinement Region Methods
+<a id="domain-and-mesh-methods"></a>
+<a id="hec-ras-version-support-for-headless-mesh-generation"></a>
+<a id="hec-ras-refinement-region-caveats"></a>
+<a id="refinement-region-methods"></a>
 
-- `add_refinement_region(geom_number, polygon, spacing_dx, ...)` - Add one refinement polygon to an existing compiled geometry HDF.
-- `add_flowline_refinement_regions(geom_number, flowlines, buffer_width, ...)` - Buffer GeoDataFrame or LineString channel flowlines into refinement-region polygons, optionally simplify/trim them, write them through `add_refinement_region()`, and return FID/name/spacing mappings.
-- `get_refinement_regions(geom_number)` - Read refinement-region FID, name, and spacing values from a compiled geometry HDF.
-- `set_refinement_region_spacing(geom_number, spacing_dx, ...)` - Update spacing for one or more existing refinement regions.
-- `set_refinement_region_name(geom_number, new_name, ...)` - Rename an existing refinement region.
+The [repair contract](meshing.md#repair-persistence-and-failure-contract),
+[version support](meshing.md#hec-ras-version-support-for-headless-mesh-generation),
+and [refinement caveats](meshing.md#hec-ras-refinement-region-caveats) retain the
+existing qualification and failure limits.
 
-## RasStruct
+## Structure APIs
 
-Inline structure parsing.
+Inline structures are exposed through the public `GeomInlineWeir`,
+`GeomBridge`, and `GeomCulvert` classes. There is no public `RasStruct` class.
 
 ### Inline Weir Methods
 
-- `get_inline_weirs(geom)` - List inline weirs
-- `get_inline_weir_profile(geom, river, reach, station)` - Get weir profile
-- `get_inline_weir_gates(geom, river, reach, station)` - Get gate data
+- `GeomInlineWeir.get_weirs(geom, river=None, reach=None)` - List inline weirs
+- `GeomInlineWeir.get_profile(geom, river, reach, station)` - Get weir profile
+- `GeomInlineWeir.get_gates(geom, river, reach, station)` - Get gate data
 
 ### Bridge Methods
 
-- `get_bridges(geom)` - List bridges
-- `get_bridge_deck(geom, river, reach, station)` - Get deck profile
-- `get_bridge_piers(geom, river, reach, station)` - Get pier data
-- `get_bridge_abutment(geom, river, reach, station)` - Get abutment data
-- `get_bridge_approach_sections(geom, river, reach, station)` - Get approach sections
-- `get_bridge_coefficients(geom, river, reach, station)` - Get coefficients
-- `get_hydraulic_methods(geom, river, reach, station)` - Get bridge low-flow/high-flow method selections from `Bridge Culvert-`, `Deck Dist Width WeirC`, `BR Coef=`, and `WSPro=` records
-- `set_hydraulic_methods(geom, river, reach, station, low_flow_method=..., high_flow_method=..., weir_coefficient=...)` - Set bridge modeling approach method selections and related coefficients
-- `get_bridge_htab(geom, river, reach, station)` - Get HTAB settings
+- `GeomBridge.get_bridges(geom)` - List bridges
+- `GeomBridge.get_deck(geom, river, reach, station)` - Get deck profile
+- `GeomBridge.get_piers(geom, river, reach, station)` - Get pier data
+- `GeomBridge.get_abutment(geom, river, reach, station)` - Get abutment data
+- `GeomBridge.get_approach_sections(geom, river, reach, station)` - Get approach sections
+- `GeomBridge.get_coefficients(geom, river, reach, station)` - Get coefficients
+- `GeomBridge.get_hydraulic_methods(geom, river, reach, station)` - Get bridge low-flow/high-flow method selections from `Bridge Culvert-`, `Deck Dist Width WeirC`, `BR Coef=`, and `WSPro=` records
+- `GeomBridge.set_hydraulic_methods(geom, river, reach, station, low_flow_method=..., high_flow_method=..., weir_coefficient=...)` - Set bridge modeling approach method selections and related coefficients
+- `GeomBridge.get_htab(geom, river, reach, station)` - Get HTAB settings
 
 Accepted `low_flow_method` values are `energy`, `momentum`, `yarnell`, and `wspro`.
 Accepted `high_flow_method` values are `energy` and `pressure_weir`.
@@ -324,21 +524,208 @@ Bridge geometry authoring (deck profiles, piers, abutments, approach sections).
 
 ### Methods
 
-- `build_bridge(geom_file, river, reach, rs, **bridge_params)` - Author complete bridge geometry
-- `get_bridge_deck(geom_file, river, reach, rs)` - Read bridge deck profile
-- `set_bridge_deck(geom_file, river, reach, rs, deck_data)` - Write bridge deck profile
+- `get_bridges(geom_file, river=None, reach=None)` - List bridges
+- `get_deck(geom_file, river, reach, rs)` - Read bridge deck profile
+- `set_deck(geom_file, river, reach, rs, deck_data, ...)` - Write bridge deck profile
 
 ## GeomBcLines
 
-2D boundary condition line geometry authoring.
+Read and author boundary condition line geometry.
+
+`GeomBcLines.get_bc_lines(geom_file)` reads a plain-text `.g##` file into a
+DataFrame with `name`, `storage_area`, `coordinates`, and `coordinate_count`
+columns, in file order. Each `coordinates` value is a list of `(x, y)` tuples
+in the source coordinate system and units. The reader preserves stored
+precision, strips surrounding name padding, and rejects missing headers,
+invalid arc counts, truncated or non-finite coordinates, and missing
+text-position terminators. A file without BC lines returns an empty frame
+with the same columns. The call leaves the file unchanged and requires no
+initialized project, geometry HDF, or HEC-RAS installation.
+Start, middle, end, and text-position records must be present; their display
+position values are ignored. Returned vertices come only from the arc payload.
+
+```python
+from ras_commander import GeomBcLines
+
+bc_lines = GeomBcLines.get_bc_lines("child.g01")
+outlets = bc_lines.loc[bc_lines["storage_area"] == "Perimeter 1"]
+```
+
+Use `HdfBndry.get_bc_lines()` to read compiled geometry HDF lines instead.
+The text reader does not establish mesh attachment or boundary forcing.
+
+`replace_bc_lines(geom_file, unsteady_files, *, area_2d, lines, ras_object=None)`
+replaces the complete named-area line set and its forcing in one staged
+transaction. Pass explicit paths in a disposable cloned project. Each line
+specification contains `name`, `coordinates`, and `bc_type`: `Normal Depth`
+requires `friction_slope`; `Flow Hydrograph` requires `hydrograph_df` and
+`friction_slope`; `Stage Hydrograph` requires `hydrograph_df`. Hydrographs use
+`hour` and `value` columns. The supplied forcing applies to every supplied flow
+file. An empty `lines` list clears the target area's named perimeter boundaries.
+
+Other areas, 1D boundaries, and area-wide rainfall remain intact. Supply every
+associated unsteady file; an initialized clone `ras_object` verifies this set
+through project DataFrames and rejects flows shared with other geometries.
+Without that context, completeness is the caller's responsibility. The result
+is a DataFrame with `geom_file`, `unsteady_file`, `area_2d`, `bc_line`, and
+`bc_type`, plus removed names and backup paths in `attrs`.
+
+```python
+from ras_commander.geom import GeomBcLines
+
+written = GeomBcLines.replace_bc_lines(
+    "child.g01", ["child.u01"], area_2d="Perimeter 1",
+    lines=[dict(name="OUTLET", coordinates=[(100, 200), (300, 200)],
+                bc_type="Normal Depth", friction_slope=0.001)],
+)
+```
+
+All inputs are validated and staged before replacement, with backups and
+byte-exact rollback on write exceptions. This is exception atomicity across
+the supplied files; individual file swaps are atomic. It does not provide
+crash-atomic visibility across multiple files. Exclude concurrent readers and
+writers. The method does not create the clone or update compiled HDF files.
+Run native preprocessing, then inspect `HdfMesh.get_mesh_perimeter_faces()`
+before relying on native face attachment. A complete disposable example is
+provided in `scripts/validate_perimeter_bc.py`; the companion fleet shell script
+targets `fim-hecras-wine:6.6-clb-v8`.
 
 ### Methods
 
-- `add_bc_line(geom_file, flow_area, name, coordinates, bc_type)` - Add BC line to 2D flow area
-- `get_bc_lines(geom_file, flow_area=None)` - Read existing BC lines
-- `remove_bc_line(geom_file, flow_area, name)` - Remove a BC line
+- `get_bc_lines(geom_file)` - Read BC line identities and vertices from geometry text
+- `add_bc_lines(geom_file, lines, replace_existing=False)` - Add or upsert named geometry lines
+- `delete_bc_line(geom_file, name)` - Delete a named geometry line
+- `rename_bc_line(geom_file, old_name, new_name)` - Rename a geometry line
+- `replace_bc_lines(...)` - Replace all target-area lines and supplied unsteady references
+- `set_bc_line_types(geom_file, line_types, *, hecras_dir=None, expected_geometry_sha256=None)` - Persist explicit `Internal`/`External` classifications in a current compiled geometry through native RAS Mapper APIs. Supply exact BC names and types from the authored placement; lines not named keep their current type. The method requires matching text/HDF BC identities and coordinates, retains a sibling HDF backup, and returns before/after hashes and `lines`, one type decision per compiled line (unnamed lines included, unchanged). It uses an isolated process with HEC-RAS's bundled HDF5; it does not edit BC coordinates or forcing. Re-run geometry preprocessing after a type changes to rebuild connectivity.
+
+Matching types return with `changed=false`, identical hashes and no backup or
+native write. For a real change, native export can omit the compiled `Length`
+field and compact identity string storage. The API validates the native row
+identities and every other retained value, then preserves the original attribute
+schema, metadata and quantities while copying only verified `Type` decisions.
+It never invents a missing length. The native receipt must list every compiled
+line exactly once with its expected type. Unknown field loss, input changes, an
+invalid or incomplete decision receipt, a type change on an unnamed line or type
+truncation fail and restore the whole HDF backup.
+The additive `attribute_schema_preserved` flag and, after native work,
+`native_attribute_fields` list describe this preservation in the existing
+`ras-bc-line-types/v1` record. Recompile geometry after an actual type change;
+these fields do not establish native product completion or hydraulic acceptance.
 
 ## GeomLateral
+
+### Complete SA/2D connection records
+
+Use `GeomLateral.get_connection_data(geom_file)` to read one row per connection.
+The existing `get_connections()` metadata interface is unchanged. The complete
+reader adds `LineCoordinates`, `CrestProfile`, `TerrainProfile`, `Culverts` and
+`Gates` as nested DataFrames; `WeirWidth` and `WeirCoefficient` as model-unit
+scalars; `Breach`, `UnknownRecords`, `ParseIssues` and `DefaultsUsed` as lists;
+and exact `RawBlock` text. Reference-line and IC-point headers terminate a
+connection block; replacing external BC lines preserves those independent
+features and the connection inventory. Profiles use `Station`/`Elevation`, coordinates use
+`X`/`Y`. Unknown/version-specific records are preserved in raw form, not claimed
+to be decoded hydraulic parameters. An absent terrain profile is empty; no
+terrain is silently sampled. CRS, elevation units and vertical datum inherit
+the source model and are not converted or inferred.
+
+`write_connection_data(geom_file, connections_df, create_backup=True)` replaces
+the connection inventory with the supplied complete rows, preserving unrelated
+geometry text. Omitted rows are removed deliberately. `RawBlock` is authoritative:
+decoded columns are checked against it; use focused setters to edit a physical
+field and reread before a lossless write. Duplicate names and inconsistent rows
+fail before mutation. Both APIs accept strings or `Path` objects; they operate
+on explicit geometry files, with no global project state.
+
+```python
+from pathlib import Path
+import shutil
+from ras_commander import GeomLateral, RasExamples
+
+project = RasExamples.extract_project("BaldEagleCrkMulti2D", output_path="working/sa2d")
+source = project / "BaldEagleDamBrk.g13"
+child = Path("working/sa2d/roundtrip.g13")
+shutil.copy2(source, child)
+records = GeomLateral.get_connection_data(source)
+GeomLateral.write_connection_data(child, records)
+assert records.RawBlock.tolist() == GeomLateral.get_connection_data(child).RawBlock.tolist()
+```
+
+A runnable example is `scripts/sa2d_connection_roundtrip.py`.
+
+### Explicit physical authoring and clipping
+
+`GeomStorage.replace_breaklines()` preserves the supplied native protection
+flag in geometry text: `-1` and `1` enable one-cell protection; `0` disables it.
+Other integer values and fractional flags are rejected before mutation. Native
+HEC-RAS HDF/readback uses Boolean `True`/`1` for the delivered text value `-1`.
+
+`set_connection(..., weir_width=..., weir_coef=..., crest_profile=...)` requires
+explicit physical inputs. `crest_profile` is a DataFrame with `Station` and
+`Elevation`. Supply both exact existing area names and finite line coordinates.
+The historical width 100, coefficient 3 and zero crest are only available with
+`allow_defaults=True`; `DefaultsUsed` records which fields used that choice.
+These numbers are compatibility defaults, not qualified physical geometry.
+Callers supplying the former implicit defaults must opt in or provide measured
+parameters. Use culvert, gate, bridge and profile setters for specialized edits.
+
+`classify_connections(geom_file, child_boundary, retained_area_names=None,
+tolerance=0, allow_extended_support=False)` returns a GeoDataFrame with `Name`,
+`From`, `To`, `action`, `reason` and support `geometry`. The default preserves
+the existing acceptance policy: gates and undecoded records block classification.
+The child geometry must use the source horizontal CRS and model units.
+Width-expanded line support and explicit culvert barrel coordinates are considered.
+
+Pass `allow_extended_support=True` to include verified gate GIS support and
+accept cell-size metadata and the additional verified empty native bridge template.
+This adds `gate_group_count` before `geometry` in the return frame. The choice
+applies only to that read-only call; `GeomStorage.clip_2d_flow_area()` continues
+to use the default acceptance policy. Gate support requires explicit opening GIS lines,
+positive finite opening widths/heights and consistent opening counts/stations.
+The support includes each GIS line buffered by half its delivered gate width.
+`gate_group_count` counts verified native gate groups; unknown gate/bridge/breach
+support still blocks the edit. Empty native bridge templates do not establish
+physical bridge support. The expanded weir line is a conservative spatial screen;
+the delivered weir width is a schematic field, not a surveyed embankment footprint.
+Actions are `keep`, `drop`, `block`. Every decision has a stable reason code.
+Positive tolerance guards external separation; it does not excuse a physical
+footprint crossing the child perimeter. Named endpoints must remain present.
+
+`get_connection_gate_lines(geom_file, connection_name)` reads only explicitly
+stored opening GIS lines and returns `opening_index`, `opening_name`, `geometry`
+in source model coordinates without an inferred CRS. Missing, incomplete,
+duplicated or nonconsecutive indexes and invalid coordinates raise `ValueError`;
+no gate GIS records return an empty frame. Station-derived substitute lines are
+not inferred. The [HEC-RAS 6.6 User's Manual, Storage Area and 2D Flow Area
+Connections](https://www.hec.usace.army.mil/confluence/rasdocs/rasum/6.6/entering-and-editing-geometric-data/storage-area-and-2d-flow-area-connections)
+describes individual hydraulic-outlet GIS lines, including gates, and the
+schematic use of weir width. This parser's supported format is tested separately.
+
+`remap_connection_areas(geom_file, area_name_map)` returns source-ordered `Name`
+and authoritative `RawBlock` pairs without changing the source. Only recognized
+endpoint area-name records change; physical and control records remain exact.
+Filter the returned frame and pass it to `write_connection_data` on a clone.
+Ambiguous endpoint records or invalid mapping names raise `ValueError`. Mapping
+names does not establish native attachment or hydraulic equivalence.
+
+`GeomStorage.clip_2d_flow_area(geom_file, flow_area_name, geometry,
+containment_tolerance=0, create_backup=True)` stages all changes, retains internal
+records exactly and explicitly reports fully external removals. Partial or
+unknown affected support raises a reason-bearing error before changing the
+original. Unrelated areas and connections are retained. Its return value uses
+the six default decision columns; `attrs['backup_path']` identifies the backup and
+`attrs['attachment_status']` remains `CONNECTION_ATTACHMENT_UNVERIFIED`.
+It accepts a contained Polygon; hole-aware/multipart perimeter authoring remains
+outside this API. Existing `set_2d_flow_area_perimeter()` stays compatible and
+does not provide this connection-classification workflow.
+
+Text retention does not establish attachment or hydraulic equivalence. After
+fresh native preprocessing, inspect `HdfStruc.get_connection_attachments()`.
+Missing native evidence remains unverified; an offset line inside only one area
+cannot establish the other attachment. Forward flow, tailwater reversal, wet/dry
+transitions and engineer-selected WSE/volume/peak gates still need hydraulic
+qualification against an unsplit control.
 
 Lateral structure parsing and modification.
 
@@ -358,25 +745,56 @@ Storage area and 2D flow area geometry parsing and writing.
 - `get_2d_flow_area_settings(geom_file)` - Read 2D flow area computation settings
 - `set_2d_flow_area_settings(geom_file, area_name, **settings)` - Write 2D flow area settings (subgrid sampling, composite classification)
 - `write_2d_flow_area_perimeter(geom_file, area_name, coordinates, ...)` - Write 2D flow area perimeter
+- `plan_2d_flow_area_perimeter(coordinates=..., geometry=...)` - Plan native serialization without mutation. Removes only adjacent serialized XY pairs within the existing `GeomMesh.PERIMETER_NEAR_DUPLICATE_TOL` of 1e-6 source horizontal units, including closure. Uses the last retained point to bound chained removal; preserves distinct 0.003-unit edges. Returns original removed indexes, source/authored WKB hashes, tolerance, validity, boundary displacement and signed area change in source units (square units for area). The authored polygon must be valid, and removal-only displacement must stay within the near-duplicate tolerance. `set_2d_flow_area_perimeter()` uses this plan; callers retain their own final geometry/feature acceptance checks and canonical input artifacts.
+- `replace_breaklines(geom_file, flow_area_name, breaklines, expected_existing_names=..., ...)` - Atomically replace the geometry-global breakline collection while preserving supplied near/far spacing, near-repeat, and protection-radius values.
 
-## GeomLevee
+`GeomMesh.clip_refinement_regions()` accepts a valid, positive-area Polygon or
+MultiPolygon mask without holes. An inward buffer can split a narrow-necked
+child polygon into disconnected pieces; clipping retains every positive-area
+intersection fragment by default and preserves all native refinement controls.
+The read-only clip report retains its existing schema. This internal mask does
+not change the requirement to author one computational-domain polygon.
+
+## MeshRegenerationWorkflow
+
+Exact RAS Mapper geometry import and legacy mesh-regeneration GUI workflows.
+
+### Methods
+
+- `refresh_geometry_hdf_from_text(geom_number=..., geometry_name=..., flow_area_name=..., ras_object=..., ...)` - Transactionally displace one exact geometry HDF, let the explicitly initialized HEC-RAS version rebuild it from task-local `.g##` text, validate the exact 2D perimeter and sibling-HDF isolation, and roll back on failure. This imports geometry features but does not create computation cells.
+- `regenerate_mesh(geom_number=..., geometry_name=..., flow_area_name=..., ras_object=..., ...)` - Open/save and validate an already-current exact geometry and compiled mesh.
+- `regenerate_mesh_iterative(...)` - Legacy retry workflow; exact geometry selectors are supported and no first-registration fallback is used.
+
+<a id="geomlevee"></a>
+
+## Cross-section levees
+
+`GeomLevee` is not a public class. Use `GeomCrossSection.get_levees()` and
+`GeomCrossSection.set_levees()`; their full contracts appear below.
 
 Levee station-elevation parsing and modification.
 
 ### Methods
 
-- `get_levees(geom_file, river=None, reach=None, rs=None)` - Read levee data for cross sections
-- `set_levees(geom_file, river, reach, rs, levee_data)` - Write levee station-elevation data
+- `GeomCrossSection.get_levees(...)` - Read left/right levee points; unset points are NaN
+- `GeomCrossSection.set_levees(...)` - Write explicitly selected left/right station and elevation values
 
 ## RasBreach
 
-Breach parameter modification in plan files.
+Breach discovery and parameter modification in plan files. Detailed computed
+results are read separately through `HdfResultsBreach`.
 
 ### Methods
 
-- `list_breach_structures_plan(plan)` - List structures with breach data
-- `read_breach_block(plan, structure)` - Read breach parameters
-- `update_breach_block(plan, structure, **params)` - Modify breach parameters
+- `list_breach_structures_plan(plan_input, *, ras_object=None)` - Return one dictionary per stored definition with `structure`, `river`, `reach`, `station`, and local stored `is_active`
+- `read_breach_block(plan_input, structure_name, *, ras_object=None)` - Return the named definition's location, raw `values`, and parsed `table_rows`
+- `update_breach_block(plan_input, structure_name, *, is_active=None, method=None, geom_values=None, start_values=None, progression_mode=None, progression_pairs=None, downcutting_pairs=None, widening_pairs=None, calculator_data=None, dlb_methods=None, dlb_soil_type=None, dlb_soil_properties=None, dlb_core_soil_type=None, dlb_cover_option=None, dlb_cover_soil_properties=None, dlb_breach_direction=None, user_growth_flag=None, user_growth_ratio=None, mass_wasting_option=None, create_backup=True, ras_object=None)` - Update complete stored fields and tables
+- `set_breach_geom(plan_input, structure_name, *, centerline=None, final_bottom_width=None, final_bottom_elev=None, left_slope=None, right_slope=None, failure_mode=None, piping_coefficient=None, initial_piping_elevation=None, formation_time=None, weir_coefficient=None, initial_width=None, weir_coef=None, active=None, top_elev=None, formation_method=None, ras_object=None)` - Update selected fields in the `Breach Geom` record; `initial_width`/`weir_coef` are deprecated safe aliases, while the three other legacy keywords fail closed with migration guidance
+- `create_breach_block(plan_input, structure_name, *, river="", reach="", station="", is_active=True, create_backup=True, ras_object=None)` - Create a new minimal stored breach block
+
+The list output is the structure-level discovery API. Project-level
+`plan_df` contains only `breach_definition_count` and
+`breach_active_count`; it does not duplicate the full definition records.
 
 ## Usage Examples
 
@@ -400,10 +818,815 @@ RasGeometry.set_station_elevation("01", "River", "Reach", "1000", sta_elev)
 ```python
 from ras_commander import RasBreach
 
-# Update breach parameters
-RasBreach.update_breach_block(
-    "01", "Dam1",
+# Update named fields in Breach Geom
+RasBreach.set_breach_geom(
+    "01",
+    "Dam1",
     formation_time=2.0,
-    bottom_width=100.0
+    final_bottom_width=100.0,
+    weir_coefficient=2.6,
 )
 ```
+
+## Complete source reference
+
+The sections above explain common operations. The source-derived reference below
+includes the remaining public methods and their full signatures. Method-specific
+prerequisites and return contracts take precedence over abbreviated summaries.
+
+### GeomParser source reference
+
+::: ras_commander.geom.GeomParser.GeomParser
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - create_backup
+        - extract_comma_list
+        - extract_keyword_value
+        - extract_river_reach
+        - format_fixed_width
+        - get_1d_footprint
+        - get_geom_title
+        - get_river_centerlines
+        - get_xs_cut_lines
+        - identify_section
+        - interpret_count
+        - parse_fixed_width
+        - rollback_geometry
+        - safe_write_geometry
+        - set_geom_title
+        - update_timestamp
+        - validate_river_reach_rs
+
+### GeomPreprocessor source reference
+
+Run `GeomPreprocessor.run_geometry_preprocessor(plan_number, ras_object=project)`
+on a writable project copy. Close any h5py handles to that geometry HDF first.
+The method temporarily changes plan flags and restores them by default; native
+geometry and preprocessing artifacts remain in the copy. It preserves the
+project's CRS and units.
+
+Completion requires normal engine and preprocessing-child exit within
+`max_wait` (seconds), unchanged authored inputs, and complete native products.
+The selected geometry text defines area perimeters and computation points,
+breaklines, BC/reference lines and structure records. It must remain
+byte-identical. Compiled area/feature mirrors are checked against that text;
+an incoming HDF can still describe a parent and does not define child features.
+Existing valid native BC types are retained when their compiled names and
+coordinates match the authored lines. A subsequent type change fails input
+preservation. Unrelated parent BC mirrors do not establish a child type; explicit
+type intent can be authored with `GeomBcLines.set_bc_line_types` before recomputation.
+HDF-only refinement regions, Projection, terrain/classification associations
+and Manning calibration are preserved semantically. Projection definitions are
+compared with axis-aware `pyproj.CRS.equals`: equivalent WKT serialization,
+including native standard-parallel ordering and numeric formatting, is allowed;
+a different CRS or axis order fails. Other retained values are unchanged,
+allowing native fixed-string widths to differ.
+
+For authored 2D areas, the method retains a unique sibling HDF backup and removes
+recognized native product tables before launch, including `.c##` caches even when
+`clear_geompre=False`. This invalidation is restricted to HEC-RAS 5/6 geometry
+HDFs and geometry-only results copies named `.g##.hdf`; results/time-series
+hierarchies are rejected. Failed native work leaves the backup and diagnostics,
+and does not restore obsolete products. Completion requires a freshly written
+`Geometry/GeomPreprocess`, cell/face property pairs with valid packed ranges,
+tables sized for the current topology, BC/reference attachments and associated
+infiltration tables. Infiltration uses interior-cell counts; volume tables
+also include ghost cells, whose zero-length entries are permitted.
+Topology validation checks integer index domains, contiguous packed ranges,
+reciprocal cell/face and point/face incidence with signed orientation,
+reciprocal cell/point membership, and trailing `-1` cell-point padding.
+Face coordinates must be finite, nondegenerate and consistent with native
+normals and lengths at float32 storage precision. Fresh child regeneration
+can replace stale parent topology; no parent indexes are restored.
+The leading interior center rows must exactly equal the current regenerated
+`2D Flow Areas/Cell Points` mirror in the qualified float64 native schema. That
+mirror must match the current authored text within one float64 ULP per coordinate,
+the native decimal-parsing precision; it must be finite and have the exact shape.
+No incoming parent seed mirror is used for this binding. Remaining rows are two-vertex
+ghost cells and are not compared to authored seeds. Every native face polyline
+(endpoint, indexed `Faces Perimeter Values` intermediate vertices, endpoint)
+must lie on or inside the current authored perimeter, including interior and
+ghost-adjacent boundary faces. Both vertices and segments are checked with
+vectorized, prepared geometry predicates in bounded batches. Concavities and
+keyhole-encoded holes are honored; a bent boundary face is never replaced by its
+endpoint chord. The boundary tolerance is eight
+float64 ULPs at the perimeter's coordinate magnitude, in the geometry CRS units.
+The predicate subtracts the first perimeter vertex uniformly from perimeter,
+face endpoints and intermediate vertices before geometric operations, retaining
+the tolerance computed in original coordinates. This avoids numerical false
+exclusions at large projected offsets without editing arrays, scaling, snapping
+or expanding the permitted boundary allowance. Interior-center binding remains
+an exact comparison in original coordinates.
+Coherent translations of either coordinate array fail completion.
+Reference-line terrain profiles are checked when authored. Manning polygon
+names and coordinates are checked against the geometry text; attachment families
+are required for regions intersecting a current 2D perimeter. A valid disjoint
+polygon remains an authored input, with `outside_current_mesh` evidence, and
+does not require absent cell/face mappings. Present mappings still require valid
+region IDs and current mesh indexes. A calibration table name alone does not
+establish a polygon interaction. Invalid or multipart polygon interaction schemas
+fail before mutation. The dimensioned product contract covers structure-free HEC-RAS
+5/6 geometry with authored 2D areas; it does not qualify pure 1D completion.
+`require_complete_products=False` is the public default. Structure-bearing 2D
+or mixed geometry runs with normal engine/writer lifecycle, native-error and
+plan-restoration checks, without the unqualified product invalidation/checks.
+Its `completion_contract.status` is `not_qualified_for_structures`, with reason
+`GEOMETRY_COMPLETION_NOT_QUALIFIED_FOR_STRUCTURES`, message "completion contract
+not qualified for structures", `inputs_preserved=None`, and `products_complete=False`.
+Process success therefore does not claim qualified structure products.
+Set `require_complete_products=True` for fail-closed workflows: these geometries
+fail before cache invalidation with `GEOMETRY_PRODUCTS_SCHEMA_UNSUPPORTED`.
+`RasBreakout2D.prepare_cloned_geometry`, `GeomMesh.generate`, `generate_all`,
+and `audit_domain_containment` expose the same option, defaulting to False.
+They forward it to all native recompilation and numeric/perimeter-repair calls.
+In this compatibility path, captured stdout remains diagnostic; blocking errors
+are parsed from native compute-message files, as on the prior default path.
+Structure-free geometries always receive the complete contract checks, including
+blocking-error parsing of captured stdout.
+The structure-property schema has not been qualified. A nonempty native group does not
+prove complete structure products. Native infiltration region definitions and
+overrides are preserved as authored HDF-only inputs.
+A quiet file or flow-start message does not end the wait.
+`native_worker_threads=1` requests a managed preprocessing worker-pool limit of
+one by default. This is separate from hydraulic solver
+core settings and does not guarantee deterministic native products. Positive integers select another limit; `None` retains inherited
+managed-pool settings. The override is local to the launched process environment
+and applies only to `geometry_only=True`. `completion_contract` records the
+requested limit; it does not claim that every native thread was measured.
+The separate isolated native property/calibration/BC worker also uses a
+one-worker managed pool; the preprocessor's `None` option does not change that
+isolated-worker policy.
+Recognized Wine desktop, console and plot-display invocations may outlive the
+geometry writers and are excluded from writer completion; unknown children
+still require a confirmed exit. A transient Wine invalid-handle error while
+querying a child's role leaves it supervised. The role query is retried while
+that same process identity remains active, including after the launcher exits.
+The geometry reference is read from the selected on-disk plan; a stale project
+DataFrame cannot redirect inventory validation or `.c##` cleanup to another
+geometry. Missing or malformed geometry references fail before engine launch.
+`geometry_only=False` also waits for all enabled plan work, so its runtime can
+include hydraulic computation.
+
+`GeometryPreprocessResult` remains bool-compatible. `return_code` records the
+actual launcher exit; a nonzero exit always fails. `timed_out=True` fails even
+if geometry topology exists. `missing_geometry_inventory` now lists changed or
+missing authored inputs, rather than every incoming cache object;
+`GEOMETRY_INPUT_CHANGED` identifies this failure. `missing_geometry_products`
+lists missing or malformed required products; the corresponding reason is
+`GEOMETRY_PRODUCTS_INCOMPLETE`. Both lists default to empty.
+`completion_contract` records the contract version, text hash, area counts,
+preservation/completeness decisions, invalidated tables and backup path.
+It also records `lifecycle_verified` and `plan_restored`, both false until
+normal launcher/writer completion and exact original-plan restoration are
+positively established. Disabling restoration leaves `plan_restored=false`.
+The explicit `clear_geompre=True` path completes the unique geometry backup
+and input preflight before deleting caches, messages, or native products.
+A target open in the caller's h5py runtime
+returns `GEOMETRY_HDF_OPEN`; its handle is left with the caller. Captured stdout
+and stderr participate in blocking native-error parsing even with complete
+products and launcher exit 0; the merged stream is retained as `stdout`.
+Nonspatial preprocessing does not require Shapely; spatial imports occur only
+when authored Manning polygons require intersection checks.
+A timeout returns `GEOMETRY_PREPROCESS_TIMEOUT`; uncertain process
+inspection or an unconfirmed child exit returns
+`GEOMETRY_PROCESS_COMPLETION_UNVERIFIED`. Unexpected monitoring or process-query
+errors also attempt bounded cancellation of retained owned writers before
+restoring the plan, even if the launcher has already exited. Launcher ownership
+is captured immediately after launch, before optional monitoring hooks. Cleanup
+preserves PID/create-time identities,
+continues after individual OS errors, and bounds each cleanup phase to a shared
+ten-second wait budget. Cleanup errors remain in the failed result; uncertain
+completion never triggers a postrun HDF read. These completion checks do not
+constitute hydraulic acceptance.
+
+::: ras_commander.geom.GeomPreprocessor.GeomPreprocessor
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - clear_geompre_files
+        - clear_geompre_hdf
+        - invalidate_legacy_geometry_hdf_preprocessor_cache
+        - run_geometry_preprocessor
+
+### GeomLandCover source reference
+
+::: ras_commander.geom.GeomLandCover.GeomLandCover
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - get_base_mannings_n
+        - get_region_mannings_n
+        - override_2d_mannings_n
+        - replace_base_mannings_n
+        - set_base_mannings_n
+        - set_mannings_region_polygons
+        - set_region_mannings_n
+
+### ManningsFromLandCover source reference
+
+::: ras_commander.geom.ManningsFromLandCover.ManningsFromLandCover
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - assign
+        - default_landcover_classification_table
+        - default_mannings_table
+        - preview
+
+### GeomCrossSection source reference
+
+::: ras_commander.geom.GeomCrossSection.GeomCrossSection
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - build_cross_section
+        - format_blocked_obstructions
+        - get_bank_stations
+        - get_blocked_obstructions
+        - get_cross_sections
+        - get_expansion_contraction
+        - get_ineffective_flow
+        - get_levees
+        - get_mannings_n
+        - get_station_elevation
+        - get_xs_coords
+        - get_xs_htab_params
+        - interpolate_cross_section
+        - interpolate_station_elevation
+        - optimize_xs_htab_from_results
+        - parse_blocked_obstructions
+        - set_all_xs_htab_params
+        - set_bank_stations
+        - set_blocked_obstructions
+        - set_expansion_contraction
+        - set_ineffective_flow
+        - set_levees
+        - set_mannings_n
+        - set_station_elevation
+        - set_xs_htab_params
+        - validate_blocked_obstructions_hdf
+
+### CrossSectionBankStations source reference
+
+::: ras_commander.geom.GeomCrossSection.CrossSectionBankStations
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+
+### CrossSectionBuildInput source reference
+
+::: ras_commander.geom.GeomCrossSection.CrossSectionBuildInput
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+
+### CrossSectionBuildResult source reference
+
+::: ras_commander.geom.GeomCrossSection.CrossSectionBuildResult
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+
+### CrossSectionManningsN source reference
+
+::: ras_commander.geom.GeomCrossSection.CrossSectionManningsN
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+
+### CrossSectionReachLengths source reference
+
+::: ras_commander.geom.GeomCrossSection.CrossSectionReachLengths
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+
+### GeomStorage source reference
+
+::: ras_commander.geom.GeomStorage.GeomStorage
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - clip_2d_flow_area
+        - get_2d_flow_area_settings
+        - get_elevation_volume
+        - get_storage_area_polygons
+        - get_storage_areas
+        - repair_viewing_rectangle_from_2d_areas
+        - replace_breaklines
+        - set_2d_flow_area_perimeter
+        - set_2d_flow_area_settings
+        - set_breaklines
+        - set_elevation_volume
+
+### GeomProjection source reference
+
+::: ras_commander.geom.GeomProjection.GeomProjection
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - reproject_geometry
+        - reproject_model_geometry
+
+### GeomLateral source reference
+
+::: ras_commander.geom.GeomLateral.GeomLateral
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - classify_connections
+        - get_connection_gate_lines
+        - remap_connection_areas
+        - delete_connection
+        - get_bridge_approach_xs
+        - get_bridge_data
+        - get_bridge_deck
+        - get_bridge_piers
+        - get_bridge_xs
+        - get_connection_culverts
+        - get_connection_data
+        - get_connection_gates
+        - get_connection_line_coords
+        - get_connection_profile
+        - get_connections
+        - get_lateral_structures
+        - get_weir_profile
+        - set_bridge_approach_xs
+        - set_bridge_coefficients
+        - set_bridge_deck
+        - set_bridge_piers
+        - set_bridge_xs
+        - set_connection
+        - set_connection_culverts
+        - set_connection_gates
+        - set_connection_profile
+        - set_connection_profile_from_terrain
+        - write_connection_data
+
+### GeomInlineWeir source reference
+
+::: ras_commander.geom.GeomInlineWeir.GeomInlineWeir
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - get_gates
+        - get_profile
+        - get_weirs
+
+### GeomBridge source reference
+
+::: ras_commander.geom.GeomBridge.GeomBridge
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - get_abutment
+        - get_approach_sections
+        - get_bridge_opening_xs
+        - get_bridges
+        - get_coefficients
+        - get_deck
+        - get_htab
+        - get_htab_dict
+        - get_hydraulic_methods
+        - get_piers
+        - optimize_all_structures_from_results
+        - optimize_htab_from_results
+        - set_abutments
+        - set_all_structures_htab
+        - set_approach_sections
+        - set_coefficients
+        - set_deck
+        - set_htab
+        - set_hydraulic_methods
+        - set_piers
+
+### GeomCulvert source reference
+
+::: ras_commander.geom.GeomCulvert.GeomCulvert
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - get_adjacent_cross_sections
+        - get_all
+        - get_culverts
+        - set_adjacent_ineffective_flow
+        - set_culvert
+        - set_culverts
+
+### GeomCulvertGIS source reference
+
+::: ras_commander.geom.GeomCulvertGIS.GeomCulvertGIS
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - mesh_cell_min_from_terrain
+        - reconstruct_barrels
+        - validate_2d_inverts
+        - validate_placement
+
+### GeomHtabUtils source reference
+
+::: ras_commander.geom.GeomHtabUtils.GeomHtabUtils
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - calculate_optimal_structure_htab
+        - calculate_optimal_xs_htab
+        - get_structure_htab_defaults
+        - get_xs_htab_defaults
+        - validate_structure_htab_params
+        - validate_xs_htab_params
+
+### GeomHtab source reference
+
+::: ras_commander.geom.GeomHtab.GeomHtab
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - get_optimization_report
+        - optimize_all_htab_from_results
+        - optimize_structures_htab_from_results
+        - optimize_xs_htab_from_results
+
+### GeomMetadata source reference
+
+::: ras_commander.geom.GeomMetadata.GeomMetadata
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - get_geometry_counts
+
+### GeomReferenceFeatures source reference
+
+::: ras_commander.geom.GeomReferenceFeatures.GeomReferenceFeatures
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - add_reference_lines
+        - add_reference_lines_from_longitudinal_line
+        - add_reference_points
+        - generate_reference_lines_from_longitudinal_line
+        - get_reference_lines
+        - get_reference_points
+        - replace_reference_lines
+
+### GeomBcLines source reference
+
+::: ras_commander.geom.GeomBcLines.GeomBcLines
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - add_bc_lines
+        - delete_bc_line
+        - rename_bc_line
+        - replace_bc_lines
+        - set_bc_line_types
+
+### GeomPipeNetwork source reference
+
+::: ras_commander.geom.GeomPipeNetwork.GeomPipeNetwork
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - set_conduit_dimensions
+        - set_pump_group_hq_curve
+
+
+### RasGeometry source reference
+
+::: ras_commander.RasGeometry.RasGeometry
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - get_bank_stations
+        - get_connection_gates
+        - get_connection_weir_profile
+        - get_connections
+        - get_cross_sections
+        - get_expansion_contraction
+        - get_lateral_structures
+        - get_lateral_weir_profile
+        - get_mannings_n
+        - get_station_elevation
+        - get_storage_areas
+        - get_storage_elevation_volume
+        - interpolate_cross_section
+        - interpolate_station_elevation
+        - set_bank_stations
+        - set_connection_weir_profile
+        - set_expansion_contraction
+        - set_station_elevation
+
+
+### RasGeometryUtils source reference
+
+::: ras_commander.RasGeometryUtils.RasGeometryUtils
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - create_backup
+        - extract_comma_list
+        - extract_keyword_value
+        - format_fixed_width
+        - identify_section
+        - interpret_count
+        - parse_fixed_width
+        - update_timestamp
+        - validate_river_reach_rs
+
+
+### RasBreach source reference
+
+::: ras_commander.RasBreach.RasBreach
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - create_breach_block
+        - list_breach_structures_plan
+        - read_breach_block
+        - set_breach_geom
+        - update_breach_block
+
+
+### RasCrossSections source reference
+
+::: ras_commander.RasCrossSections.RasCrossSections
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - get_points
+
+
+### VerticalTransform source reference
+
+::: ras_commander.RasCrossSections.VerticalTransform
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - apply
+
+### Numeric breakline containment retry
+
+`RasBreakout2D.prepare_cloned_geometry` permits one automatic retry only when
+native containment violations exclusively identify breaklines outside the
+one-cell inward buffer. The planner clips each identified line against the
+exact compiled collection perimeter eroded by cell spacing plus
+`max(1e-6, cell_spacing * 1e-8)` source horizontal units, intersected with the
+strict buffer. A repair must preserve one valid positive LineString, its name,
+child FID and all native spacing/repeat/protection controls, with Hausdorff
+movement at most 0.01 source horizontal units. No source file is changed.
+
+A cloned geometry sidecar `<geometry>.breakline_containment_repair.json`
+(`ras-numeric-breakline-containment-repair/v1`) is written before mutation.
+It records `reason_code=NUMERIC_BREAKLINE_CONTAINMENT_CLIP` or
+`NUMERIC_BREAKLINE_CONTAINMENT_VERTEX_REPAIR`, with each line's `method` set to
+`endpoint_clip` or `bounded_vertex_projection`, horizontal units,
+maximum movement, one-cell spacing, additional margin, compiled perimeter WKB
+SHA256, perimeter/control preservation flags, and per-line before/after WKB
+hashes, lengths, removed length and movement. The plan binds the current text
+and HDF SHA256. Status advances from `planned` to `applied` (with preprocessing
+success) to `validated` or `failed` (with native mesh success and final hashes).
+Exceptions preserve the last sidecar. The result's default-empty
+`breakline_containment_repairs` list returns completed retry records. Native
+compilation and the original strict containment audit still must pass.
+
+### Fresh geometry preprocessor evidence
+
+`GeomPreprocessor.run_geometry_preprocessor(..., geometry_only=True)` waits for
+normal launcher and owned-child exits before inspecting the geometry HDF.
+Messages and fresh sidecars cannot shorten that wait. The post-completion
+contract checks fresh products, authored inputs, topology, native face binding,
+process errors and exact plan restoration. Run against a disposable project
+copy and inspect the returned completion evidence. FIM callers require
+`require_complete_products=True`, including repair and mesh-generation paths.
+The upstream default remains `False` for explicitly unqualified structure
+schemas; it does not waive qualified structure-free checks. These checks
+establish software geometry completion, not hydraulic acceptance.
+
+
+## Recorded refinement and generated-point repairs
+
+### Supplied parent-seed repair
+
+Use `GeomMesh.plan_computation_point_repair` when a child should start with its
+parent's computation points, allowing recorded native repairs at the cut edge.
+The default `write_computation_points` path still writes supplied points without
+repair. Coordinates and spacing use the geometry's horizontal CRS and units.
+
+```python
+from ras_commander.geom import GeomMesh
+
+plan = GeomMesh.plan_computation_point_repair(
+    child_geometry, parent_points, mesh_name="ChildArea", ras_object=child_project,
+)
+evidence = plan.to_dict()  # inspect seed additions, exclusions and removed vertices
+result = GeomMesh.apply_computation_point_repair(plan)
+readback = GeomMesh.validate_computation_point_repair(plan)
+```
+
+Planning performs native previews without changing the target text or compiled
+HDF. It follows the supplied-seed recipe retained in the Salt Draw subdomain
+assembly research: up to seven MaxFaces repairs at face-length ratios 0.0025,
+0.05 and 0.1, and up to six perimeter-connection repairs. MaxFaces is checked
+again after each perimeter change, sharing the same seven-repair budget. New
+midpoints are rounded to three decimal places before being moved inside, then
+deduplicated by exact equality. It removes perimeter vertices nearest native
+error locations and records seeds excluded by the repaired perimeter. Final previews must
+complete at all three ratios, both before and after native text serialization.
+Breakline and connection-line constraints participate in the native previews.
+Kept breaklines and complete connection footprints must remain contained, and
+boundary-condition line ends must still touch the repaired perimeter (within
+1e-6 model unit for text serialization). Breakout also audits compiled feature
+containment and connection/BC geometry after native preprocessing.
+
+The default loss limits are 0.001 of supplied parent seeds and 0.001 of the
+original perimeter area. Set `max_parent_seed_loss_fraction` and
+`max_area_loss_fraction` explicitly when planning if the reviewed workflow needs
+different limits. Loss uses the original polygon's excluded area, not net area
+change. Exceeding either limit raises with a `repair_evidence` dictionary; no
+successful plan or target mutation occurs. Failure or exhausted repair budgets
+also leave the target unchanged.
+
+Application requires unchanged input bytes, preserves a numbered backup and
+atomically replaces only the geometry text. The explicitly supplied project's runtime must
+agree with the actual loaded RasMapperLib assembly; use a fresh worker to switch
+runtimes. Without `ras_object`, supply explicit geometry and installation paths;
+the global project is never selected. A project's unresolved `Ras.exe` fallback
+accepts an explicit installation instead of resolving against the working folder.
+Successful readback establishes that the text matches the plan. It
+does not establish identical parent face topology or hydraulic equivalence.
+Run native Geometry and Event Conditions preprocessing and review the resulting
+compiled mesh and hydraulics separately.
+
+For breakout authoring, opt in with
+`RasBreakout2D.prepare_cloned_geometry(computation_points=parent_points,
+repair_computation_points=True, refresh_method="rasexe", remesh=False, ...)`.
+The returned `computation_points_result.seed_repair` retains the plan and
+application readback. Omitting the repair flag preserves existing behavior.
+
+The recipe was adapted from FIM Commander's retained
+`pipelines/rog/subdomain_assembly/author_piece.py` at commit `2384719e`.
+It uses GeomMesh's existing native repair helpers; no optimesh dependency is
+required.
+
+### Synchronize cloned area association caches
+
+After relocating a clone's terrain or classification sidecars, compiled 2D areas
+may retain filenames from the parent even when `/Geometry` has current links.
+Inspect and synchronize those caches through RasMap:
+
+```python
+plan = RasMap.plan_geometry_area_association_sync(child_hdf, ["ChildArea"])
+# Review plan["changes"] before application.
+receipt = RasMap.apply_geometry_area_association_sync(plan)
+```
+
+Planning requires existing current geometry-wide sidecars and records every
+selected area's filename/layer change. Application rejects changed input or a
+modified plan, verifies staged readback, preserves a numbered backup and replaces
+the HDF atomically. Area-only associations are preserved when no geometry-wide
+filename is declared. A stale area layer name is removed when the current
+geometry filename has no corresponding layer name.
+
+Absent optional area layer names remain absent; current filename links are still
+synchronized. In a HEC-RAS 6.6 geometry-refresh readback, the native save retained
+the child terrain filename but omitted the area `Terrain Layername` even though
+the canonical geometry association named the layer. The API preserves that
+cache representation instead of introducing a label that native save removes.
+An existing area layer name is still updated or removed to match the canonical
+association.
+
+Only the selected cached association attributes change. Calibration overrides,
+mesh datasets, other area attributes and canonical geometry links remain intact.
+An already synchronized plan preserves the file bytes and creates no backup.
+These APIs do not execute HEC-RAS or establish native/hydraulic acceptance;
+preprocess and review the child afterwards.
+
+`GeomMesh.clip_refinement_regions(..., invalid_regions="repair")` reads delivered
+geometry without changing the source HDF. GEOS `make_valid` supplies valid
+polygon coverage; every positive-area component survives before clipping.
+Holes are partitioned into hole-free pieces without filling them. Zero-area
+remnants are recorded explicitly. The returned DataFrame keeps its existing
+columns and stores source repair records in `report.attrs["repairs"]`, including
+validity, source/repaired WKB hashes and areas, nonpolygon remnants and the
+positive-area preservation check. Default `invalid_regions="raise"` is unchanged.
+Breakout preflight normalizes invalid source refinements before intersection,
+and marks the corresponding feature-action reason.
+
+`GeomMeshRepair.plan_refinement_support` plans a bounded grid for a retained
+region whose final cells fail local-resolution QA. Coordinates and dx/dy share
+the source projected CRS and project length units. Plans preserve source region
+coverage and spacing controls, retain existing points, record each added XY
+coordinate, and fail before mutation if the candidate budget is exceeded.
+When the bounding box exceeds the remaining budget, the planner intersects grid
+columns with the support polygon. It bounds each fallback region's column count
+and the total examined grid sites by `max_points`, preserving the original lattice, ordering
+and strict containment checks. `candidate_count` still records the bounding-box
+count. Such plans also record `candidate_generation` and
+`examined_candidate_count`; ordinary plans keep their existing evidence shape.
+`GeomMeshRepair.apply_refinement_support` requires a hash-guarded child geometry,
+an exact serialized-seed match and strictly interior additions. It changes only
+the selected child's point block. Use attempt-owned copies and then refresh
+native mesh metadata, recompile and recheck all engineering gates.
+
+`GeomMeshRepair.plan_native_seed_removal` reads specific native topology errors.
+It requires native error indexes or fewer-than-three-face cells, and proves
+each cell point matches the corresponding generated seed within 1e-6 project
+units. It never changes perimeter vertices.
+`DuplicatePoints` repairs use native `BadIndexes` referring to input seeds,
+because this state may have no physical cell collection. Every index must be
+integral and within the supplied finite XY seed array. The plan records the
+index basis, native index count, seed count, selected coordinates and removal
+budget (`max_removals`, default 8192). Missing indexes, indexes outside the input
+array, removing every seed, or exceeding the budget hold before mutation.
+Remaining seed order and all perimeter and feature controls are preserved.
+Successful native recompilation and all final spacing checks remain required.
+Optional
+`generate_computation_points(..., repair_generated_points=True)` applies at most
+five such bootstrap repairs and emits each plan to `evidence_callback` before
+writing geometry text. Observer errors abort generation and appear in the
+returned `MeshResult` error. Supply the persisted dimensionless minimum face
+length ratio for the preview. The option defaults to `False`.
+
+These repair plans support native meshing; they do not establish hydraulic
+acceptance. Successful native recompilation and the caller's spatial and
+hydraulic review remain required.
+
+Numeric breakline containment repairs keep their maximum geometry displacement
+of 0.01 in project horizontal units and the exact one-cell inward containment
+gate. The usual endpoint clip is unchanged. At an acute intersection, clipping
+can remove a long endpoint despite a microscopic normal deficit; a bounded
+fallback projects exterior vertices into the guarded polygon. It must retain
+one valid line, satisfy the original displacement cap and exact containment,
+and preserve controls and the perimeter. Material deficits and disconnected
+fragments still fail closed. Each record identifies `endpoint_clip` or
+`bounded_vertex_projection` in `repairs[].method`; projection uses reason
+`NUMERIC_BREAKLINE_CONTAINMENT_VERTEX_REPAIR`, while endpoint clipping keeps
+`NUMERIC_BREAKLINE_CONTAINMENT_CLIP`. Coordinates remain in the same CRS.
+
+`removed_length` is the signed original length minus repaired length in project
+units; bounded vertex projection can make this diagnostic negative.
+
+`GeomMeshRepair.plan_compiled_polygon_seed_removal` accepts serialized XY seeds,
+native-index-ordered physical centers and public HDF polygon diagnostics in one
+projected CRS/project unit system. Both complete center arrays must have the
+same count and agree by index within 1e-6 units. Only consistent `no_polygon`
+and `multiple_polygons` records for physical cells authorize a plan; ghost IDs
+and unrelated diagnostics do not. Duplicate/inconsistent diagnostics fail.
+The caller may lower the removal budget from its hard maximum of 32; removing
+every seed is prohibited. The method returns `ras-compiled-polygon-seed-repair/v1`
+with diagnostic and coordinate evidence, and changes nothing. Hash-guarded
+application to disposable geometry, native rebuilding, exhaustive physical
+polygon reconstruction and all feature/hydraulic gates remain caller duties.

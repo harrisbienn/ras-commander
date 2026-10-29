@@ -3,12 +3,25 @@ import logging
 from pathlib import Path
 
 import pandas as pd
+import psutil
+import h5py
+import pytest
 
 
 raspreprocess_module = importlib.import_module("ras_commander.RasPreprocess")
 RasPreprocess = raspreprocess_module.RasPreprocess
 
 PREPROCESS_LOGGER = "ras_commander.RasPreprocess"
+
+
+@pytest.fixture(autouse=True)
+def _available_owned_tcu_supervision(monkeypatch):
+    """Logging units simulate the Windows supervision available to their launcher."""
+    monkeypatch.setattr(
+        RasPreprocess,
+        "_tcu_supervision_availability_error",
+        staticmethod(lambda: None),
+    )
 
 
 class _FakeRasProject:
@@ -52,7 +65,9 @@ def _seed_project(tmp_path: Path) -> _FakeRasProject:
 
 
 def _write_preprocess_outputs(project_folder: Path):
-    (project_folder / "PreprocessProject.p01.tmp.hdf").write_bytes(b"t" * 1024 * 1024)
+    with h5py.File(project_folder / "PreprocessProject.p01.tmp.hdf", "w") as hdf:
+        hdf.create_group("Event Conditions").attrs["Completed Successfully"] = True
+        hdf.create_dataset("Payload", data=b"t" * 1024 * 1024)
     (project_folder / "PreprocessProject.b01").write_bytes(b"b" * 2048)
     (project_folder / "PreprocessProject.x03").write_bytes(b"x" * 4096)
 
@@ -171,6 +186,10 @@ def test_full_simulation_fallback_warning_is_concise(
             return None
 
         def monitor_until_signal(self, _process):
+            # Represent the full simulation writing a fresh final HDF after
+            # preprocessing began.
+            with h5py.File(ras_obj.project_folder / "PreprocessProject.p01.hdf", "w") as hdf:
+                hdf.create_group("Event Conditions").attrs["Completed Successfully"] = True
             return True
 
     monkeypatch.setattr(raspreprocess_module, "BcoMonitor", FakeBcoMonitor)
@@ -189,6 +208,8 @@ def test_full_simulation_fallback_warning_is_concise(
     )
 
     assert result.success is True
+    assert result.signal_source == "full_result_copy"
+    assert result.full_result_copied is True
     warning_messages = [
         record.getMessage()
         for record in _preprocess_records(caplog)
@@ -206,3 +227,135 @@ def test_full_simulation_fallback_warning_is_concise(
     ]
     assert all(str(ras_obj.project_folder) not in message for message in warning_messages)
     assert "Preprocessing complete; HEC-RAS process already exited" in debug_messages
+
+
+def test_clear_existing_preserves_final_result_families(
+    tmp_path,
+    monkeypatch,
+):
+    ras_obj = _seed_project(tmp_path)
+    hdf = ras_obj.project_folder / "PreprocessProject.p01.hdf"
+    legacy = ras_obj.project_folder / "PreprocessProject.O01"
+    hdf.write_bytes(b"existing hdf bytes")
+    legacy.write_bytes(b"existing legacy bytes")
+
+    class FakeBcoMonitor:
+        @staticmethod
+        def enable_detailed_logging(_plan_file):
+            return True
+
+        def __init__(self, *, project_path, **_kwargs):
+            self.project_path = Path(project_path)
+
+        def monitor_until_signal(self, _process):
+            _write_preprocess_outputs(self.project_path)
+            return True
+
+    monkeypatch.setattr(raspreprocess_module, "BcoMonitor", FakeBcoMonitor)
+    monkeypatch.setattr(
+        raspreprocess_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: _FakeProcess(),
+    )
+    monkeypatch.setattr(
+        RasPreprocess,
+        "_terminate_process_tree",
+        staticmethod(lambda _process: None),
+    )
+
+    result = RasPreprocess.preprocess_plan(
+        "01",
+        ras_object=ras_obj,
+        clear_existing=True,
+        fix_line_endings=False,
+    )
+
+    assert result.success is True
+    assert hdf.read_bytes() == b"existing hdf bytes"
+    assert legacy.read_bytes() == b"existing legacy bytes"
+
+
+def test_process_tree_cleanup_race_is_debug_when_direct_fallback_succeeds(
+    monkeypatch,
+    caplog,
+):
+    class VanishedLauncher:
+        pid = 12345
+        killed = False
+        waited = False
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout):
+            assert timeout == 10
+            self.waited = True
+
+    launcher = VanishedLauncher()
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        lambda _pid: (_ for _ in ()).throw(RuntimeError("launcher vanished")),
+    )
+    caplog.set_level(logging.DEBUG, logger=PREPROCESS_LOGGER)
+
+    RasPreprocess._terminate_process_tree(launcher)
+
+    assert launcher.killed is True
+    assert launcher.waited is True
+    records = _preprocess_records(caplog)
+    assert not [record for record in records if record.levelno >= logging.WARNING]
+    assert any(
+        "falling back to process.kill()" in record.getMessage()
+        for record in records
+        if record.levelno == logging.DEBUG
+    )
+
+
+def test_full_simulation_fallback_rejects_unchanged_existing_hdf(
+    tmp_path,
+    monkeypatch,
+):
+    ras_obj = _seed_project(tmp_path)
+    hdf = ras_obj.project_folder / "PreprocessProject.p01.hdf"
+    hdf.write_bytes(b"unchanged existing result")
+    (ras_obj.project_folder / "PreprocessProject.b01").write_bytes(b"b")
+    (ras_obj.project_folder / "PreprocessProject.x03").write_bytes(b"x")
+
+    class CompletedProcess:
+        pid = 12345
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+    class FakeBcoMonitor:
+        @staticmethod
+        def enable_detailed_logging(_plan_file):
+            return True
+
+        def __init__(self, **_kwargs):
+            return None
+
+        def monitor_until_signal(self, _process):
+            return True
+
+    monkeypatch.setattr(raspreprocess_module, "BcoMonitor", FakeBcoMonitor)
+    monkeypatch.setattr(
+        raspreprocess_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: CompletedProcess(),
+    )
+
+    result = RasPreprocess.preprocess_plan(
+        "01",
+        ras_object=ras_obj,
+        clear_existing=False,
+        fix_line_endings=False,
+    )
+
+    assert result.success is False
+    assert result.full_result_copied is False
+    assert result.signal_source == "bco"
+    assert result.error == "Preprocessing did not generate: .p01.tmp.hdf"
+    assert hdf.read_bytes() == b"unchanged existing result"

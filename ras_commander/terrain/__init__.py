@@ -15,17 +15,27 @@ Main Classes:
         - compute_bank_lines(): Generate bank lines from XS bank stations
         - create_terrain_hdf(): Create terrain HDF from input rasters
         - vrt_to_tiff(): Convert VRT to single TIFF with overviews
+        - export_rasmapper_terrain(): Native registered-terrain GeoTIFF export
 
     Usgs3depAws: USGS 3DEP elevation tile download from AWS S3
         - find_tiles_for_bbox(): Find tiles covering a bounding box
-        - download_tiles(): Download tiles with concurrent threads
+        - select_projects_for_coverage(): Newest project per sub-area, with a coverage report
+        - download_tiles(): Download tiles with concurrent threads, optional
+          coverage-aware project selection and per-tile provenance
+        - build_terrain_raster(): One gap-free GeoTIFF terrain in the project CRS,
+          with 10m/30m backfill, explicit vertical unit conversion, a
+          zero-nodata gate inside the buffered model extent, and a
+          single-source HEC-RAS terrain check
+        - plan_terrain_tiles(): Plan every tile a terrain build needs (network)
+        - prefetch_terrain_tiles(): Download plans' tiles once into a shared store
+        - create_vrt(): Mosaic downloaded tiles into a VRT
 
     RasTerrainMod: Terrain modification analysis via pythonnet (Windows only)
         - get_terrain_profile(): Sample terrain with modifications applied
         - get_terrain_volume_elevation(): Elevation-volume curve for polygons
         - compare_terrain_profiles(): Cut/fill analysis between terrains
         - compare_terrain_volumes(): No-net-fill compliance checking
-        - compute_modified_terrain_raster(): Full-resolution GeoTIFF of modified terrain
+        - compute_modified_terrain_raster(): Deprecated row-sampled compatibility raster
         Requires: pythonnet, HEC-RAS 6.6+ with bundled GDAL
 
     RasTerrainModWriter: Terrain modification HDF and .rasmap writer
@@ -39,6 +49,7 @@ Requirements:
     - HEC-RAS 6.3+ installed (for RasProcess.exe and GDAL tools)
     - Optional: pythonnet for RasTerrainMod (terrain modification analysis)
     - Optional: rasterio for advanced raster analysis
+    - USGS downloader: requests (loaded only when its API is requested)
 
 Usage:
     from ras_commander.terrain import RasTerrain, RasTerrainMod
@@ -63,8 +74,38 @@ See Also:
 """
 
 from .RasTerrain import RasTerrain
-from .Usgs3depAws import Usgs3depAws
+from ..ComputeResults import TerrainExportResult
 from .RasTerrainModWriter import RasTerrainModification, RasTerrainModWriter
+
+
+def __getattr__(name):
+    """Load the network downloader only when its public API is requested."""
+    if name in {'TerrainBuildError', 'Usgs3depAws'}:
+        from importlib import import_module
+
+        try:
+            module = import_module('.Usgs3depAws', __name__)
+        except ModuleNotFoundError as exc:
+            if exc.name == 'requests':
+                raise ImportError(
+                    'USGS terrain downloads require requests; install requests '
+                    'before using Usgs3depAws.'
+                ) from exc
+            raise
+        for public in ('TerrainBuildError', 'Usgs3depAws'):
+            globals()[public] = getattr(module, public)
+        return globals()[name]
+    if name in _TAUDEM_EXPORTS:
+        from importlib import import_module
+
+        module = import_module('.RasTauDem', __name__)
+        for public in _TAUDEM_EXPORTS:
+            globals()[public] = getattr(module, public)
+        return globals()[name]
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+
+
+_TAUDEM_EXPORTS = ('RasTauDem', 'TauDemDelineation', 'TauDemError', 'TauDemNotFoundError')
 
 # Conditional import - RasTerrainMod requires pythonnet (Windows only)
 try:
@@ -72,14 +113,20 @@ try:
     __all__ = [
         'RasTerrain',
         'Usgs3depAws',
+        'TerrainBuildError',
         'RasTerrainMod',
         'RasTerrainModification',
         'RasTerrainModWriter',
+        'TerrainExportResult',
+        *_TAUDEM_EXPORTS,
     ]
 except ImportError:
     __all__ = [
         'RasTerrain',
         'Usgs3depAws',
+        'TerrainBuildError',
         'RasTerrainModification',
         'RasTerrainModWriter',
+        'TerrainExportResult',
+        *_TAUDEM_EXPORTS,
     ]

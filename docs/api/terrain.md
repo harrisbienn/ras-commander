@@ -3,7 +3,7 @@
 Classes for terrain creation, terrain modification writing, and terrain modification analysis.
 
 !!! note "Platform Requirements"
-    `RasTerrainMod` requires Windows with pythonnet and a HEC-RAS installation (uses RasMapperLib.dll via .NET interop). `RasTerrain` and `RasTerrainModWriter` work on all platforms.
+    `RasTerrainMod` requires Windows with pythonnet and a HEC-RAS installation (uses RasMapperLib.dll via .NET interop). `RasTerrain.export_rasmapper_terrain()` runs natively on Windows and through a configured Wine runtime on Linux. Other `RasTerrain` and `RasTerrainModWriter` methods retain their documented platform requirements.
 
 ## RasTerrain
 
@@ -13,6 +13,110 @@ Terrain HDF creation from rasters using `RasProcess.exe CreateTerrain`.
 
 - `create_terrain_hdf(input_rasters, output_hdf, projection_prj, units="Feet", stitch=True, hecras_version="7.0", timeout_seconds=600)` - Create HEC-RAS terrain HDF from input rasters
 - `create_terrain_from_rasters(input_rasters, output_folder, terrain_name="Terrain", units="Feet", stitch=True, hecras_version="7.0", generate_prj=True)` - Convenience wrapper with automatic PRJ generation
+
+### Native Registered-Terrain Export
+
+- `export_rasmapper_terrain(ras_project_path, output_tif, terrain_name=None, extent=None, downsample_factor=1, rasterize_modifications=True, overwrite=False, timeout_seconds=1800, hecras_version=None, ras_object=None, receipt_path=None)` - Consolidate a registered RAS Mapper terrain to one semantically validated GeoTIFF
+
+The native export loads the exact terrain entry from the project's `.rasmap`.
+Consequently, source priority/order, stitches, masks, and terrain-modification
+surfaces remain HEC-RAS behavior. The base raster always uses nearest-neighbor
+and the output cell size is exactly the finest registered source cell size
+times `1`, `2`, `4`, or `8`. Requested bounds snap outward to the authoritative
+source grid. Registered sources may have different, non-integer-related cell
+sizes: the API passes the exact selected output cell size to RAS Mapper with
+**Export to Single Raster** enabled, and RAS Mapper performs the consolidation
+and downsampling using the loaded source order, stitches, and masks. Preflight
+rejects only missing, non-finite, or non-positive level-zero source grids.
+
+The method writes to a unique same-directory partial, validates the GeoTIFF,
+then atomically promotes it. `overwrite=False` is the default. A JSON receipt
+is written beside the TIFF by default, and the returned `TerrainExportResult`
+is bool-compatible. The derivative is not registered back into the project.
+Windows-drive and UNC project/input paths retain their supported normalization.
+Direct output to a real UNC share is not qualified: the host stages its owned
+GDAL junction beside the output, and Windows junction creation generally cannot
+target a remote volume. This fails before export rather than silently changing
+destinations. Write to a short local path, then copy the committed TIFF and
+receipt to the share. A qualification path whose fully qualified helper response
+name exceeded the legacy .NET 260-character limit also failed cleanly; long-path
+output staging remains unqualified.
+
+Supported HEC-RAS versions are deliberately narrow:
+
+| Runtime | Status | Evidence |
+|---------|--------|----------|
+| 6.3 / 6.3.1 | Unsupported | The installed API lacks the bounded `GenerateNewRasTerrain(..., resampleVecMods, ...)` contract; its public single-file method always uses the full terrain extent |
+| 6.4.0 | Unsupported | Not locally installed or qualified; HEC's [6.4.1 resolved issues](https://www.hec.usace.army.mil/confluence/rasdocs/rasrn/6.4.1/resolved-issues) report that creating a terrain in 6.4 could add 1.0 to elevations |
+| 6.4.1 | Supported | Exact private contract reflected; bounded modification-aware, mixed-source, and two-source stitched exports qualified on native Windows and Wine |
+| 6.5 | Supported | Exact private contract reflected; bounded modification-aware, mixed-source, and two-source stitched exports qualified on native Windows and Wine |
+| 6.6 | Supported | Native Windows and Wine qualified with bounded modification-aware and stitched exports; HEC's [6.6 terrain manual](https://www.hec.usace.army.mil/confluence/rasdocs/rmum/6.6/terrain-layer) explicitly documents the unified export options |
+| 6.7 beta releases | Unsupported prereleases | HEC's [archive](https://www.hec.usace.army.mil/software/hec-ras/download.aspx) lists Beta, Beta 2, Beta 3, Beta 4a, and Beta 5 before 7.0. The locally installed Beta 4-labeled and Beta 5 runtimes passed bounded checks, but the API accepts no beta runtime |
+| 7.0.0 | Unsupported | Although the checked windows completed, HEC documents a [terrain-modification export defect](https://www.hec.usace.army.mil/confluence/rasdocs/raski/7.0) that can omit the minimum-Y portion of a modification |
+| 7.0.1 | Supported | The official installer's signature was validated, then the installed runtime was reflected and qualified on native Windows and Wine after HEC reported the 7.0.0 defect fixed in [7.0.1 resolved issues](https://www.hec.usace.army.mil/confluence/rasdocs/rasrn/latest/resolved-issues). Bounded modification-aware, mixed-source, and stitched exports passed |
+| 7.1 | Forward-open; not yet qualified | The API and installation discovery accept the exact 7.1 term so the official release can run when installed. The helper still verifies the exact managed method contract at runtime. The official [HEC-RAS downloads page](https://www.hec.usace.army.mil/software/hec-ras/download.aspx) currently contains no HEC-RAS Classic 7.1 release |
+| Other versions | Unsupported | Their exact mapper contract and semantics have not been qualified |
+
+When `ras_object` is supplied, it must be an initialized `RasPrj`. The API
+checks `ras_object.ras_version` and, when identifiable, the release folder in
+`ras_object.ras_exe_path` before creating output directories or starting native
+work. It raises `ValueError` for unsupported versions and for any mismatch
+between the explicit version, project version, and executable release. The
+existing `6.4` convenience term resolves to the qualified 6.4.1 installation;
+an actual executable in a `6.4` folder remains rejected.
+
+The four qualified releases all passed on native Windows and under Wine. The
+Wine matrix used task-local runtime/project copies and nine successful receipts:
+for each of 6.4.1, 6.5, and 7.0.1 it exported a bounded two-source Muncie terrain,
+the mixed-resolution `Terrain50` terrain with modifications disabled, and the
+same terrain with modifications enabled. Arrays and validity masks were
+pixel-identical across those three releases; the modification comparison raised
+264 cells by 0.15625 to 9.625 feet while 1,769 control cells remained exactly
+unchanged. HEC-RAS 6.6 additionally passed exact-input native-Windows/Wine
+pixel-parity checks.
+
+HEC-RAS 7.1 is deliberately forward-open rather than pre-qualified. Until HEC
+publishes the binary, no claim is made about its export semantics. When the
+release is installed, version discovery accepts `7.1`, `7.1.0`, `7.10`, or
+`71`; helper reflection fails closed if HEC changes the expected native contract.
+
+```python
+from pathlib import Path
+from ras_commander import RasMap, RasTerrain
+
+project = Path(r"C:\Models\Example\Example.prj")
+print(RasMap.list_terrain_layers(project)[["name", "resolved_path"]])
+
+result = RasTerrain.export_rasmapper_terrain(
+    project,
+    Path(r"C:\Exports\channel_window_2x.tif"),
+    terrain_name="Terrain",
+    extent=(100000.0, 200000.0, 101000.0, 201000.0),
+    downsample_factor=2,
+    rasterize_modifications=True,
+    hecras_version="6.6",
+)
+
+if not result:
+    raise RuntimeError(result.error)
+print(result.output_path)
+print(result.receipt_path)
+print(result.source_inventory)
+```
+
+On Linux, configure `RasProcess.configure_wine()` first. The host clones the
+configured Wine prefix into task-local state by default. An orchestration
+system that already supplies a prefix owned exclusively by the current task
+may set `RAS_COMMANDER_TERRAIN_WINE_PREFIX_IS_TASK_LOCAL=1`; do not set it for
+a shared prefix.
+
+`RasTerrainMod.compute_modified_terrain_raster()` is deprecated as of 0.99.2
+and is scheduled for removal in 1.1. It samples one horizontal
+`TerrainProfile` per row of a caller-supplied GeoTIFF grid and interpolates the
+profile onto cell centers. Existing callers may use it during the compatibility
+window, but new code should call `export_rasmapper_terrain()` with
+`downsample_factor=1` and `rasterize_modifications=True`. Native export failures
+are reported rather than rerouted through the numerically different sampler.
 
 ### Utility Methods
 
@@ -109,6 +213,7 @@ Terrain profile and volume comparison with modifications applied. Uses RasMapper
 
 - `get_terrain_extent(rasmap_path, geom_hdf_path, ras_object=None)` - Get terrain bounding box with modifications applied
 - `get_terrain_profile(rasmap_path, geom_hdf_path, x_coords, y_coords, filter_tolerance=0.01, ras_object=None)` - Sample terrain elevation along polyline
+- `iter_terrain_point_elevations(rasmap_path, terrain_name, point_batches, cell_size, use_obstructions=True, nodata_values=(-9999.0,))` - Read bounded original-coordinate Float64 batches as native Float32 elevations; isolated HEC-RAS 6.6, serial native calls of at most 65536 points with caller batch shape/order preserved, no interpolation/fallback.
 - `get_terrain_volume_elevation(rasmap_path, geom_hdf_path, x_coords, y_coords, ...)` - Compute elevation-volume curve for polygon
 
 ### Comparison Methods
@@ -118,7 +223,7 @@ Terrain profile and volume comparison with modifications applied. Uses RasMapper
 
 ### Raster Export
 
-- `compute_modified_terrain_raster(rasmap_path, geom_hdf_path, terrain_tif_path, output_tif_path=None, ...)` - Compute full-resolution raster of terrain with modifications applied
+- `compute_modified_terrain_raster(rasmap_path, geom_hdf_path, terrain_tif_path, output_tif_path=None, ...)` - **Deprecated:** row-sampled compatibility raster; use `RasTerrain.export_rasmapper_terrain()`
 
 ### Usage
 
@@ -139,6 +244,183 @@ comparison = RasTerrainMod.compare_terrain_profiles(
 print(comparison[['station', 'existing_elevation', 'proposed_elevation', 'difference']])
 ```
 
+## Usgs3depAws
+
+USGS 3DEP elevation acquisition from the public AWS S3 bucket, plus VRT
+mosaicking with HEC-RAS bundled GDAL. Direct download currently covers the 1m
+project-based products; 10m and 30m are discovery only.
+
+### Discovery Methods
+
+- `download_tile_index(resolution, cache_folder=None)` - Download and cache the spatial metadata GeoPackage
+- `query_tiles_api(bbox, resolution, buffer_distance=0.0)` - Query the National Map tile index REST API
+- `find_tiles_for_bbox(bbox, resolution, cache_folder=None, buffer_distance=0.0)` - Projects intersecting a WGS84 extent
+- `list_projects_for_bbox(bbox, resolution, cache_folder=None, buffer_distance=0.0)` - Same, with `_year` parsed from project names
+- `select_projects_for_coverage(projects, bbox, min_coverage_fraction=0.999, min_project_area_fraction=0.0)` - Newest project per sub-area, plus a coverage report
+
+### Download Methods
+
+- `download_tiles(bbox, resolution, output_folder, cache_folder=None, overwrite_dest=False, max_workers=3, project_name=None, min_year=None, buffer_distance=0.0, *, project_selection="newest", min_coverage_fraction=0.999, min_project_area_fraction=0.0, return_provenance=False, exclude_tile_ids=None)` - Download the intersecting 1m tiles
+
+`project_selection` controls what happens when several projects intersect the
+extent:
+
+| Mode | Behavior |
+|------|----------|
+| `"newest"` (default) | Keeps only the single most recent project. Any sub-area that project does not cover is silently absent from the mosaic. |
+| `"coverage"` | Greedily covers the extent with the newest project available per sub-area, falls back to older projects only for the residual geometry, logs each project's contributed area, and warns when the extent cannot be fully covered. Tiles are returned oldest project first so the newest data wins on overlap in a `gdalbuildvrt` mosaic. |
+
+With `return_provenance=True` the call returns `(tile_paths, provenance)`, where
+each provenance record carries `tile_id`, `file_name`, `file_path`,
+`source_url`, `project_name`, `project_year`, `etag`, `last_modified`,
+`content_length`, and `local_size_bytes`. That is enough to record exactly which
+tiles a terrain was built from without re-hashing the rasters.
+
+### HEC-RAS Terrain Raster
+
+- `build_terrain_raster(output_raster, project_crs, geom_path=None, aoi_geometry=None, *, buffer_distance=100.0, buffer_units="US survey foot", vertical_unit=None, minimum_cell_size=5.0, target_resolution=None, backfill_resolutions=(10, 30), exclude_tile_ids=None, download_folder=None, cache_folder=None, resampling_method="bilinear", nodata=-9999.0, src_nodata=None, max_workers=3, hecras_version=None, hec_terrain_hdf=None, receipt_path=None, overwrite=False, timeout_seconds=7200, tile_plan=None, require_cached_tiles=False)` - Build one gap-free GeoTIFF terrain in the project CRS
+
+RASMapper creates result rasters that mirror the terrain VRT structure: when a
+terrain references several rasters, every result output mirrors that
+multi-raster structure. `build_terrain_raster()` therefore delivers exactly one
+raster, already in the project CRS so HEC-RAS never reprojects, and can prove
+the HEC-RAS terrain built from it has a single source member.
+
+| Step | Behavior |
+|------|----------|
+| AOI | Buffered model extent in the project CRS. From `geom_path` it is the model footprint (`HdfProject.get_project_extent(..., geometry_type="footprint")`, text-only 1D supported) unioned with the full cross-section cut lines, which can protrude past the edge-line footprint. The buffer is an absolute distance (default 100 US survey feet), not a percentage. A caller geometry (`aoi_geometry`, project CRS) is buffered the same way. The project CRS is always caller-supplied. |
+| Priority | 3DEP 1m project-based DEMs via `download_tiles(project_selection="coverage")` (newest project per sub-area), then seamless 1/3 arc-second (~10m), then 1 arc-second (~30m). A lower tier is downloaded only where higher tiers leave AOI pixels uncovered. |
+| Cell size | The dominant resolution is the native resolution of the tier contributing the most AOI area, converted to project units with exact fractions (1m is 3937/1200 = 3.2808333333333333 US survey feet). The cell size is `k * dominant_resolution` for the smallest integer `k >= 1` reaching `minimum_cell_size` (default 5 project units): 1m in EPSG:2277 gives k=2 and 6.5616666666666667 ftUS; a 10m source (32.8 ft) already meets the minimum, so k=1. `target_resolution` overrides the rule; a value that is not an integer multiple of the dominant resolution is snapped to the nearest multiple (at least 1x) with a logged warning. The receipt records `multiple`, `dominant_resolution`, `minimum_cell_size`, `requested_resolution`, `snapped`, `chosen_by`, and the resulting `value`. |
+| Composite | One HEC-RAS bundled `gdalwarp.exe` call, sources lowest priority first and highest last, bilinear resampling for every tier (`resampling_method`, default `"bilinear"`), `-t_srs`, `-tr`, `-tap`, `-te` snapped outward, tiled/compressed GeoTIFF with `BIGTIFF=IF_SAFER`. |
+| Vertical units | 3DEP heights are NAVD88 metres. Reprojection changes horizontal units only, and the bundled GDAL 3.0.2 `gdalwarp` does not rescale Z even with compound CRSs, so valid pixels are explicitly scaled (x 3.2808333333333333 for US survey feet). |
+| Gate | Nodata pixels inside the buffered AOI polygon (not its bounding rectangle; any touching pixel counts) must be zero. Otherwise `TerrainBuildError` is raised with `reason_code="terrain_aoi_nodata_after_backfill"`, the count, bounds, and sample locations. Terrain is never fabricated. |
+| Receipt | `<output stem>.terrain_receipt.json`: per-tier projects, tiles (URL, ETag, Last-Modified, size), contributed AOI pixels and area; the cell-size rule inputs and result; vertical datum, units, and factor; target CRS; grid origin and shape; nodata-inside-AOI count. |
+| HEC-RAS handoff | With `hec_terrain_hdf`, `RasTerrain.create_terrain_hdf` builds the terrain from the single raster with stitching disabled, and the resulting `Terrain.vrt` must have exactly one source member (`reason_code="hec_terrain_vrt_not_single_source"` otherwise). |
+
+```python
+from ras_commander.terrain import TerrainBuildError, Usgs3depAws
+
+try:
+    receipt = Usgs3depAws.build_terrain_raster(
+        "Terrain/maha_creek_navd88_ftus_epsg2277.tif",
+        project_crs="EPSG:2277",          # caller-asserted for text-only models
+        geom_path="MAHA CREEK.g01",
+        hecras_version="6.6",
+        hec_terrain_hdf="Terrain/hec-terrain-6.6/Terrain.hdf",
+    )
+except TerrainBuildError as error:
+    print(error.reason_code, error.details)
+else:
+    print(receipt["resolution"]["value"], receipt["hec_terrain"]["source_member_count"])
+```
+
+### Catalog Builds: Plan, Prefetch, Build Offline
+
+For many models that share one tile store (for example a catalog built in
+parallel in containers or on HPC nodes with no internet and a read-only store),
+split acquisition from building:
+
+- `plan_terrain_tiles(project_crs, geom_path=None, aoi_geometry=None, *, buffer_distance=100.0, buffer_units="US survey foot", backfill_resolutions=(10, 30), min_coverage_fraction=0.999, min_project_area_fraction=0.0, cache_folder=None, exclude_tile_ids=None)` - Network. Computes the same buffered AOI `build_terrain_raster()` uses (one shared routine) and every tile each tier needs, and returns a JSON-serializable plan.
+- `prefetch_terrain_tiles(plans, download_folder, *, max_workers=4, overwrite=False)` - Network, single writer. Deduplicates tiles by URL across any number of plans, downloads each once into `download_folder/<product>/<filename>`, keeps size-matched existing files, and returns a manifest.
+- `build_terrain_raster(..., tile_plan=plan, require_cached_tiles=True)` - No network. Uses the plan's AOI and tile lists and reads the store without writing to it.
+
+| Plan field | Content |
+|------------|---------|
+| `schema`, `version`, `created_at`, `project_crs` | Identity (`ras-commander/usgs-3dep-terrain-tile-plan`, `1.0.0`) |
+| `buffer` | Distance, units, and distance in project units |
+| `aoi` | `wkt` (full precision, project CRS), `wkt_sha256`, `bounds`, `bounds_wgs84`, and the AOI report (cross-section counts) |
+| `selection` | Coverage fractions, backfill resolutions, excluded tile ids |
+| `tiers` | Highest priority first. Each tier has `tier`, `product`, `resolution`, and `tiles`; each tile has `tile_id`, `url`, `filename`, `relative_path`, `product`, `tier_resolution`, `project`, `project_folder`, `year`, `etag`, `last_modified`, and `content_length` (from a HEAD request). Tier 1 lists coverage-selected 1m tiles in composite order and adds `coverage` (covered and uncovered fraction, uncovered area, and uncovered geometry WKT). Backfill tiers list EVERY seamless 1-degree tile intersecting the AOI, unconditionally, because interior 1m voids cannot be predicted from the index; tiles missing on S3 are listed under `unavailable_tiles`. |
+
+The prefetch manifest lists one entry per unique URL with `filename`,
+`relative_path`, `local_path`, `url`, `tier_resolutions`, `products`,
+`project`, `project_folder`, `year`, `etag`, `last_modified`,
+`content_length`, `local_size_bytes`, `status` (`downloaded`, `cached`, or
+`failed`), `error`, and `referenced_by_plans` (plan SHA-256 digests), plus
+`counts`. Failures are reported per tile rather than raised; a partial or
+size-mismatched download is removed so it can never pass as cached.
+
+With `tile_plan`, `build_terrain_raster()` does not recompute the AOI and does
+not query the tile index or S3 listings. `geom_path` and `aoi_geometry` must be
+omitted, `project_crs` must match the plan, and `backfill_resolutions` must be
+a subset of the planned tiers. With `require_cached_tiles=True` it never
+downloads, never writes into `download_folder`, and makes no HEAD or other
+network request. Every tile of every planned tier must already be in the
+store, otherwise `TerrainBuildError` is raised with
+`reason_code="terrain_tile_not_cached"` and the missing relative paths.
+`require_cached_tiles=True` without `tile_plan` is rejected. The receipt
+`build_mode` block records `offline`, `network_access`, the store folder, and
+the plan's SHA-256. Per-tile provenance comes from the plan, plus the local
+size and a `size_matches_plan` flag computed without network access. The
+cell-size rule, bilinear composite, single raster, zero-nodata gate, and
+single-member `Terrain.vrt` check are unchanged.
+
+```python
+import json
+from concurrent.futures import ProcessPoolExecutor
+from ras_commander.terrain import Usgs3depAws
+
+# 1. Plan (network), one plan per model
+plans = {name: Usgs3depAws.plan_terrain_tiles("EPSG:2277", geom_path=geom) for name, geom in models.items()}
+
+# 2. Prefetch once, single writer
+manifest = Usgs3depAws.prefetch_terrain_tiles(plans.values(), "tile-store", max_workers=8)
+assert manifest["counts"]["failed"] == 0
+
+# 3. Build offline in parallel against the read-only store
+def build(name):
+    return Usgs3depAws.build_terrain_raster(
+        f"terrain/{name}.tif", "EPSG:2277",
+        download_folder="tile-store", tile_plan=plans[name], require_cached_tiles=True,
+        hec_terrain_hdf=f"terrain/{name}/Terrain.hdf", hecras_version="6.6",
+    )
+
+with ProcessPoolExecutor() as pool:
+    receipts = list(pool.map(build, plans))
+```
+
+### Mosaic Methods
+
+- `create_vrt(tile_files, output_vrt, hecras_version=None)` - Build a VRT mosaic of downloaded tiles with HEC-RAS bundled `gdalbuildvrt.exe`
+
+`create_vrt()` inherits the source SRS and native cell size. Do not use a
+multi-raster VRT as a HEC-RAS terrain source; use `build_terrain_raster()`.
+
+## RasTauDem
+
+D8 stream links and catchments from a DEM, using the TauDEM 5 command-line
+tools (PitRemove, D8FlowDir, AreaD8, Threshold, StreamNet). TauDEM is GPL-3
+software that RAS Commander runs only as separate processes; install it from
+[hydrology.usu.edu/taudem](https://hydrology.usu.edu/taudem/). MPI (MS-MPI on
+Windows, MPICH or Open MPI on Linux) is optional: without `mpiexec` each tool
+runs as one process.
+
+- `get_taudem_info(taudem_dir=None, mpiexec_path=None)` - Locate the tools: argument, then `RAS_COMMANDER_TAUDEM_DIR`, then `PATH`, then the default Windows folder. The launcher: argument, then `RAS_COMMANDER_MPIEXEC`, then `PATH`, then the default MS-MPI folder. Raises `TauDemNotFoundError`
+- `delineate(dem_path, dest_folder, *, stream_area_sqmi=0.1, cell_size=None, num_processes=4, edge_contamination_check=False, taudem_dir=None, mpiexec_path=None, overwrite=False, timeout=None)` - Returns `TauDemDelineation`
+
+`TauDemDelineation.streams` holds one row per link (schema `taudem_streams`):
+`LINKNO`, `DSLINKNO` (-1 at an outlet), `USLINKNO1`, `USLINKNO2`, `strmOrder`,
+`Length`, `Slope`, `DSContArea` (DEM units squared) and `contributing_area_sqmi`.
+Each LineString starts at the link outlet. `catchments` (schema
+`taudem_catchments`) is the polygonized StreamNet watershed grid. The DEM must
+be in a projected CRS with square, north-up cells; geographic DEMs are refused.
+`cell_size` resamples the DEM (average) before delineation, which keeps
+HUC-scale runs tractable: the Salt Draw (HUC-8 13070004) 10 ft terrain at
+`cell_size=100` delineated 3,204 links in 18 s on a workstation.
+
+The AreaD8 edge-contamination check is off by default (TauDEM `-nc`). A terrain
+clipped at its drainage divide touches the DEM edge everywhere, and the check
+would remove every stream. Turn it on only for a DEM buffered well past the
+divide.
+
+```python
+from ras_commander.terrain import RasTauDem
+
+result = RasTauDem.delineate("Terrain/dem.tif", "work/taudem",
+                             stream_area_sqmi=0.5, cell_size=100.0)
+outlets = result.streams[result.streams["DSLINKNO"] < 0]
+```
+
 ## Related Examples
 
 | Notebook | Description |
@@ -146,3 +428,170 @@ print(comparison[['station', 'existing_elevation', 'proposed_elevation', 'differ
 | `316_terrain_modifications.ipynb` | Terrain modification writer: high ground, channel, polygon |
 | `920_terrain_creation.ipynb` | Terrain HDF creation from rasters |
 | `930_terrain_modification_analysis.ipynb` | Cut/fill analysis with RasTerrainMod |
+| `931_native_rasmapper_terrain_export.ipynb` | Bounded native export, typed result, receipt, and visual grid evidence |
+
+Notebooks 316, 920, 930, and 931 include freshly executed review outputs and
+figures for their bounded terrain workflows. Notebook 612 retains its coherent
+previously computed hydraulic outputs and four final maps; its four hydraulic
+simulations were deliberately not rerun for this terrain-export change.
+
+## Complete source reference
+
+The sections above explain common operations. The source-derived reference below
+includes the remaining public methods and their full signatures. Method-specific
+prerequisites and return contracts take precedence over abbreviated summaries.
+
+### RasTerrain source reference
+
+::: ras_commander.terrain.RasTerrain.RasTerrain
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - compute_bank_lines
+        - compute_xs_interpolation_surface
+        - create_terrain_from_rasters
+        - create_terrain_hdf
+        - export_rasmapper_terrain
+        - get_available_versions
+        - profile_vrt_to_tiff
+        - vrt_to_tiff
+
+### Usgs3depAws source reference
+
+::: ras_commander.terrain.Usgs3depAws.Usgs3depAws
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - build_terrain_raster
+        - create_vrt
+        - download_tile_index
+        - download_tiles
+        - find_tiles_for_bbox
+        - list_projects_for_bbox
+        - plan_terrain_tiles
+        - prefetch_terrain_tiles
+        - query_tiles_api
+        - select_projects_for_coverage
+
+### TauDEM source reference
+
+::: ras_commander.terrain.RasTauDem
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - RasTauDem
+        - TauDemDelineation
+        - TauDemNotFoundError
+        - TauDemError
+
+### TerrainBuildError source reference
+
+::: ras_commander.terrain.Usgs3depAws.TerrainBuildError
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+
+### RasTerrainMod source reference
+
+::: ras_commander.terrain.RasTerrainMod.RasTerrainMod
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - compare_terrain_profiles
+        - compare_terrain_volumes
+        - compute_modified_terrain_raster
+        - get_terrain_extent
+        - get_terrain_profile
+        - iter_terrain_point_elevations
+        - get_terrain_volume_elevation
+        - setup_gdal_bridge
+
+### RasTerrainModification source reference
+
+::: ras_commander.terrain.RasTerrainModWriter.RasTerrainModification
+    options:
+      inherited_members: true
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - add_channel_modification
+        - add_fill_surface_modification
+        - add_high_ground_modification
+        - add_modification_group
+        - add_modification_polygon
+        - apply_modification_to_profile
+        - compare_before_after_profiles
+        - get_modification_profile
+        - list_modifications
+        - sample_modification_surface
+
+### RasTerrainModWriter source reference
+
+::: ras_commander.terrain.RasTerrainModWriter.RasTerrainModWriter
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - add_channel_modification
+        - add_fill_surface_modification
+        - add_high_ground_modification
+        - add_modification_group
+        - add_modification_polygon
+        - apply_modification_to_profile
+        - compare_before_after_profiles
+        - get_modification_profile
+        - list_modifications
+        - sample_modification_surface
+
+### TerrainExportResult source reference
+
+::: ras_commander.ComputeResults.TerrainExportResult
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+
+
+### Isolated serial native sampling
+
+`RasTerrainMod.run_serial_native_sampling(operation)` runs an eager callback on
+one CLR ThreadPool worker and returns `(result, execution_evidence)`. Use it only
+inside a caller-owned fresh Windows or Wine process without other native/CLR
+work. Exhaust point iterators inside the callback; do not return a lazy iterator
+or await separately queued CLR work. Calls cannot be concurrent or nested.
+
+The helper selects one already-available processor through the public process
+API, lowers the public CLR worker and completion-port limits to one, verifies
+both controls, and dispatches the callback onto that sole pool worker. Native
+nested `Parallel.For` work then cannot obtain a second pool worker. No HEC private
+cache, coordinates, source records, profile tolerance, cell size or obstruction
+parameter is changed. Runtime limitations fail before the callback is invoked.
+Affinity and original minimum/maximum thread counts are restored and read back
+on success or exception; restoration failure cannot yield a successful result.
+
+Execution evidence records the mode `single-clr-pool-worker-v1`, original and
+sampling processor-affinity masks, reported processor count, original minimum
+and maximum thread limits, the sampling minimum and maximum `[1, 1]`, pool dispatch and
+runtime restoration. The helper writes no artifacts. Units, CRS, mutation policy
+and artifacts remain those of the callback. The caller retains this evidence.
+
+The CLR may reject a requested thread limit; actual return values and readback
+are required, not a presumed one-thread environment. See the public
+[ThreadPool limit contract](https://learn.microsoft.com/en-us/dotnet/api/system.threading.threadpool.setmaxthreads)
+and [default Parallel scheduler behavior](https://github.com/microsoft/referencesource/blob/main/mscorlib/system/threading/Tasks/Parallel.cs).
+Source-parent first-profile controls under the qualified HEC-RAS 6.6 Wine runtime
+crashed in native parallel HDF reads under the ordinary execution mode and
+returned finite nonempty profiles under the verified serial mode. These controls
+qualify the execution experiment; they do not establish complete-support,
+corpus, hydraulic mesh or engineering acceptance.
