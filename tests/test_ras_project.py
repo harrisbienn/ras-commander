@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import shutil
@@ -17,12 +18,61 @@ import ras_commander.RasProject as project_module
 from ras_commander._rasmap_schema import create_rasmap_dataframe
 from ras_commander.schemas import DATAFRAME_SCHEMAS
 from ras_commander import (
+    ProjectPopulationError,
     ProjectPathAmbiguityError,
     ProjectPublicationError,
     STAGE_PROJECT_TREE_FINGERPRINT_ALGORITHM,
     inspect_project_assets,
     stage_project,
 )
+
+
+@pytest.mark.parametrize("initialization_fails", [False, True])
+def test_stage_releases_owned_native_handles_before_publish_or_cleanup(
+    tmp_path, monkeypatch, initialization_fails,
+):
+    native = pytest.importorskip("ras_commander_fast_hdf")
+    fast_hdf = importlib.import_module("ras_commander.fast_hdf")
+    monkeypatch.setenv("RAS_COMMANDER_HDF_SESSION_CACHE", "persist")
+    project = _write_project(tmp_path / "source")
+    source_hash = _tree_hash(project.parent)
+    unrelated = tmp_path / "unrelated.hdf"
+    with h5py.File(unrelated, "w") as hdf:
+        hdf.create_dataset("values", data=[1.0])
+    original_init = project_module.init_ras_project
+    staged_paths = []
+
+    def initialize_with_cached_handle(path, **kwargs):
+        staged_hdf = Path(path).with_suffix(".g01.hdf")
+        staged_paths.append(str(staged_hdf.resolve()))
+        with fast_hdf._session(native, staged_hdf):
+            pass
+        if initialization_fails:
+            raise ValueError("injected initialization failure after native read")
+        return original_init(path, **kwargs)
+
+    monkeypatch.setattr(project_module, "init_ras_project", initialize_with_cached_handle)
+    fast_hdf.close_sessions()
+    try:
+        with fast_hdf._session(native, unrelated):
+            pass
+        destination = tmp_path / "staged"
+        if initialization_fails:
+            with pytest.raises(ProjectPopulationError, match="could not be initialized"):
+                stage_project(project, destination)
+            assert not destination.exists()
+        else:
+            result = stage_project(project, destination)
+            assert result.publication_state == "published"
+            assert (destination / "Model.g01.hdf").is_file()
+        assert staged_paths
+        assert not any(key[0] in staged_paths for key in fast_hdf._sessions)
+        assert any(key[0] == str(unrelated.resolve()) for key in fast_hdf._sessions)
+        assert not list(tmp_path.glob(".staged.ras-stage-*"))
+        assert not (tmp_path / ".staged.rascommander-stage.lock").exists()
+        assert _tree_hash(project.parent) == source_hash
+    finally:
+        fast_hdf.close_sessions()
 
 
 def _write_project(

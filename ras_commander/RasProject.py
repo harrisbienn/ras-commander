@@ -32,6 +32,7 @@ from .RasUnsteady import RasUnsteady
 from .RasUtils import RasUtils
 from ._land_classification_helper import _expand_reference_text, _unresolved_reference
 from ._rasmap_schema import expected_rasmap_path, rasmap_dataframe_is_usable
+from .fast_hdf import release_native_sessions
 from .schemas import DATAFRAME_SCHEMAS
 
 logger = get_logger(__name__)
@@ -2682,6 +2683,13 @@ def _stage_project(
                 "staged_initialization_failed",
                 "The verified copy could not be initialized and inventoried",
             ) from exc
+        finally:
+            # A public-call-scoped native read can outlive inspection. Windows
+            # cannot publish or clean up the staging directory while it is open.
+            # Release only files from this operation's verified copy inventory.
+            release_native_sessions(
+                *(_io_path(temp_root / relative) for relative in source_files_before)
+            )
         checked_assets = assets
         if boundary_edit:
             checked_assets = assets.loc[

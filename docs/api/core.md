@@ -132,6 +132,11 @@ an explicit `RasPrj`, inventories the staged dependencies, writes a stage
 manifest, and publishes with one final directory rename. It never runs or
 preprocesses HEC-RAS.
 
+Native HDF sessions opened during staged inspection are released before the
+directory is published or cleaned up after an inspection failure. Sessions
+for files outside the verified staging inventory remain untouched. This keeps
+Windows directory publication compatible with the native reader cache.
+
 The destination's parent must already exist and the destination itself must
 not exist. The operation fails closed on overlap, reparse/symlink ambiguity,
 lock artifacts, source or copy drift, an invalid project population, and
