@@ -39,20 +39,21 @@ Example:
         timestamps = HdfBase.get_unsteady_timestamps(hdf)
     ```
 """
-import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import h5py
 import numpy as np
 import pandas as pd
-import xarray as xr
-from typing import List, Tuple, Union, Optional, Dict, Any
+from typing import TYPE_CHECKING, List, Tuple, Union, Optional, Dict, Any
 from pathlib import Path
 import logging
-from shapely.geometry import LineString, MultiLineString
 
 from .HdfUtils import HdfUtils
+from ..fast_hdf import read_attr, read_attrs, read_typed, reraise_required
 from ..Decorators import standardize_input, log_call
 from ..LoggingConfig import setup_logging, get_logger
+
+if TYPE_CHECKING:
+    from shapely.geometry import LineString
 
 logger = get_logger(__name__)
 _missing_projection_warning_paths: set[str] = set()
@@ -72,12 +73,58 @@ class HdfBase:
     """
 
     @staticmethod
-    def get_simulation_start_time(hdf_file: h5py.File) -> datetime:
+    @log_call
+    def fingerprint_model_inputs(
+        hdf_path: Union[str, Path],
+        *,
+        groups: Tuple[str, ...] = ("Geometry", "Plan Data"),
+        block_bytes: int = 1048576,
+    ) -> Dict[str, Any]:
+        """Fingerprint selected compiled model inputs after native writers exit.
+
+        Numeric hashes preserve exact values. Compound fields are hashed without
+        padding; string hashes preserve record boundaries. Attributes are retained
+        separately so callers can distinguish changed paths/timestamps from changed
+        hydraulic inputs. No equality tolerance or ignored attribute is implied.
+
+        Args:
+            hdf_path: Existing geometry, temporary or result HDF, as str or Path.
+            groups: Disjoint absolute or relative group paths to inspect.
+            block_bytes: Maximum fixed-width row block size, at least 1024 bytes.
+                Variable-length strings are read one block of records at a time;
+                their individual allocation size is controlled by HDF5.
+
+        Returns:
+            JSON-safe dataset hashes, shapes, dtypes, group/dataset attributes,
+            hard-link aliases and missing group paths. This receipt does not establish model equivalence.
+
+        Raises:
+            ValueError: Invalid limits, overlapping groups, non-hard links,
+                external/virtual datasets or a row exceeding the block limit.
+            OSError: The file cannot be read. Native writers must already be stopped.
+            RuntimeError: The file changes during inspection.
+            TypeError: Unsupported attributes or nested/object compound fields.
+        """
+        if isinstance(block_bytes, bool) or not isinstance(block_bytes, int) or block_bytes < 1024:
+            raise ValueError("block_bytes must be an integer of at least 1024")
+        if isinstance(groups, str) or not groups or any(not isinstance(g, str) or not g.strip('/') for g in groups):
+            raise ValueError("groups must contain nonempty HDF group paths")
+        normalized = ['/' + g.strip('/') for g in groups]
+        if any(a == b or b.startswith(a + '/') or a.startswith(b + '/')
+               for index, a in enumerate(normalized) for b in normalized[index + 1:]):
+            raise ValueError("groups must be distinct and must not overlap")
+        from ._fingerprint import fingerprint_model_inputs
+        return fingerprint_model_inputs(Path(hdf_path), normalized, block_bytes)
+
+    @staticmethod
+    @standardize_input(file_type='plan_hdf')
+    def get_simulation_start_time(hdf_file: Union[h5py.File, str, Path]) -> datetime:
         """
         Extract the simulation start time from the HDF file.
 
         Args:
-            hdf_file: Open HDF file object containing RAS simulation data.
+            hdf_file: Open plan HDF handle, or a path (``str`` or ``Path``) to
+                one. A path is opened read-only for the duration of the call.
 
         Returns:
             datetime: Simulation start time as a datetime object.
@@ -98,14 +145,15 @@ class HdfBase:
         plan_info = hdf_file.get("Plan Data/Plan Information")
         if plan_info is None:
             raise ValueError("Plan Information not found in HDF file")
+        plan_attrs = read_attrs(plan_info)
 
         # Primary (HEC-RAS 6.x): explicit 'Simulation Start Time' attribute.
-        time_str = plan_info.attrs.get('Simulation Start Time')
+        time_str = plan_attrs.get('Simulation Start Time')
         if time_str is not None:
             return HdfUtils.parse_ras_datetime(_decode(time_str))
 
         # Fallback 1 (HEC-RAS 5.0.x): 'Time Window' = "<start> to <end>".
-        time_window = plan_info.attrs.get('Time Window')
+        time_window = plan_attrs.get('Time Window')
         if time_window is not None:
             start_str = _decode(time_window).split(" to ")[0].strip()
             if start_str:
@@ -116,7 +164,7 @@ class HdfBase:
         for ts_name, has_ms in (("Time Date Stamp", False), ("Time Date Stamp (ms)", True)):
             ds = hdf_file.get(f"{base}/{ts_name}")
             if ds is not None and ds.shape[0] > 0:
-                first = _decode(ds[0])
+                first = _decode(read_typed(ds, 0))
                 return HdfUtils.parse_ras_datetime_ms(first) if has_ms else HdfUtils.parse_ras_datetime(first)
 
         raise ValueError(
@@ -125,19 +173,39 @@ class HdfBase:
         )
 
     @staticmethod
-    def get_unsteady_timestamps(hdf_file: h5py.File) -> List[datetime]:
+    @standardize_input(file_type='plan_hdf')
+    def get_unsteady_timestamps(hdf_file: Union[h5py.File, str, Path]) -> List[datetime]:
         """
         Extract the list of unsteady timestamps from the HDF file.
 
         Args:
-            hdf_file (h5py.File): Open HDF file object.
+            hdf_file: Open plan HDF handle, or a path (``str`` or ``Path``) to
+                one. A path is opened read-only for the duration of the call.
 
         Returns:
             List[datetime]: A list of datetime objects representing the unsteady timestamps.
+
+        Raises:
+            ValueError: If the plan HDF has no unsteady output timestamps.
+
+        Note:
+            Reads 'Time Date Stamp (ms)' and falls back to 'Time Date Stamp'
+            when a plan HDF does not write the millisecond dataset.
         """
-        group_path = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Time Date Stamp (ms)"
-        raw_datetimes = hdf_file[group_path][:]
-        return [HdfUtils.parse_ras_datetime_ms(x.decode("utf-8")) for x in raw_datetimes]
+        base = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series"
+        for ts_name, parse in (
+            ("Time Date Stamp (ms)", HdfUtils.parse_ras_datetime_ms),
+            ("Time Date Stamp", HdfUtils.parse_ras_datetime),
+        ):
+            dataset = hdf_file.get(f"{base}/{ts_name}")
+            if dataset is not None:
+                return [parse(x.decode("utf-8")) for x in read_typed(dataset, slice(None))]
+        file_label = Path(getattr(hdf_file, "filename", "HDF file")).name
+        raise ValueError(
+            f"No unsteady output timestamps in {file_label}: neither "
+            f"'{base}/Time Date Stamp (ms)' nor '{base}/Time Date Stamp' exists. "
+            "The plan may be steady or may not have been computed."
+        )
 
     @staticmethod
     @standardize_input(file_type='plan_hdf')
@@ -174,7 +242,7 @@ class HdfBase:
                         f"{missing} in {Path(hdf_path).name}."
                     )
 
-                attributes = hdf_file[attributes_path][()]
+                attributes = read_typed(hdf_file[attributes_path])
                 if "Name" not in attributes.dtype.names:
                     raise ValueError(
                         f"2D flow area attributes at '{attributes_path}' in "
@@ -182,7 +250,7 @@ class HdfBase:
                     )
                 names = [HdfUtils.convert_ras_string(name) for name in attributes["Name"]]
 
-                cell_info = hdf_file[cell_info_path][()]
+                cell_info = read_typed(hdf_file[cell_info_path])
                 cell_counts = [info[1] for info in cell_info]
                 if len(names) != len(cell_counts):
                     raise ValueError(
@@ -194,6 +262,7 @@ class HdfBase:
         except ValueError:
             raise
         except Exception as e:
+            reraise_required(e)
             raise ValueError(
                 f"Failed to read 2D flow area names/counts from "
                 f"{Path(hdf_path).name}: {e}"
@@ -202,30 +271,22 @@ class HdfBase:
 
     @staticmethod
     def _wkt_to_crs_string(wkt_string: str, source: str) -> str:
-        from pyproj import CRS
-
+        """Format one CRS definition with the shared ``HdfUtils.format_crs``
+        contract: ``"EPSG:n"`` when strictly equivalent, else the WKT."""
         try:
-            crs = CRS.from_wkt(wkt_string)
-            epsg = crs.to_epsg()
-            if epsg:
-                epsg_str = f"EPSG:{epsg}"
-                logger.debug(f"Converted WKT to {epsg_str} from {source}")
-                return epsg_str
-
-            logger.debug(
-                f"No EPSG match for CRS '{crs.name}' from {source}, using WKT"
-            )
-            return wkt_string
+            HdfUtils._to_crs(wkt_string)
         except Exception as e:
             logger.warning(
                 f"Could not parse WKT from {source}: {e}. Returning raw WKT."
             )
             return wkt_string
+        formatted = HdfUtils.format_crs(wkt_string)
+        logger.debug(f"Formatted CRS from {source} as {str(formatted)[:60]}")
+        return formatted
 
     @staticmethod
     def _resolve_rasmap_path(base_folder: Path, filename: str) -> Path:
-        cleaned = filename.replace(".\\", "").replace("./", "")
-        return base_folder / cleaned
+        return HdfUtils.resolve_ras_relative_path(base_folder, filename)
 
     @staticmethod
     def _get_projection_from_hdf_attribute(
@@ -280,11 +341,6 @@ class HdfBase:
             with rasterio.open(raster_path) as src:
                 if src.crs is None:
                     return None
-                epsg = src.crs.to_epsg()
-                if epsg:
-                    epsg_str = f"EPSG:{epsg}"
-                    logger.debug(f"Found CRS {epsg_str} in raster: {raster_path}")
-                    return epsg_str
                 wkt = src.crs.to_wkt()
                 if wkt:
                     return HdfBase._wkt_to_crs_string(
@@ -300,79 +356,63 @@ class HdfBase:
         return None
 
     @staticmethod
+    @log_call
     @standardize_input(file_type='plan_hdf')
     def get_projection(hdf_path: Path) -> Optional[str]:
         """
-        Get projection information from HDF file or RASMapper project file.
-        Converts WKT projection to EPSG code for GeoDataFrame compatibility.
+        Get the CRS of a HEC-RAS HDF file from consistent CRS evidence.
+
+        Evidence is collected by ``HdfUtils.collect_hdf_crs_evidence`` and
+        resolved by ``HdfUtils.resolve_crs_evidence``. In precedence order:
+
+        1. the HDF ``Projection`` attribute (root, else ``Geometry`` group);
+        2. the projection file named by the matching ``.rasmap``
+           (``RASProjectionFilename``);
+        3. every terrain layer HDF listed in that ``.rasmap``.
+
+        Every CRS found must be strictly equivalent (``HdfUtils.crs_equivalent``).
+        No coordinates are transformed and no authority code is guessed.
+
+        Behaviour changes from ras-commander <= 0.106.1:
+
+        - Conflicting evidence (for example an HDF attribute in one State
+          Plane zone and a ``.rasmap`` projection in another) now returns
+          ``None`` with a warning. Previously the HDF attribute was returned
+          without checking the ``.rasmap`` or terrain.
+        - Terrain layer HDFs are now consulted, so a project whose HDF and
+          ``.rasmap`` projection are missing can resolve from terrain.
+        - ``"EPSG:n"`` is returned only when an EPSG definition is strictly
+          equivalent (``HdfUtils.get_equivalent_epsg``); previously
+          ``pyproj.CRS.to_epsg()`` accepted a 70%-confidence match. ``"ESRI:n"``
+          codes are never returned.
+        - The ``.rasmap`` is selected by matching the HDF project name when a
+          folder holds several; parent (``..``) components of ``.rasmap``
+          paths are resolved instead of being stripped.
 
         Args:
             hdf_path (Path): Path to the HDF file.
 
         Returns:
-            Optional[str]: The projection as EPSG code (e.g. "EPSG:6556"), WKT
-                string if no EPSG match is found, or None if no projection is
-                available.
+            Optional[str]: ``"EPSG:n"`` when an EPSG code is strictly
+                equivalent; otherwise the WKT of the highest-precedence
+                evidence; ``None`` when evidence is missing or conflicting.
+                Use ``HdfUtils.resolve_crs_evidence`` directly to see which
+                case applies and the evidence examined.
         """
-        project_folder = hdf_path.parent
-        proj_file = None
-
-        projection = HdfBase._get_projection_from_hdf_attribute(hdf_path)
-        if projection:
-            return projection
-
-        try:
-            rasmap_files = list(project_folder.glob("*.rasmap"))
-            if rasmap_files:
-                rasmap_path = rasmap_files[0]
-                tree = ET.parse(rasmap_path)
-                root = tree.getroot()
-
-                proj_elem = root.find(".//RASProjectionFilename")
-                if proj_elem is not None:
-                    filename = proj_elem.get("Filename")
-                    if filename:
-                        proj_file = HdfBase._resolve_rasmap_path(
-                            project_folder,
-                            filename,
-                        )
-                        if proj_file.exists():
-                            projection = HdfBase._get_projection_from_prj_file(
-                                proj_file
-                            )
-                            if projection:
-                                return projection
-        except Exception as e:
-            logger.debug(
-                "Error reading RASMapper projection file while checking %s: %s",
-                hdf_path,
-                str(e),
-            )
-
-        if proj_file:
-            error_msg = (
-                "No valid projection found. Checked:\n"
-                f"1. HDF file projection attribute: {hdf_path}\n"
-                f"2. RASMapper projection file {proj_file} found in RASMapper "
-                "file, but was invalid"
-            )
-        else:
-            error_msg = (
-                "No valid projection found. Checked:\n"
-                f"1. HDF file projection attribute: {hdf_path}\n"
-                "2. No RASMapper projection file found"
-            )
-
-        error_msg += (
-            "\nTo fix this:\n"
-            "1. Open RASMapper\n"
-            "2. Click Map > Set Projection\n"
-            "3. Select an appropriate projection file or coordinate system\n"
-            "4. Save the RASMapper project"
+        resolution = HdfUtils.resolve_crs_evidence(
+            HdfUtils.collect_hdf_crs_evidence(hdf_path)
         )
+        if resolution.status == "resolved":
+            return resolution.to_crs_string()
 
-        logger.debug(error_msg)
-
+        logger.debug(
+            "CRS resolution for %s: %s; evidence=%s. To fix a missing "
+            "projection: open RASMapper, click Map > Set Projection, select a "
+            "projection file and save the RASMapper project.",
+            hdf_path,
+            resolution.status,
+            resolution.evidence,
+        )
         try:
             warning_key = str(hdf_path.resolve())
         except OSError:
@@ -382,14 +422,422 @@ class HdfBase:
             warning_key not in _missing_projection_warning_paths
             and logger.isEnabledFor(logging.WARNING)
         ):
-            logger.warning(
-                "Projection not found for %s; returned geospatial outputs will "
-                "not have a CRS. Enable DEBUG for checked paths and RASMapper "
-                "projection setup guidance.",
-                hdf_path.name,
-            )
+            if resolution.status == "missing":
+                logger.warning(
+                    "Projection not found for %s; returned geospatial outputs will "
+                    "not have a CRS. Enable DEBUG for checked evidence and RASMapper "
+                    "projection setup guidance.",
+                    hdf_path.name,
+                )
+            else:
+                logger.warning(
+                    "Conflicting projection evidence for %s (%d distinct CRS "
+                    "definitions); returned geospatial outputs will not have a "
+                    "CRS. Use HdfUtils.collect_hdf_crs_evidence to inspect.",
+                    hdf_path.name,
+                    len(resolution.candidates),
+                )
             _missing_projection_warning_paths.add(warning_key)
         return None
+
+    @staticmethod
+    def _decode_unit_attribute(value: Any) -> str:
+        """Return one stable text representation for an HDF attribute."""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace").strip()
+        if isinstance(value, np.ndarray):
+            if value.size == 1:
+                return HdfBase._decode_unit_attribute(value.reshape(-1)[0])
+            return str(value.tolist())
+        if isinstance(value, np.generic):
+            value = value.item()
+        return str(value).strip()
+
+    @staticmethod
+    def _parse_si_units_attribute(value: Any) -> Optional[bool]:
+        """Parse the HEC-RAS ``Geometry/@SI Units`` attribute."""
+        if isinstance(value, np.ndarray) and value.size == 1:
+            value = value.reshape(-1)[0]
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and value in {0, 1}:
+            return bool(value)
+        text = HdfBase._decode_unit_attribute(value).casefold()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return None
+
+    @staticmethod
+    def _parse_unit_system_attribute(value: Any) -> Optional[bool]:
+        """Return True for SI and False for US Customary root metadata."""
+        text = HdfBase._decode_unit_attribute(value).casefold()
+        if text.startswith("si") or text == "metric":
+            return True
+        if text.startswith("us") or text in {"english", "imperial"}:
+            return False
+        return None
+
+    @staticmethod
+    def _parse_unit_system_override(value: Any) -> bool:
+        """Return True for an SI and False for a US Customary ``unit_system``."""
+        text = HdfBase._decode_unit_attribute(value).casefold()
+        if text in {"si", "si units", "metric", "m"}:
+            return True
+        if text in {"us", "us customary", "english", "english units", "ft"}:
+            return False
+        raise ValueError(
+            f"Unrecognized unit_system {value!r}; use 'SI' or 'US Customary'"
+        )
+
+    @staticmethod
+    def _length_unit_labels(hdf_file: h5py.File) -> Dict[str, List[str]]:
+        """Return result datasets whose own ``Units`` attribute is ``m`` or ``ft``.
+
+        Only exact length labels count, including elements of array labels
+        such as ``['m', 'Days']``. Unlabelled tables are never used.
+        """
+        labels: Dict[str, List[str]] = {"m": [], "ft": []}
+        results = hdf_file.get("Results")
+        if results is None:
+            return labels
+
+        def visit(name: str, obj: Any) -> None:
+            if not isinstance(obj, h5py.Dataset) or "Units" not in obj.attrs:
+                return
+            values = {
+                HdfBase._decode_unit_attribute(item).casefold()
+                for item in np.asarray(read_attr(obj, "Units")).reshape(-1)
+            }
+            for unit, paths in labels.items():
+                if unit in values:
+                    paths.append(f"{results.name}/{name}")
+
+        results.visititems(visit)
+        return labels
+
+    @staticmethod
+    def _resolved_unit_metadata(
+        si_units: bool,
+        *,
+        source: str,
+        source_text: str,
+        evidence: List[Dict[str, Optional[str]]],
+        warnings: List[str],
+    ) -> Dict[str, Any]:
+        """Return the normalized record for a resolved unit system."""
+        length_units = "m" if si_units else "ft"
+        return {
+            "status": "resolved",
+            "unit_system": "SI" if si_units else "US Customary",
+            "length_units": length_units,
+            "depth_units": length_units,
+            "velocity_units": "m/s" if si_units else "ft/s",
+            "flow_units": "m3/s" if si_units else "ft3/s",
+            "source": source,
+            "source_file": source_text,
+            "evidence": evidence,
+            "contradictions": [],
+            "warnings": warnings,
+        }
+
+    @staticmethod
+    def _result_unit_metadata_from_file(
+        hdf_file: h5py.File,
+        *,
+        source_file: Union[str, Path],
+        strict: bool,
+        unit_system: Optional[str] = None,
+        project_file: Optional[Union[str, Path]] = None,
+    ) -> Dict[str, Any]:
+        """Build normalized result-HDF unit metadata from an open file.
+
+        Resolution order:
+
+        1. ``unit_system`` override (``source="override"``).
+        2. The ``project_file`` ``.prj`` marker (``source="project_file"``).
+           A root ``/@Units System`` that disagrees with it is contradictory;
+           a disagreeing ``/Geometry/@SI Units`` is ignored with a warning.
+        3. The embedded attributes (``source="plan_hdf"``). Agreeing evidence
+           resolves. Root ``SI Units`` with ``/Geometry/@SI Units = False`` is
+           the RasMapper geometry default, which HEC-RAS 6.6 and 7.0 never
+           update from the project. It resolves to SI only when at least one
+           result dataset ``Units`` label in the same file is ``m`` and none
+           is ``ft``. Every other disagreement is contradictory.
+
+        Every record carries ``warnings``; the evidence keeps both attributes.
+        """
+        source_path = Path(source_file)
+        try:
+            source_text = str(source_path.resolve())
+        except OSError:
+            source_text = str(source_path.absolute())
+        warnings: List[str] = []
+
+        evidence: List[Dict[str, Optional[str]]] = []
+        recognized: List[Tuple[str, bool]] = []
+        problems: List[str] = []
+
+        if "Results" not in hdf_file:
+            problems.append("HDF file does not contain a /Results group")
+
+        geometry = hdf_file.get("Geometry")
+        if geometry is not None and "SI Units" in geometry.attrs:
+            raw_value = read_attr(geometry, "SI Units")
+            si_units = HdfBase._parse_si_units_attribute(raw_value)
+            evidence.append(
+                {
+                    "attribute": "/Geometry/@SI Units",
+                    "raw_value": HdfBase._decode_unit_attribute(raw_value),
+                    "unit_system": (
+                        "SI"
+                        if si_units is True
+                        else "US Customary"
+                        if si_units is False
+                        else None
+                    ),
+                }
+            )
+            if si_units is None:
+                problems.append(
+                    "Unrecognized /Geometry/@SI Units value "
+                    f"{HdfBase._decode_unit_attribute(raw_value)!r}"
+                )
+            else:
+                recognized.append(("/Geometry/@SI Units", si_units))
+
+        if "Units System" in hdf_file.attrs:
+            raw_value = read_attr(hdf_file, "Units System")
+            si_units = HdfBase._parse_unit_system_attribute(raw_value)
+            evidence.append(
+                {
+                    "attribute": "/@Units System",
+                    "raw_value": HdfBase._decode_unit_attribute(raw_value),
+                    "unit_system": (
+                        "SI"
+                        if si_units is True
+                        else "US Customary"
+                        if si_units is False
+                        else None
+                    ),
+                }
+            )
+            if si_units is None:
+                problems.append(
+                    "Unrecognized /@Units System value "
+                    f"{HdfBase._decode_unit_attribute(raw_value)!r}"
+                )
+            else:
+                recognized.append(("/@Units System", si_units))
+
+        def label(state: bool) -> str:
+            return "SI" if state else "US Customary"
+
+        if unit_system is not None and "Results" in hdf_file:
+            si_units = HdfBase._parse_unit_system_override(unit_system)
+            ignored = [
+                f"{attribute}={label(state)}"
+                for attribute, state in recognized
+                if state != si_units
+            ]
+            if ignored:
+                warnings.append(
+                    f"unit_system={unit_system!r} override used; ignored "
+                    + ", ".join(ignored)
+                )
+            return HdfBase._resolved_unit_metadata(
+                si_units,
+                source="override",
+                source_text=source_text,
+                evidence=evidence,
+                warnings=warnings,
+            )
+
+        attribute_states = dict(recognized)
+        root_state = attribute_states.get("/@Units System")
+        geometry_state = attribute_states.get("/Geometry/@SI Units")
+        states = {state for _, state in recognized}
+        source = "plan_hdf"
+        contradictory = False
+
+        project_units = None
+        if project_file is not None:
+            from ..RasPrj import RasPrj
+
+            project_units = RasPrj.get_project_units(project_file)
+            if project_units is None:
+                logger.debug(
+                    "No unit marker in project file %s; using embedded "
+                    "result-HDF metadata",
+                    project_file,
+                )
+        if project_units is not None:
+            source = "project_file"
+            project_si = project_units == "m"
+            evidence.append(
+                {
+                    "attribute": "project_file",
+                    "raw_value": str(project_file),
+                    "unit_system": label(project_si),
+                }
+            )
+            if root_state is not None and root_state != project_si:
+                contradictory = True
+                problems.append(
+                    f"Project file marker ({label(project_si)}) disagrees "
+                    f"with /@Units System={label(root_state)}"
+                )
+            elif geometry_state is not None and geometry_state != project_si:
+                warnings.append(
+                    f"/Geometry/@SI Units={label(geometry_state)} ignored: "
+                    f"the project file marker ({label(project_si)}) is "
+                    "authoritative"
+                )
+            states = {project_si}
+        elif root_state is True and geometry_state is False and not problems:
+            # Known HEC-RAS pattern: RasMapper writes /Geometry/@SI Units from
+            # a False default and never syncs it with the project unit system.
+            # Accept root SI only when the file's own dataset labels agree.
+            length_labels = HdfBase._length_unit_labels(hdf_file)
+            if length_labels["m"] and not length_labels["ft"]:
+                warning = (
+                    "/Geometry/@SI Units=False ignored: RasMapper geometry "
+                    "default; /@Units System and "
+                    f"{len(length_labels['m'])} result dataset Units labels "
+                    "agree on SI"
+                )
+                warnings.append(warning)
+                logger.warning("%s: %s", source_path.name, warning)
+                states = {True}
+            else:
+                contradictory = True
+                problems.append(
+                    "Result HDF unit-system metadata is contradictory: "
+                    "/Geometry/@SI Units=US Customary, /@Units System=SI, "
+                    "and result dataset Units labels do not corroborate SI "
+                    f"(m: {len(length_labels['m'])}, "
+                    f"ft: {len(length_labels['ft'])})"
+                )
+        elif len(states) > 1:
+            contradictory = True
+            detail = ", ".join(
+                f"{attribute}={label(state)}"
+                for attribute, state in recognized
+            )
+            problems.append(
+                "Result HDF unit-system metadata is contradictory: " + detail
+            )
+        if not evidence:
+            problems.append(
+                "Result HDF contains no recognized embedded unit-system metadata"
+            )
+
+        if not problems and len(states) == 1:
+            return HdfBase._resolved_unit_metadata(
+                states.pop(),
+                source=source,
+                source_text=source_text,
+                evidence=evidence,
+                warnings=warnings,
+            )
+
+        if contradictory:
+            status = "contradictory"
+        elif evidence and any(item["unit_system"] is None for item in evidence):
+            status = "unrecognized"
+        elif "Results" not in hdf_file:
+            status = "unrecognized"
+        else:
+            status = "missing"
+        result = {
+            "status": status,
+            "unit_system": None,
+            "length_units": None,
+            "depth_units": None,
+            "velocity_units": None,
+            "flow_units": None,
+            "source": source,
+            "source_file": source_text,
+            "evidence": evidence,
+            "contradictions": problems,
+            "warnings": warnings,
+        }
+        if strict:
+            hint = ""
+            if "Results" in hdf_file:
+                hint = (
+                    ". If the true unit system is known, pass "
+                    "unit_system='SI' or unit_system='US Customary'"
+                )
+            raise ValueError(
+                f"Could not resolve result-HDF units for {source_path.name}: "
+                + "; ".join(problems)
+                + hint
+            )
+        return result
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type="plan_hdf")
+    def get_result_unit_metadata(
+        hdf_path: Path,
+        *,
+        strict: bool = True,
+        unit_system: Optional[str] = None,
+        project_file: Optional[Union[str, Path]] = None,
+    ) -> Dict[str, Any]:
+        """Read normalized units from a HEC-RAS result HDF.
+
+        If the full HEC-RAS project is available, pass its ``.prj`` as
+        ``project_file`` (or use :meth:`RasPrj.get_project_units`): the text
+        project marker is authoritative. A root ``/@Units System`` that
+        disagrees with it raises; a disagreeing ``/Geometry/@SI Units`` is
+        ignored with a warning (``source="project_file"``).
+
+        For a standalone HDF the reader checks ``/Geometry/@SI Units`` and
+        ``/@Units System`` (``source="plan_hdf"``). Agreeing evidence
+        resolves. One disagreement is accepted: root ``SI Units`` with
+        ``/Geometry/@SI Units = False``. RasMapper writes that geometry flag
+        from a ``False`` default and HEC-RAS 6.6 and 7.0 never update it from
+        the project units (seen on the Weise_2D sediment example). It resolves
+        to SI only when at least one result dataset ``Units`` label in the same
+        file is ``m`` and none is ``ft``; the record then carries a warning
+        and keeps both attributes in ``evidence``. Every other disagreement,
+        including root ``US Customary`` with ``/Geometry/@SI Units = True``,
+        remains contradictory.
+
+        ``unit_system`` overrides all embedded and project evidence
+        (``source="override"``); disagreeing evidence is listed in
+        ``warnings``.
+
+        With ``strict=True`` (default), missing, unrecognized, non-result, or
+        contradictory metadata raises :class:`ValueError` naming the
+        ``unit_system`` override. With ``strict=False``, the same condition
+        returns a JSON-serializable unresolved record with evidence and
+        contradictions.
+
+        Args:
+            hdf_path: HEC-RAS plan-result HDF path or plan selector.
+            strict: Raise when the unit system cannot be resolved.
+            unit_system: Explicit ``"SI"`` or ``"US Customary"`` override.
+            project_file: HEC-RAS ``.prj`` whose unit marker is authoritative.
+
+        Returns:
+            Dict containing status, normalized unit labels, provenance
+            (``source``), source evidence, contradictions, and warnings.
+        """
+        source = Path(hdf_path)
+        with h5py.File(source, "r") as hdf_file:
+            return HdfBase._result_unit_metadata_from_file(
+                hdf_file,
+                source_file=source,
+                strict=strict,
+                unit_system=unit_system,
+                project_file=project_file,
+            )
 
     @staticmethod
     @standardize_input(file_type='plan_hdf')
@@ -409,8 +857,9 @@ class HdfBase:
                 logger.debug("Attribute path '%s' not found in HDF file", attr_path)
                 return {}
 
-            return HdfUtils.convert_hdf5_attrs_to_dict(hdf_file[attr_path].attrs)
+            return HdfUtils.convert_hdf5_attrs_to_dict(read_attrs(hdf_file[attr_path]))
         except Exception as e:
+            reraise_required(e)
             file_label = Path(getattr(hdf_file, "filename", "HDF file")).name
             raise ValueError(
                 f"Failed to read HDF attributes at '{attr_path}' in "
@@ -478,10 +927,98 @@ class HdfBase:
 
     @staticmethod
     @log_call
+    def plan_vertex_ordinates(points: "np.ndarray") -> "np.ndarray":
+        """Reduce an HDF vertex array to ordinates Shapely accepts.
+
+        HEC-RAS writes some geometry point tables with four ordinates per
+        vertex. Shapely's constructors take two or three and raise
+        ``ValueError: The ordinate (last) dimension should be 2 or 3, got 4``
+        on anything wider, which aborts the whole layer for the caller.
+
+        Observed on the FEMA eBFE submittal for HUC8 12090106, model
+        ``MidCo_0601_A1``: ``/Geometry/2D Flow Area Refinement Regions/Polygon
+        Points`` is ``(21592, 4)`` and the third and fourth columns are
+        entirely NaN. There they are padding, not Z and M, so keeping three
+        ordinates would manufacture NaN-Z geometry out of nothing and push the
+        failure downstream into whatever consumes the GeoDataFrame.
+
+        The rule is therefore: a real Z is kept, a padding or measure column is
+        not.
+
+        - Fewer than four ordinates: returned unchanged. Two and three are what
+          Shapely already accepts, so nothing that reads today changes.
+        - Four or more: the trailing ordinates past the third are dropped as M
+          and beyond. The third is kept only when it holds at least one finite
+          value; when it is entirely NaN or infinite it is padding and the
+          result is planar XY.
+
+        Parameters
+        ----------
+        points : np.ndarray
+            A 2-D array of vertices, ``(n_vertices, n_ordinates)``, sliced
+            straight out of an HDF point dataset.
+
+        Returns
+        -------
+        np.ndarray
+            The same array when it already fits, otherwise a view holding its
+            first two or three ordinates.
+        """
+        array = np.asarray(points)
+        if array.ndim != 2 or array.shape[1] < 4:
+            return array
+        third = array[:, 2]
+        if np.issubdtype(array.dtype, np.floating) and not np.isfinite(third).any():
+            return array[:, :2]
+        return array[:, :3]
+
+    @staticmethod
+    def _feature_part_ranges(parts, point_start: int, point_count: int):
+        """Resolve one complete packed feature to local point ranges.
+
+        Native Parts are feature-local and valid when every part lies within
+        the feature's point count (the HEC-RAS / native engine rule); gaps,
+        unused vertices and shared vertices are allowed. Legacy global ranges
+        are accepted only when the entire collection of parts, shifted by the
+        feature point start, covers the feature exactly. Never choose an offset
+        convention independently for individual parts.
+        """
+        ranges = []
+        for row in parts:
+            if len(row) != 2 or any(
+                not np.isfinite(value) or int(value) != value for value in row
+            ):
+                raise ValueError("Packed feature parts require integer offsets and counts")
+            start, count = map(int, row)
+            if start < 0 or count < 0:
+                raise ValueError("Packed feature parts require nonnegative offsets and counts")
+            ranges.append((start, count))
+
+        # Native rule. When point_start > 0, an exact legacy global cover always
+        # has a part ending past point_count, so it can never also match here.
+        if ranges and all(start + count <= point_count for start, count in ranges):
+            return ranges
+
+        local_ranges = [(start - point_start, count) for start, count in ranges]
+        expected = 0
+        for start, count in sorted(local_ranges):
+            if start != expected:
+                break
+            expected += count
+        else:
+            if local_ranges and expected == point_count:
+                return local_ranges
+        raise ValueError(
+            "Packed feature parts exceed the feature point range and are not a "
+            "legacy global layout covering the feature exactly"
+        )
+
+    @staticmethod
+    @log_call
     @standardize_input(file_type='plan_hdf')
     def get_polylines_from_parts(hdf_path: Path, path: str, info_name: str = "Polyline Info", 
                               parts_name: str = "Polyline Parts", 
-                              points_name: str = "Polyline Points") -> List[LineString]:
+                              points_name: str = "Polyline Points") -> List["LineString"]:
         """
         Extract polylines from HDF file parts data.
 
@@ -501,6 +1038,8 @@ class HdfBase:
             - Parts information for multi-part lines
             - Point coordinates
         """
+        from shapely.geometry import LineString, MultiLineString
+
         polyline_info_path = f"{path}/{info_name}"
         polyline_parts_path = f"{path}/{parts_name}"
         polyline_points_path = f"{path}/{points_name}"
@@ -530,13 +1069,17 @@ class HdfBase:
                         f"{missing} under '{path}' in {Path(hdf_path).name}."
                     )
 
-                polyline_info = hdf_file[polyline_info_path][()]
-                polyline_parts = hdf_file[polyline_parts_path][()]
-                polyline_points = hdf_file[polyline_points_path][()]
+                polyline_info = read_typed(hdf_file[polyline_info_path])
+                polyline_parts = read_typed(hdf_file[polyline_parts_path])
+                polyline_points = read_typed(hdf_file[polyline_points_path])
 
                 geoms = []
                 for pnt_start, pnt_cnt, part_start, part_cnt in polyline_info:
-                    points = polyline_points[pnt_start : pnt_start + pnt_cnt]
+                    points = HdfBase.plan_vertex_ordinates(
+                        polyline_points[pnt_start : pnt_start + pnt_cnt]
+                    )
+                    if pnt_start < 0 or pnt_cnt < 2 or len(points) != pnt_cnt:
+                        raise ValueError("Invalid polyline point range")
                     if part_cnt == 1:
                         geoms.append(LineString(points))
                     else:
@@ -553,6 +1096,7 @@ class HdfBase:
         except ValueError:
             raise
         except Exception as e:
+            reraise_required(e)
             raise ValueError(
                 f"Failed to extract polylines from '{path}' in "
                 f"{Path(hdf_path).name}: {e}"

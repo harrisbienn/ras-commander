@@ -6,12 +6,11 @@ and extract summary information about execution status.
 """
 
 from typing import Dict, Optional
-import logging
 import re
 
-from ..Decorators import log_call
+from ..LoggingConfig import get_logger, log_call
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class ResultsParser:
@@ -31,6 +30,32 @@ class ResultsParser:
         ...     print(f"Found {result['error_count']} errors")
     """
 
+    # Exact vendor diagnostics that contain error-like words but are warnings.
+    # Keep these patterns narrow: matching one must never hide a nearby failure.
+    CLASSIFIED_WARNING_PATTERNS = {
+        "hec_ras_edge_line_self_intersection": (
+            r"^The generated edge lines have self intersections,\s*"
+            r"the interpolation surface may not generate correctly because of this\.\s*"
+            r"See the points in the error layer\.$"
+        ),
+        # HEC-RAS 6.1 reports an optional geometry layer that a plan lacks while
+        # writing plan attributes; the computation continues and completes.
+        "hec_ras_write_attribute_precheck_missing_geometry_layer": (
+            r"^WRITE ATTR ERROR: ERROR: Geometry/[A-Za-z ]+ not found in WriteAttributePreCheck$"
+        ),
+    }
+
+    # Observed fatal records take precedence over generic metric exclusions.
+    # A normal timing footer can still follow an early solver termination.
+    CLASSIFIED_ERROR_PATTERNS = {
+        "hec_ras_unsteady_simulation_terminated": (
+            r"^Unsteady Flow Simulation Terminated\.?$"
+        ),
+        "hec_ras_pipe_solution_unstable": (
+            r"^Pipe Flow Solution went unstable in system:\s*\S.*$"
+        ),
+    }
+
     # Configurable keyword sets for error/warning detection
     # More specific patterns to avoid false positives from metric names
     ERROR_PATTERNS = [
@@ -46,7 +71,7 @@ class ResultsParser:
         r'aborted',                        # "aborted"
         r'terminated\s+abnormally',        # "terminated abnormally"
         r'\bwriter\s+failed\b',            # "Geometry Writer Failed"
-        r'exit\s+code\s*=\s*-?\d+',        # "Exit Code = -532462766" (RasProcess crash)
+        r'exit\s+code\s*=\s*[+-]?0*[1-9]\d*\b',  # Nonzero process exit code
         r'\berror\b',                      # HEC-RAS data_errors: "Error generating Mesh"
     ]
 
@@ -62,6 +87,8 @@ class ResultsParser:
         r'\bcell\s+error\b',               # Iteration/convergence table header
         r'\berror\s+node\s+or\s+conduit\b', # Pipe network iteration table header
         r'iterations',                     # Lines with iteration counts
+        r'\b0\s+errors?\b',               # Explicit zero-error summary
+        r'\berrors?\s*[:=]\s*0\b',       # "Errors: 0" / "Error = 0"
     ]
 
     WARNING_KEYWORDS = [
@@ -70,10 +97,30 @@ class ResultsParser:
         'notice',
         'exceeded',
         'unstable',
-        'convergence'
+        'convergence',
+        'may not generate correctly',
     ]
 
+    # A completion signal is authoritative only when it occupies the whole
+    # record.  Substrings such as "Did not Complete Process" or
+    # "Complete Process failed" are not completion evidence.
+    _COMPLETE_PROCESS_LINE = re.compile(
+        r"^Complete Process(?:\s+(?:(?:\d+\s*:\s*)+\d+|"
+        r"\d+(?:\.\d+)?(?:[xX]|(?i:\s*sec(?:ond)?s?))?))?\s*$"
+    )
+
     @staticmethod
+    def _has_complete_process_record(messages: str) -> bool:
+        """Return whether messages contain an exact completion record."""
+        if not messages:
+            return False
+        return any(
+            ResultsParser._COMPLETE_PROCESS_LINE.fullmatch(line) is not None
+            for line in messages.splitlines()
+        )
+
+    @staticmethod
+    @log_call
     def parse_compute_messages(messages: str) -> Dict:
         """
         Parse compute messages and extract summary information.
@@ -87,18 +134,22 @@ class ResultsParser:
 
         Returns:
             dict: Summary with keys:
-                - completed (bool): True if "Complete Process" found
+                - completed (bool): True if an exact "Complete Process" record
+                  exists; a timing footer alone does not establish success
                 - has_errors (bool): True if error keywords found
                 - has_warnings (bool): True if warning keywords found
                 - error_count (int): Number of lines with error keywords
                 - warning_count (int): Number of lines with warning keywords
                 - first_error_line (str or None): First line containing error (truncated to 200 chars)
+                - diagnostics (list[dict]): Reason-coded warning/fatal diagnostics
+                  classified separately from generic warning and error keywords
 
         Example:
             >>> result = ResultsParser.parse_compute_messages("Complete Process\\nWarning: High velocity")
             >>> result
             {'completed': True, 'has_errors': False, 'has_warnings': True,
-             'error_count': 0, 'warning_count': 1, 'first_error_line': None}
+             'error_count': 0, 'warning_count': 1, 'first_error_line': None,
+             'diagnostics': []}
         """
         if not messages:
             return {
@@ -107,11 +158,12 @@ class ResultsParser:
                 'has_warnings': False,
                 'error_count': 0,
                 'warning_count': 0,
-                'first_error_line': None
+                'first_error_line': None,
+                'diagnostics': [],
             }
 
-        # Check for completion
-        completed = 'Complete Process' in messages
+        # Check for an exact completion record, not a misleading substring.
+        completed = ResultsParser._has_complete_process_record(messages)
 
         # Split into lines for analysis
         lines = messages.split('\n')
@@ -120,10 +172,19 @@ class ResultsParser:
         error_count = 0
         warning_count = 0
         first_error_line = None
+        diagnostics = []
 
         # Compile error patterns
         error_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in ResultsParser.ERROR_PATTERNS]
         exclusion_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in ResultsParser.ERROR_EXCLUSIONS]
+        classified_warning_patterns = {
+            reason_code: re.compile(pattern, re.IGNORECASE)
+            for reason_code, pattern in ResultsParser.CLASSIFIED_WARNING_PATTERNS.items()
+        }
+        classified_error_patterns = {
+            reason_code: re.compile(pattern, re.IGNORECASE)
+            for reason_code, pattern in ResultsParser.CLASSIFIED_ERROR_PATTERNS.items()
+        }
 
         # Build regex pattern for warnings
         warning_pattern = re.compile(
@@ -134,6 +195,39 @@ class ResultsParser:
         for line in lines:
             line_stripped = line.strip()
             if not line_stripped:
+                continue
+
+            classified_error_code = next(
+                (code for code, pattern in classified_error_patterns.items()
+                 if pattern.fullmatch(line_stripped)),
+                None,
+            )
+            if classified_error_code is not None:
+                error_count += 1
+                if first_error_line is None:
+                    first_error_line = line_stripped[:200]
+                diagnostics.append({
+                    'reason_code': classified_error_code,
+                    'severity': 'error',
+                    'message': line_stripped,
+                })
+                continue
+
+            classified_warning_code = next(
+                (
+                    reason_code
+                    for reason_code, pattern in classified_warning_patterns.items()
+                    if pattern.fullmatch(line_stripped)
+                ),
+                None,
+            )
+            if classified_warning_code is not None:
+                warning_count += 1
+                diagnostics.append({
+                    'reason_code': classified_warning_code,
+                    'severity': 'warning',
+                    'message': line_stripped,
+                })
                 continue
 
             # Check for errors with exclusion filtering
@@ -162,7 +256,8 @@ class ResultsParser:
             'has_warnings': warning_count > 0,
             'error_count': error_count,
             'warning_count': warning_count,
-            'first_error_line': first_error_line
+            'first_error_line': first_error_line,
+            'diagnostics': diagnostics,
         }
 
     @staticmethod
@@ -310,6 +405,7 @@ class ResultsParser:
         return None
 
     @staticmethod
+    @log_call
     def parse_compute_messages_runtime(messages: str) -> Dict:
         """
         Parse compute messages for runtime data (fallback for pre-6.4 HEC-RAS).
@@ -367,7 +463,11 @@ class ResultsParser:
         # Task/time line: "Completing Geometry	      27" or "Unsteady Flow Computations	<1"
         # Format is: task_name + tab + optional_spaces + time_value
         # Note: Some time values like "<1" have no extra spaces, others like "27" have padding
-        task_time_pattern = re.compile(r'^([A-Za-z,\s]+?)\t\s*(<?[\d:]+)\s*$')
+        task_time_pattern = re.compile(
+            r'^([A-Za-z,\s]+?)\t\s*(<?[\d:.]+)'
+            r'(?:\s*sec(?:ond)?s?)?\s*$',
+            re.IGNORECASE,
+        )
 
         # Speed line: "Unsteady Flow Computations	673x" or "Complete Process	646x"
         # Format is: task_name + tab + optional_spaces + speed_value + optional 'x'
@@ -391,7 +491,10 @@ class ResultsParser:
                     pass
 
             # Detect table sections
-            if 'Computation Task' in line and 'Time' in line:
+            if (
+                ('Computation Task' in line and 'Time' in line)
+                or re.fullmatch(r'Task\s+Time', line_stripped, re.IGNORECASE)
+            ):
                 in_task_table = True
                 in_speed_table = False
                 continue

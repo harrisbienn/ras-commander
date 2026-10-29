@@ -89,7 +89,7 @@ psexec = init_ras_worker(
     cores_per_plan=4,
 )
 
-# Docker worker - Container execution
+# Docker worker - local image implementing the worker shell-runner contract
 docker = init_ras_worker(
     "docker",
     docker_image="hecras:6.6",
@@ -163,6 +163,8 @@ class ExecutionResult:
     worker_id: str            # Worker that ran this plan
     success: bool             # True if completed successfully
     hdf_path: Optional[str]   # Path to output HDF (if success)
+    result_path: Optional[str]  # Selected HDF or legacy result path
+    result_format: Optional[str]  # "hdf" or "legacy"
     error_message: Optional[str]  # Error details (if failed)
     execution_time: float     # Execution time in seconds
 ```
@@ -175,7 +177,7 @@ results = compute_parallel_remote(plans, workers)
 for plan_num, result in results.items():
     if result.success:
         print(f"Plan {plan_num}: completed in {result.execution_time:.1f}s")
-        print(f"  Output: {result.hdf_path}")
+        print(f"  Output: {result.result_path}")
         print(f"  Worker: {result.worker_id}")
     else:
         print(f"Plan {plan_num}: FAILED")
@@ -339,6 +341,11 @@ query user
     execution.
 
 ### Docker Worker Requirements
+
+`hecras:6.6` in this page is a local image example, not a published Docker Hub
+tag. For the published Wine/native pair, use [RasDocker](../user-guide/container-execution.md).
+See [backend selection](../user-guide/execution-backends.md) and the
+[image catalog](../user-guide/container-images.md) before selecting an image.
 
 1. **Docker daemon** available locally or through `docker_host`
 2. **HEC-RAS Docker image** available (native Linux binaries from HEC)

@@ -163,10 +163,17 @@ def python_gdal_bridge_is_usable(
         else Path(sys.executable).parent
     )
     gdal_dir = python_dir / "GDAL"
-    return (
-        (gdal_dir / "bin64").is_dir()
-        and (gdal_dir / "common" / "data").is_dir()
-    )
+    try:
+        return (
+            (gdal_dir / "bin64").is_dir()
+            and (gdal_dir / "common" / "data").is_dir()
+        )
+    except OSError as exc:
+        # Windows can refuse to traverse a junction it does not trust
+        # (WinError 448, "untrusted mount point"), for example from a
+        # non-interactive SSH session. Such a bridge is not usable here.
+        logger.debug("GDAL bridge at %s is not traversable: %s", gdal_dir, exc)
+        return False
 
 
 def ensure_python_gdal_junction(
@@ -174,11 +181,11 @@ def ensure_python_gdal_junction(
     python_dir: Optional[Union[str, Path]] = None,
 ) -> bool:
     """
-    Create the legacy ``python.exe`` sibling GDAL junction when explicitly used.
+    Create missing Python GDAL junctions; refuse existing runtime mismatches.
 
-    New code should prefer :func:`configure_hecras_gdal_runtime`. This fallback
-    remains for environments where a HEC-RAS assembly still insists on an
-    application-directory ``GDAL`` folder.
+    Existing bridges must reference the selected installation, including its
+    binary and data directories. They are never replaced or retargeted. A
+    mismatch returns False; use an isolated interpreter for another runtime.
     """
     if platform.system() != "Windows":
         logger.warning("GDAL junction creation is Windows-only")
@@ -190,21 +197,33 @@ def ensure_python_gdal_junction(
         logger.error("Could not identify a Python directory for GDAL bridge setup")
         return False
 
+    # Validate the base interpreter too before creating a venv bridge. Otherwise
+    # a later conflict would leave a partially configured runtime selection.
+    try:
+        for directory in python_dirs:
+            _check_existing_bridge(directory / "GDAL", paths)
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return False
+
     ok = True
     for target_python_dir in python_dirs:
         gdal_junction = target_python_dir / "GDAL"
 
-        if python_gdal_bridge_is_usable(target_python_dir):
-            continue
-
         try:
+            if _check_existing_bridge(gdal_junction, paths):
+                continue
             result = subprocess.run(
                 [
                     "powershell",
+                    "-NoProfile",
                     "-Command",
-                    f'New-Item -ItemType Junction -Path "{gdal_junction}" '
-                    f'-Target "{paths.gdal_root}" -Force',
+                    "$ErrorActionPreference='Stop'; New-Item -ItemType Junction "
+                    "-Path $env:RAS_COMMANDER_GDAL_BRIDGE "
+                    "-Target $env:RAS_COMMANDER_GDAL_TARGET | Out-Null",
                 ],
+                env=dict(os.environ, RAS_COMMANDER_GDAL_BRIDGE=str(gdal_junction),
+                         RAS_COMMANDER_GDAL_TARGET=str(paths.gdal_root)),
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -215,9 +234,26 @@ def ensure_python_gdal_junction(
             continue
 
         if result.returncode == 0:
-            logger.info("Created GDAL junction for HEC-RAS GDAL bridge")
-            logger.debug("Created GDAL junction: %s -> %s", gdal_junction, paths.gdal_root)
-            ok = python_gdal_bridge_is_usable(target_python_dir) and ok
+            try:
+                usable = _check_existing_bridge(gdal_junction, paths)
+            except RuntimeError as exc:
+                logger.error("%s", exc)
+                usable = False
+            if usable:
+                logger.info("Created GDAL junction for HEC-RAS GDAL bridge")
+                logger.debug(
+                    "Created GDAL junction: %s -> %s",
+                    gdal_junction,
+                    paths.gdal_root,
+                )
+            else:
+                logger.warning(
+                    "GDAL junction command reported success but %s is not "
+                    "usable; Wine-hosted callers should prepare this "
+                    "task-local bridge from the native Linux host",
+                    gdal_junction,
+                )
+            ok = usable and ok
             continue
 
         logger.error(
@@ -230,6 +266,30 @@ def ensure_python_gdal_junction(
     return ok
 
 
+def _check_existing_bridge(bridge: Path, paths: GdalRuntimePaths) -> bool:
+    """Return False only for an absent bridge; reject ambiguous runtime identity."""
+    try:
+        bridge.lstat()  # Unlike exists(), this detects a dangling junction.
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot inspect GDAL bridge {bridge}; use an isolated interpreter "
+            f"with a GDAL bridge to {paths.gdal_root}. Existing paths were preserved."
+        ) from exc
+    try:
+        if all((bridge / part).samefile(paths.gdal_root / part)
+               for part in (".", "bin64", "common/data")):
+            return True
+    except OSError:
+        pass  # Missing/inaccessible targets are also identity failures.
+    raise RuntimeError(
+        f"GDAL bridge {bridge} does not reference the selected runtime {paths.gdal_root}; "
+        "use an isolated interpreter with its own matching GDAL bridge. "
+        "Existing paths were preserved; no bridge was replaced or retargeted."
+    )
+
+
 def configure_rasmapper_gdal_bridge(
     hecras_dir: Union[str, Path],
     python_dir: Optional[Union[str, Path]] = None,
@@ -239,9 +299,13 @@ def configure_rasmapper_gdal_bridge(
 
     HEC-RAS/RasMapperLib builds may show a modal error unless a ``GDAL``
     directory is present next to the running ``python.exe``. Call this before
-    loading any RasMapperLib assembly.
+    loading any RasMapperLib assembly. Existing mismatched or inaccessible
+    bridges raise RuntimeError before process search paths are configured.
+    A matching bridge is reused; missing bridges are created without overwrite.
     """
-    paths = configure_hecras_gdal_runtime(hecras_dir)
+    paths = resolve_hecras_gdal_paths(hecras_dir)
+    for directory in _candidate_python_dirs(python_dir):
+        _check_existing_bridge(directory / "GDAL", paths)
     if not ensure_python_gdal_junction(paths.hecras_dir, python_dir):
         py_dirs = _candidate_python_dirs(python_dir)
         expected = ", ".join(str(py_dir / "GDAL") for py_dir in py_dirs)
@@ -249,4 +313,4 @@ def configure_rasmapper_gdal_bridge(
             "Could not initialize the GDAL bridge required by RasMapperLib. "
             f"Expected usable GDAL directories at: {expected}."
         )
-    return paths
+    return configure_hecras_gdal_runtime(hecras_dir)

@@ -1,23 +1,27 @@
-"""Deterministic client-oriented products from a qualified RAS result HDF."""
+"""Inspection and deterministic products for completed HEC-RAS result HDFs."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 import tempfile
+from numbers import Integral, Real
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Union
 
 import h5py
 import numpy as np
 import pandas as pd
 
-from ..Decorators import log_call
+from ..Decorators import log_call, standardize_input
+from ..fast_hdf import read_attr, read_typed, reraise_required
 from ..LoggingConfig import get_logger
+from ..RasUtils import RasUtils
 from .HdfBase import HdfBase
 from .HdfMesh import HdfMesh
-from .HdfProject import HdfProject
 from .HdfResultsMesh import HdfResultsMesh
 from .HdfResultsPlan import HdfResultsPlan
 from .HdfUtils import HdfUtils
@@ -34,21 +38,19 @@ def _sha256(path: Path) -> str:
 
 
 def _json_value(value: Any) -> Any:
-    if value is None:
+    if value is None or value is pd.NA or value is pd.NaT:
         return None
     if isinstance(value, (str, bool, int)):
         return value
-    if isinstance(value, float):
-        return value if np.isfinite(value) else None
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
+    if isinstance(value, (float, np.floating)):
         numeric = float(value)
         return numeric if np.isfinite(numeric) else None
-    if isinstance(value, (pd.Timestamp,)):
-        return value.isoformat()
-    if isinstance(value, np.datetime64):
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, (pd.Timestamp, np.datetime64)):
         return pd.Timestamp(value).isoformat()
+    if isinstance(value, Path):
+        return str(value)
     if isinstance(value, np.ndarray):
         return [_json_value(item) for item in value.tolist()]
     if isinstance(value, dict):
@@ -58,24 +60,31 @@ def _json_value(value: Any) -> Any:
     return str(value)
 
 
-def _write_json(path: Path, payload: Dict[str, Any]) -> Path:
+def _write_json(path: Path, payload: dict[str, Any]) -> Path:
     path.write_text(
-        json.dumps(_json_value(payload), indent=2, sort_keys=True) + "\n",
+        json.dumps(
+            _json_value(payload),
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n",
         encoding="utf-8",
     )
     return path
 
 
-def _frame_records(frame: Optional[pd.DataFrame]) -> list[Dict[str, Any]]:
+def _frame_records(frame: pd.DataFrame | None) -> list[dict[str, Any]]:
     if frame is None or frame.empty:
         return []
     return [_json_value(record) for record in frame.to_dict(orient="records")]
 
 
 class HdfResultsProducts:
-    """Static namespace for deterministic hydraulic product extraction."""
+    """Static namespace for deterministic hydraulic product packages."""
 
-    SCHEMA = "ras-commander/hydraulic-product-manifest/1.0"
+    SCHEMA = "ras-commander/hydraulic-product-manifest/2.0"
+    INSPECTION_SCHEMA = "ras-commander/hydraulic-result-inspection/1.0"
     FILENAMES = {
         "maximum-wse": "maximum-wse.tif",
         "maximum-depth": "maximum-depth.tif",
@@ -84,89 +93,74 @@ class HdfResultsProducts:
         "result-metadata": "result-metadata.json",
         "numerical-qaqc": "numerical-qaqc.json",
         "result-footprint": "result-footprint.geojson",
+        "raster-support": "raster-support.geojson",
         "preview": "maximum-depth-preview.png",
     }
     MANIFEST_FILENAME = "hydraulic-products.json"
 
+    _TIME_SERIES_BASE = (
+        "Results/Unsteady/Output/Output Blocks/Base Output/"
+        "Unsteady Time Series"
+    )
+    _SUMMARY_BASE = (
+        "Results/Unsteady/Output/Output Blocks/Base Output/Summary Output"
+    )
+    _COMPUTE_MESSAGES_PATH = "Results/Summary/Compute Messages (text)"
     @staticmethod
     @log_call
-    def inspect_result(
-        hdf_path: Union[str, Path],
-    ) -> Dict[str, Any]:
-        """Validate completion and required result time axes without mutation."""
-        source = Path(hdf_path).resolve()
+    @standardize_input(file_type="plan_hdf")
+    def inspect_result(hdf_path: Union[str, Path]) -> dict[str, Any]:
+        """Inspect whether an HDF can support the hydraulic product contract.
+
+        Completion is accepted from the current HEC-RAS
+        ``Event Conditions/Completed Successfully=True`` attribute or, for
+        older producer files that do not contain that attribute, an embedded
+        compute-message ``Complete Process`` marker. An explicit false or
+        malformed completion attribute is never overridden by messages.
+
+        The method reads the existing result HDF without creating or changing
+        any HDF dataset. It validates the time axes, embedded CRS and units,
+        cell/face topology, and all mesh result arrays required by
+        :meth:`export`.
+
+        Args:
+            hdf_path: Existing HEC-RAS unsteady plan-result HDF.
+
+        Returns:
+            A JSON-serializable inspection record. ``hydraulic_qaqc`` remains
+            ``"not_evaluated"`` because mechanical completion and product
+            readiness do not constitute engineering acceptance.
+
+        Raises:
+            FileNotFoundError: If ``hdf_path`` is not a file.
+            ValueError: If completion evidence, time axes, CRS, units, mesh
+                geometry, topology, or required result arrays are incomplete
+                or inconsistent.
+            OSError: If the HDF cannot be opened or read.
+        """
+        source = RasUtils.safe_resolve(Path(hdf_path))
         if not source.is_file():
             raise FileNotFoundError(f"Result HDF does not exist: {source}")
-        if source.stat().st_size <= 0:
+        source_size = source.stat().st_size
+        if source_size <= 0:
             raise ValueError(f"Result HDF is empty: {source}")
 
         with h5py.File(source, "r") as hdf_file:
-            event_conditions = hdf_file.get("Event Conditions")
-            if event_conditions is None:
-                raise ValueError("Event Conditions group is missing")
-            completed = HdfResultsProducts._decode(
-                event_conditions.attrs.get("Completed Successfully")
+            completion = HdfResultsProducts._completion_evidence(hdf_file)
+            timestamps, timestamp_datasets = HdfResultsProducts._time_axis(
+                hdf_file
             )
-            if str(completed).strip().casefold() != "true":
-                raise ValueError(
-                    "Result HDF does not report Completed Successfully=True"
-                )
-
-            timestamps = HdfBase.get_unsteady_timestamps(hdf_file)
-            if len(timestamps) < 2:
+            timestamp_index = pd.DatetimeIndex(timestamps)
+            if len(timestamp_index) < 2:
                 raise ValueError(
                     "Result HDF must contain at least two unsteady timestamps"
                 )
-            timestamp_index = pd.DatetimeIndex(timestamps)
             if not timestamp_index.is_monotonic_increasing:
                 raise ValueError("Result HDF time axis is not increasing")
             if timestamp_index.has_duplicates:
                 raise ValueError("Result HDF time axis contains duplicates")
 
-            mesh_names = HdfMesh.get_mesh_area_names(hdf_file)
-            if not mesh_names:
-                raise ValueError("Result HDF contains no 2D flow areas")
-
-            base = (
-                "Results/Unsteady/Output/Output Blocks/Base Output/"
-                "Unsteady Time Series"
-            )
-            checked_datasets: list[str] = []
-            for mesh_name in mesh_names:
-                for variable in ("Water Surface", "Face Velocity"):
-                    dataset_path = (
-                        f"{base}/2D Flow Areas/{mesh_name}/{variable}"
-                    )
-                    if dataset_path not in hdf_file:
-                        raise ValueError(
-                            f"Required result dataset is missing: {dataset_path}"
-                        )
-                    dataset = hdf_file[dataset_path]
-                    if dataset.ndim != 2:
-                        raise ValueError(
-                            f"Required result dataset is not two-dimensional: "
-                            f"{dataset_path}"
-                        )
-                    if dataset.shape[0] != len(timestamps):
-                        raise ValueError(
-                            f"Time-axis mismatch for {dataset_path}: "
-                            f"{dataset.shape[0]} rows != {len(timestamps)} "
-                            "timestamps"
-                        )
-                    checked_datasets.append(dataset_path)
-
-            intervals = (
-                timestamp_index.to_series(index=range(len(timestamp_index)))
-                .diff()
-                .dropna()
-                .dt.total_seconds()
-                .to_numpy(dtype=float)
-            )
-            regular = bool(np.allclose(intervals, intervals[0]))
-            interval_seconds = (
-                float(intervals[0]) if regular and len(intervals) else None
-            )
-            projection = HdfBase.get_projection(hdf_file)
+            crs = HdfResultsProducts._embedded_crs(hdf_file, source)
             unit_metadata = HdfResultsProducts._unit_metadata(hdf_file)
             program_version = HdfResultsProducts._first_attribute(
                 hdf_file,
@@ -176,80 +170,156 @@ class HdfResultsProducts:
                     ("", "File Version"),
                 ),
             )
+            meshes, checked_datasets = HdfResultsProducts._inspect_meshes(
+                hdf_file,
+                timestamp_count=len(timestamp_index),
+            )
 
+        # Subtract on the native timestamp resolution: casting Year 3000 to
+        # nanoseconds can overflow even though its intervals are representable.
+        intervals = np.asarray([
+            (right - left).total_seconds()
+            for left, right in zip(timestamp_index[:-1], timestamp_index[1:])
+        ])
+        regular = bool(
+            intervals.size > 0
+            and np.allclose(intervals, intervals[0], rtol=0.0, atol=1e-6)
+        )
+        interval_seconds = float(intervals[0]) if regular else None
+        mesh_names = [mesh["mesh_name"] for mesh in meshes]
+        logger.info(
+            "Inspected existing HEC-RAS result HDF '%s' read-only: %s mesh(es), "
+            "%s timestamps; hydraulic QA/QC not evaluated",
+            source.name,
+            len(meshes),
+            len(timestamp_index),
+        )
         return {
+            "schema": HdfResultsProducts.INSPECTION_SCHEMA,
+            "source": {
+                "href": source.name,
+                "size_bytes": source_size,
+                "producer": "HEC-RAS",
+                "access": "read_only",
+            },
             "completed_successfully": True,
+            "completion_evidence": completion,
             "time_axis_consistent": True,
+            "hydraulic_qaqc": "not_evaluated",
             "time": {
                 "start": timestamp_index[0].isoformat(),
                 "end": timestamp_index[-1].isoformat(),
                 "count": len(timestamp_index),
                 "regular": regular,
                 "interval_seconds": interval_seconds,
+                "datasets": timestamp_datasets,
             },
             "mesh_names": mesh_names,
+            "meshes": meshes,
             "checked_datasets": checked_datasets,
-            "crs": str(projection) if projection else None,
+            "crs": crs,
             "program_version": program_version,
             **unit_metadata,
         }
 
     @staticmethod
     @log_call
+    @standardize_input(file_type="plan_hdf")
     def export(
         hdf_path: Union[str, Path],
         output_directory: Union[str, Path],
         *,
-        resolution: Optional[float] = None,
+        resolution: float | None = None,
         max_dimension: int = 2048,
         nodata: float = -9999.0,
         include_preview: bool = True,
-    ) -> Dict[str, Any]:
-        """Export a deterministic hydraulic product package.
+    ) -> dict[str, Any]:
+        """Generate a deterministic hydraulic product package.
+
+        The source is an existing HEC-RAS producer HDF opened read-only. The
+        COG, Parquet, GeoJSON, JSON, and optional PNG files are newly generated
+        ras-commander product artifacts; they are not HEC-RAS model output.
+        The source digest is checked before and after inspection, rendering,
+        and publication.
+
+        The output directory must not exist. It is claimed atomically, assets
+        are hard-linked from a same-parent staging directory without
+        overwriting names, and the checksum-pinned manifest is published last.
+        Consumers must treat the package as complete only when
+        :attr:`MANIFEST_FILENAME` exists.
 
         Args:
-            hdf_path: Qualified HEC-RAS plan-result HDF.
-            output_directory: New directory for the product package. It must
-                not already exist.
+            hdf_path: Completed HEC-RAS unsteady plan-result HDF.
+            output_directory: New directory for the generated product package.
             resolution: Optional raster cell size in model CRS units.
-            max_dimension: Maximum raster width or height when resolution is
-                inferred.
-            nodata: Nodata value for all raster products.
-            include_preview: Create a deterministic depth PNG when matplotlib
-                is available.
+            max_dimension: Maximum raster width and height. Defaults to 2048;
+                total raster cells are also bounded for memory safety.
+            nodata: Finite float32 nodata value for all three COGs. Inputs are
+                normalized to the value that will actually be stored.
+            include_preview: Generate ``maximum-depth-preview.png``.
 
         Returns:
-            JSON-serializable hydraulic product manifest.
+            The JSON-serializable manifest also written to the package.
 
         Raises:
-            ValueError: If completion, time axes, result variables, CRS, or
-                product metadata are incomplete.
-            FileExistsError: If the output directory already exists.
+            FileNotFoundError: If the source HDF does not exist.
+            FileExistsError: If the output directory already exists or is
+                claimed concurrently.
+            ValueError: If inputs, the result HDF, spatial support, or rendered
+                metadata are invalid or inconsistent.
+            RuntimeError: If the source changes, asset verification fails, or
+                publication cannot preserve the no-overwrite contract.
+            OSError: If source reads, staging, hard links, or publication fail.
         """
-        source = Path(hdf_path).resolve()
-        output = Path(output_directory).resolve()
-        if output.exists():
+        source = RasUtils.safe_resolve(Path(hdf_path))
+        raw_output = Path(output_directory)
+        if raw_output.name in {"", ".", ".."}:
+            raise ValueError("output_directory must name a new child directory")
+        output_parent = RasUtils.safe_resolve(raw_output.parent)
+        output = output_parent / raw_output.name
+        if (
+            output.exists()
+            or output.is_symlink()
+            or HdfResultsProducts._is_reparse_point(output)
+        ):
             raise FileExistsError(
                 f"Hydraulic product directory already exists: {output}"
             )
-        if max_dimension < 64:
+        resolution_value = HdfResultsProducts._optional_positive_float(
+            resolution,
+            label="resolution",
+        )
+        if isinstance(max_dimension, bool) or not isinstance(
+            max_dimension,
+            Integral,
+        ):
+            raise ValueError("max_dimension must be an integer")
+        max_dimension_value = int(max_dimension)
+        if max_dimension_value < 64:
             raise ValueError("max_dimension must be at least 64")
-        if resolution is not None and resolution <= 0:
-            raise ValueError("resolution must be positive")
-        if not np.isfinite(nodata):
-            raise ValueError("nodata must be finite")
+        nodata_value = HdfResultsProducts._finite_float32(
+            nodata,
+            label="nodata",
+        )
+        if not isinstance(include_preview, bool):
+            raise ValueError("include_preview must be True or False")
 
-        inspection = HdfResultsProducts.inspect_result(source)
-        if not inspection["crs"]:
-            raise ValueError("Result HDF does not contain a resolvable CRS")
-
-        source_size = source.stat().st_size
         source_hash = _sha256(source)
-        output.parent.mkdir(parents=True, exist_ok=True)
+        source_size = source.stat().st_size
+        inspection = HdfResultsProducts.inspect_result(source)
+        HdfResultsProducts._require_unchanged_source(
+            source,
+            expected_size=source_size,
+            expected_hash=source_hash,
+            checkpoint="after inspection",
+        )
+        output_parent.mkdir(parents=True, exist_ok=True)
 
+        manifest: dict[str, Any]
+        published = False
         with tempfile.TemporaryDirectory(
             prefix=f".{output.name}-",
-            dir=output.parent,
+            dir=output_parent,
         ) as stage_name:
             stage = Path(stage_name)
             manifest = HdfResultsProducts._build_products(
@@ -258,134 +328,181 @@ class HdfResultsProducts:
                 inspection,
                 source_size=source_size,
                 source_hash=source_hash,
-                resolution=resolution,
-                max_dimension=max_dimension,
-                nodata=nodata,
+                resolution=resolution_value,
+                max_dimension=max_dimension_value,
+                nodata=nodata_value,
                 include_preview=include_preview,
             )
-            current_size = source.stat().st_size
-            current_hash = _sha256(source)
-            if current_size != source_size or current_hash != source_hash:
-                raise RuntimeError(
-                    "Source result HDF changed during product extraction"
-                )
             _write_json(stage / HdfResultsProducts.MANIFEST_FILENAME, manifest)
-            stage.replace(output)
+            HdfResultsProducts._validate_package(stage, manifest)
+            HdfResultsProducts._require_unchanged_source(
+                source,
+                expected_size=source_size,
+                expected_hash=source_hash,
+                checkpoint="after rendering",
+            )
+            HdfResultsProducts._publish_package(stage, output, manifest)
+            published = True
+            try:
+                HdfResultsProducts._validate_package(output, manifest)
+                HdfResultsProducts._require_unchanged_source(
+                    source,
+                    expected_size=source_size,
+                    expected_hash=source_hash,
+                    checkpoint="after publication",
+                )
+            except Exception:
+                HdfResultsProducts._cleanup_published_package(
+                    stage,
+                    output,
+                    manifest,
+                )
+                published = False
+                raise
 
+        if not published:
+            raise RuntimeError("Hydraulic product package was not published")
         logger.info(
-            "Exported %s hydraulic products to %s",
-            len(manifest["assets"]),
+            "Generated ras-commander hydraulic product package '%s' from "
+            "existing HEC-RAS result '%s' read-only; no HEC-RAS model output "
+            "was created or modified; hydraulic QA/QC not evaluated",
             output.name,
+            source.name,
         )
-        logger.debug("Hydraulic product directory: %s", output)
         return manifest
 
     @staticmethod
     def _build_products(
         source: Path,
         stage: Path,
-        inspection: Dict[str, Any],
+        inspection: dict[str, Any],
         *,
         source_size: int,
         source_hash: str,
-        resolution: Optional[float],
+        resolution: float | None,
         max_dimension: int,
         nodata: float,
         include_preview: bool,
-    ) -> Dict[str, Any]:
-        import geopandas as gpd
-        from shapely.geometry import mapping
+    ) -> dict[str, Any]:
+        from pyproj import CRS
 
-        footprint, bbox = HdfProject.get_project_extent(
-            source,
-            buffer_percent=0.0,
-            fill_holes=False,
-        )
-        if footprint.empty or footprint.geometry.is_empty.all():
-            raise ValueError("Result HDF produced an empty project footprint")
-        footprint_geometry = footprint.geometry.union_all()
-        if footprint_geometry.is_empty:
-            raise ValueError("Result HDF produced an empty project footprint")
+        from ._HdfResultsProductRenderers import _ProductRenderers
 
-        wse = HdfResultsMesh.get_mesh_max_ws(source)
-        depth = HdfResultsMesh.get_mesh_max_depth(source)
-        velocity = HdfResultsProducts._maximum_velocity_points(source)
-        required_frames = {
-            "maximum WSE": wse,
-            "maximum depth": depth,
-            "maximum velocity": velocity,
-        }
-        for label, frame in required_frames.items():
-            if frame.empty:
-                raise ValueError(f"Result HDF produced no {label} values")
-            if frame.crs is None:
-                raise ValueError(f"Result HDF produced {label} without a CRS")
-
-        depth = depth.copy()
-        depth["maximum_depth"] = depth["maximum_depth"].clip(lower=0.0)
-        wse = wse.merge(
-            depth[["mesh_name", "cell_id", "maximum_depth"]],
-            on=["mesh_name", "cell_id"],
-            how="left",
-            validate="one_to_one",
-        )
-        wse = gpd.GeoDataFrame(wse, geometry="geometry", crs=depth.crs)
-        invalid_wse = (
-            (wse["maximum_depth"] <= 0.0)
-            | (wse["maximum_water_surface"] <= 0.0)
-        )
-        wse.loc[invalid_wse, "maximum_water_surface"] = np.nan
-
-        grid = HdfResultsProducts._grid_spec(
+        mesh_areas = _ProductRenderers.mesh_areas(source, inspection)
+        expected_crs = CRS.from_user_input(inspection["crs"])
+        if CRS.from_user_input(mesh_areas.crs) != expected_crs:
+            raise ValueError("2D mesh footprint CRS differs from inspected CRS")
+        bbox = tuple(float(value) for value in mesh_areas.total_bounds)
+        response_areas = _ProductRenderers.response_areas(source, mesh_areas)
+        response_bbox = [float(value) for value in response_areas.total_bounds]
+        grid = _ProductRenderers.grid_spec(
             bbox,
             resolution=resolution,
             max_dimension=max_dimension,
         )
-        depth_grid = HdfResultsProducts._interpolate_points(
+
+        depth = HdfResultsMesh.get_mesh_max_depth(source)
+        HdfResultsProducts._validate_product_frame(
+            depth,
+            value_column="maximum_depth",
+            label="maximum depth",
+            inspection=inspection,
+            expected_crs=expected_crs,
+        )
+        finite_depth = depth["maximum_depth"].to_numpy(dtype=float)
+        if np.any(np.isfinite(finite_depth) & (finite_depth < 0.0)):
+            raise ValueError("Maximum depth contains finite negative values")
+
+        depth_grid, support = _ProductRenderers.rasterize_points_by_mesh(
             depth,
             "maximum_depth",
+            mesh_areas,
             grid,
         )
-        wet_mask = np.isfinite(depth_grid) & (depth_grid > 0.0)
+        wet_mask = support & np.isfinite(depth_grid) & (depth_grid > 0.0)
+        assets: dict[str, Any] = {}
 
-        raster_specs = {
-            "maximum-wse": (
-                wse,
-                "maximum_water_surface",
-                inspection["length_units"],
-                "maximum cell water-surface elevation; dry cells are nodata",
+        depth_path = stage / HdfResultsProducts.FILENAMES["maximum-depth"]
+        rendered_depth = _ProductRenderers.apply_masks(
+            depth_grid,
+            support,
+            wet_mask=None,
+            nodata=nodata,
+        )
+        _ProductRenderers.write_cog(
+            depth_path,
+            rendered_depth,
+            grid,
+            crs=inspection["crs"],
+            nodata=nodata,
+            units=inspection["depth_units"],
+            product_key="maximum-depth",
+            derivation=(
+                "maximum stored Depth or Water Surface minus Cells Minimum "
+                "Elevation"
             ),
-            "maximum-depth": (
-                depth,
-                "maximum_depth",
-                inspection["depth_units"],
-                "maximum of stored Depth or WSE minus cell minimum elevation",
+        )
+        del rendered_depth
+        assets["maximum-depth"] = _ProductRenderers.raster_asset(
+            depth_path,
+            units=inspection["depth_units"],
+        )
+        del depth, depth_grid, finite_depth
+
+        sequential_rasters = {
+            "maximum-wse": (
+                HdfResultsMesh.get_mesh_max_ws,
+                "maximum_water_surface",
+                "maximum WSE",
+                inspection["length_units"],
+                "HEC-RAS Maximum Water Surface summary; ever-dry cells are nodata",
             ),
             "maximum-velocity": (
-                velocity,
+                lambda path: _ProductRenderers.maximum_velocity_points(
+                    path,
+                    inspection,
+                ),
                 "maximum_velocity",
+                "maximum velocity",
                 inspection["velocity_units"],
                 "maximum absolute adjacent-face velocity across time",
             ),
         }
-        assets: Dict[str, Any] = {}
-        for key, (frame, column, units, derivation) in raster_specs.items():
-            values = (
-                depth_grid
-                if key == "maximum-depth"
-                else HdfResultsProducts._interpolate_points(frame, column, grid)
+        for key, (
+            reader,
+            column,
+            label,
+            units,
+            derivation,
+        ) in sequential_rasters.items():
+            frame = reader(source)
+            HdfResultsProducts._validate_product_frame(
+                frame,
+                value_column=column,
+                label=label,
+                inspection=inspection,
+                expected_crs=expected_crs,
             )
-            values = HdfResultsProducts._apply_masks(
-                values,
-                footprint_geometry,
+            values, value_support = _ProductRenderers.rasterize_points_by_mesh(
+                frame,
+                column,
+                mesh_areas,
                 grid,
-                wet_mask=wet_mask if key != "maximum-depth" else None,
+            )
+            if not np.array_equal(value_support, support):
+                raise RuntimeError(
+                    f"Raster support changed while rendering {key}"
+                )
+            rendered = _ProductRenderers.apply_masks(
+                values,
+                value_support,
+                wet_mask=wet_mask,
                 nodata=nodata,
             )
-            raster_path = stage / HdfResultsProducts.FILENAMES[key]
-            HdfResultsProducts._write_cog(
-                raster_path,
-                values,
+            path = stage / HdfResultsProducts.FILENAMES[key]
+            _ProductRenderers.write_cog(
+                path,
+                rendered,
                 grid,
                 crs=inspection["crs"],
                 nodata=nodata,
@@ -393,19 +510,18 @@ class HdfResultsProducts:
                 product_key=key,
                 derivation=derivation,
             )
-            assets[key] = HdfResultsProducts._raster_asset(
-                raster_path,
-                units=units,
-            )
+            del rendered
+            assets[key] = _ProductRenderers.raster_asset(path, units=units)
+            del frame, values
 
         hydrograph_path = (
             stage / HdfResultsProducts.FILENAMES["hydraulic-hydrographs"]
         )
-        hydrograph_metadata = HdfResultsProducts._write_hydrographs(
+        hydrograph_metadata = _ProductRenderers.write_hydrographs(
             source,
             hydrograph_path,
         )
-        assets["hydraulic-hydrographs"] = HdfResultsProducts._file_asset(
+        assets["hydraulic-hydrographs"] = _ProductRenderers.file_asset(
             hydrograph_path,
             media_type="application/vnd.apache.parquet",
             roles=["data", "hydrograph"],
@@ -421,434 +537,195 @@ class HdfResultsProducts:
         )
         metadata_path = stage / HdfResultsProducts.FILENAMES["result-metadata"]
         _write_json(metadata_path, metadata)
-        assets["result-metadata"] = HdfResultsProducts._file_asset(
+        assets["result-metadata"] = _ProductRenderers.file_asset(
             metadata_path,
             media_type="application/json",
             roles=["metadata"],
         )
 
-        qaqc = HdfResultsProducts._numerical_qaqc(source)
+        numerical_qaqc = HdfResultsProducts._numerical_qaqc(source)
         qaqc_path = stage / HdfResultsProducts.FILENAMES["numerical-qaqc"]
-        _write_json(qaqc_path, qaqc)
-        assets["numerical-qaqc"] = HdfResultsProducts._file_asset(
+        _write_json(qaqc_path, numerical_qaqc)
+        assets["numerical-qaqc"] = _ProductRenderers.file_asset(
             qaqc_path,
             media_type="application/json",
             roles=["metadata", "quality"],
         )
 
-        footprint_payload = {
-            "type": "FeatureCollection",
-            "features": [
-                {
-                    "type": "Feature",
-                    "id": "result-footprint",
-                    "properties": {
-                        "crs": inspection["crs"],
-                        "source": source.name,
-                    },
-                    "geometry": mapping(footprint_geometry),
-                }
-            ],
-        }
-        footprint_path = stage / HdfResultsProducts.FILENAMES["result-footprint"]
-        _write_json(footprint_path, footprint_payload)
-        assets["result-footprint"] = HdfResultsProducts._file_asset(
-            footprint_path,
-            media_type="application/geo+json",
-            roles=["metadata", "footprint"],
-            extra={
-                "proj:bbox": [float(value) for value in bbox],
-                "proj:code": inspection["crs"],
-            },
-        )
+        for key, areas, bounds, scope in (
+            ("result-footprint", response_areas, response_bbox, "coupled_model_domain"),
+            ("raster-support", mesh_areas, list(bbox), "2d_flow_area_footprints"),
+        ):
+            footprint_path = stage / HdfResultsProducts.FILENAMES[key]
+            footprint_metadata = _ProductRenderers.write_footprint(
+                footprint_path, areas, source_name=source.name, scope=scope,
+            )
+            assets[key] = _ProductRenderers.file_asset(
+                footprint_path, media_type="application/geo+json",
+                roles=["metadata", "footprint"],
+                extra={
+                    "bbox": footprint_metadata["bbox_wgs84"],
+                    "proj:bbox": bounds, "proj:code": inspection["crs"],
+                    "feature_count": footprint_metadata["feature_count"],
+                    "scope": scope,
+                },
+            )
+        for key in ("maximum-depth", "maximum-wse", "maximum-velocity"):
+            assets[key]["support_asset"] = "raster-support"
 
-        omissions: list[Dict[str, str]] = []
+        omissions: list[dict[str, str]] = []
         if include_preview:
             preview_path = stage / HdfResultsProducts.FILENAMES["preview"]
-            try:
-                HdfResultsProducts._write_preview(
-                    stage / HdfResultsProducts.FILENAMES["maximum-depth"],
-                    preview_path,
-                    units=inspection["depth_units"],
-                )
-                assets["preview"] = HdfResultsProducts._file_asset(
-                    preview_path,
-                    media_type="image/png",
-                    roles=["overview", "visual"],
-                )
-            except ImportError as exc:
-                omissions.append(
-                    {
-                        "asset_key": "preview",
-                        "reason": f"renderer unavailable: {exc}",
-                    }
-                )
+            _ProductRenderers.write_preview(
+                stage / HdfResultsProducts.FILENAMES["maximum-depth"],
+                preview_path,
+                units=inspection["depth_units"],
+            )
+            assets["preview"] = _ProductRenderers.file_asset(
+                preview_path,
+                media_type="image/png",
+                roles=["overview", "visual"],
+            )
+        else:
+            omissions.append(
+                {"asset_key": "preview", "reason": "disabled_by_request"}
+            )
 
-        return {
+        manifest = {
             "schema": HdfResultsProducts.SCHEMA,
             "source": {
                 "href": source.name,
                 "size_bytes": source_size,
                 "sha256": source_hash,
+                "producer": "HEC-RAS",
+                "access": "read_only",
                 "roles": ["source", "engineering-result"],
             },
+            "product_package": {
+                "generated_by": "ras-commander",
+                "artifact_type": "derived_hydraulic_products",
+                "hec_ras_model_output_generated": False,
+            },
             "status": {
-                "completed_successfully": inspection["completed_successfully"],
-                "time_axis_consistent": inspection["time_axis_consistent"],
+                "completed_successfully": True,
+                "time_axis_consistent": True,
                 "hydraulic_qaqc": "not_evaluated",
             },
+            "completion_evidence": inspection["completion_evidence"],
             "time": inspection["time"],
             "spatial": {
                 "crs": inspection["crs"],
-                "bbox": [float(value) for value in bbox],
+                "bbox": response_bbox,
+                "raster_bbox": list(bbox),
                 "footprint_asset": "result-footprint",
+                "support": "coupled_model_domain",
+                "raster_support_asset": "raster-support",
             },
             "assets": dict(sorted(assets.items())),
             "omissions": omissions,
         }
+        for asset in manifest["assets"].values():
+            _ProductRenderers.validate_asset(stage, asset)
+        return _json_value(manifest)
 
     @staticmethod
-    def _maximum_velocity_points(source: Path):
-        import geopandas as gpd
-
-        points = HdfMesh.get_mesh_cell_points(source)
-        if points.empty:
-            return gpd.GeoDataFrame(
-                columns=[
-                    "mesh_name",
-                    "cell_id",
-                    "maximum_velocity",
-                    "geometry",
-                ],
-                geometry="geometry",
-            )
-
-        frames = []
-        base = (
-            "Results/Unsteady/Output/Output Blocks/Base Output/"
-            "Unsteady Time Series/2D Flow Areas"
-        )
-        with h5py.File(source, "r") as hdf_file:
-            for mesh_name in HdfMesh.get_mesh_area_names(hdf_file):
-                velocity_path = f"{base}/{mesh_name}/Face Velocity"
-                info_path = (
-                    f"Geometry/2D Flow Areas/{mesh_name}/"
-                    "Cells Face and Orientation Info"
-                )
-                values_path = (
-                    f"Geometry/2D Flow Areas/{mesh_name}/"
-                    "Cells Face and Orientation Values"
-                )
-                for required in (velocity_path, info_path, values_path):
-                    if required not in hdf_file:
-                        raise ValueError(
-                            f"Maximum velocity input is missing: {required}"
-                        )
-
-                face_timeseries = np.asarray(
-                    hdf_file[velocity_path],
-                    dtype=float,
-                )
-                finite_face = np.any(np.isfinite(face_timeseries), axis=0)
-                maximum_face = np.full(face_timeseries.shape[1], np.nan)
-                maximum_face[finite_face] = np.nanmax(
-                    np.abs(face_timeseries[:, finite_face]),
-                    axis=0,
-                )
-
-                cell_face_info = np.asarray(hdf_file[info_path])
-                cell_face_values = np.asarray(hdf_file[values_path])[:, 0].astype(
-                    int
-                )
-                maximum_cell = np.full(len(cell_face_info), np.nan)
-                for cell_id, (start, count) in enumerate(
-                    cell_face_info[:, :2]
-                ):
-                    face_ids = cell_face_values[start : start + count]
-                    face_ids = face_ids[
-                        (face_ids >= 0) & (face_ids < len(maximum_face))
-                    ]
-                    finite = maximum_face[face_ids]
-                    finite = finite[np.isfinite(finite)]
-                    if finite.size:
-                        maximum_cell[cell_id] = float(np.max(finite))
-
-                mesh_points = (
-                    points[points["mesh_name"] == mesh_name]
-                    .sort_values("cell_id")
-                    .copy()
-                )
-                if len(mesh_points) != len(maximum_cell):
-                    raise ValueError(
-                        f"Velocity cell count mismatch for mesh '{mesh_name}': "
-                        f"{len(maximum_cell)} values != {len(mesh_points)} "
-                        "cell points"
-                    )
-                mesh_points["maximum_velocity"] = maximum_cell
-                frames.append(
-                    mesh_points[
-                        ["mesh_name", "cell_id", "maximum_velocity", "geometry"]
-                    ]
-                )
-
-        return gpd.GeoDataFrame(
-            pd.concat(frames, ignore_index=True),
-            geometry="geometry",
-            crs=points.crs,
-        )
-
-    @staticmethod
-    def _grid_spec(
-        bbox: tuple[float, float, float, float],
-        *,
-        resolution: Optional[float],
-        max_dimension: int,
-    ) -> Dict[str, Any]:
-        from rasterio.transform import from_bounds
-
-        minx, miny, maxx, maxy = (float(value) for value in bbox)
-        width = maxx - minx
-        height = maxy - miny
-        if width <= 0 or height <= 0:
-            raise ValueError(f"Result footprint has invalid bounds: {bbox}")
-        if resolution is None:
-            resolution = max(width, height) / float(max_dimension)
-        columns = max(2, int(np.ceil(width / resolution)))
-        rows = max(2, int(np.ceil(height / resolution)))
-        transform = from_bounds(minx, miny, maxx, maxy, columns, rows)
-        return {
-            "bbox": (minx, miny, maxx, maxy),
-            "width": columns,
-            "height": rows,
-            "transform": transform,
-            "resolution": (
-                float(transform.a),
-                float(abs(transform.e)),
-            ),
-        }
-
-    @staticmethod
-    def _interpolate_points(
+    def _validate_product_frame(
         frame,
+        *,
         value_column: str,
-        grid: Dict[str, Any],
-    ) -> np.ndarray:
-        from scipy.spatial import cKDTree
-
-        valid = (
-            frame.geometry.notna()
-            & ~frame.geometry.is_empty
-            & np.isfinite(frame[value_column].to_numpy(dtype=float))
-        )
-        source = frame.loc[valid]
-        if source.empty:
-            raise ValueError(f"No finite values available for {value_column}")
-        xy = np.column_stack(
-            [
-                source.geometry.x.to_numpy(dtype=float),
-                source.geometry.y.to_numpy(dtype=float),
-            ]
-        )
-        values = source[value_column].to_numpy(dtype=float)
-        minx, miny, maxx, maxy = grid["bbox"]
-        width = grid["width"]
-        height = grid["height"]
-        x_resolution, y_resolution = grid["resolution"]
-        x = np.linspace(
-            minx + x_resolution / 2.0,
-            maxx - x_resolution / 2.0,
-            width,
-        )
-        y = np.linspace(
-            maxy - y_resolution / 2.0,
-            miny + y_resolution / 2.0,
-            height,
-        )
-        gx, gy = np.meshgrid(x, y)
-        tree = cKDTree(xy)
-        _, nearest = tree.query(np.column_stack([gx.ravel(), gy.ravel()]))
-        return values[nearest].reshape((height, width)).astype(np.float32)
-
-    @staticmethod
-    def _apply_masks(
-        values: np.ndarray,
-        footprint,
-        grid: Dict[str, Any],
-        *,
-        wet_mask: Optional[np.ndarray],
-        nodata: float,
-    ) -> np.ndarray:
-        from rasterio.features import geometry_mask
-
-        valid_footprint = geometry_mask(
-            [footprint],
-            out_shape=(grid["height"], grid["width"]),
-            transform=grid["transform"],
-            invert=True,
-        )
-        valid = valid_footprint & np.isfinite(values)
-        if wet_mask is not None:
-            valid &= wet_mask
-        return np.where(valid, values, nodata).astype(np.float32)
-
-    @staticmethod
-    def _write_cog(
-        path: Path,
-        values: np.ndarray,
-        grid: Dict[str, Any],
-        *,
-        crs: str,
-        nodata: float,
-        units: str,
-        product_key: str,
-        derivation: str,
+        label: str,
+        inspection: dict[str, Any],
+        expected_crs,
     ) -> None:
-        import rasterio
+        from pyproj import CRS
 
-        with rasterio.open(
-            path,
-            "w",
-            driver="COG",
-            height=grid["height"],
-            width=grid["width"],
-            count=1,
-            dtype="float32",
-            crs=crs,
-            transform=grid["transform"],
-            nodata=nodata,
-            compress="DEFLATE",
-            blocksize=512,
-            overview_resampling="average",
-            num_threads=1,
-            BIGTIFF="IF_SAFER",
-        ) as destination:
-            destination.write(values, 1)
-            destination.update_tags(
-                product_key=product_key,
-                units=units,
-                derivation=derivation,
-            )
-
-        with rasterio.open(path) as source:
-            layout = source.tags(ns="IMAGE_STRUCTURE").get("LAYOUT")
-            if layout != "COG":
-                raise RuntimeError(
-                    f"Raster driver did not produce a COG for {path.name}"
-                )
-
-    @staticmethod
-    def _write_hydrographs(
-        source: Path,
-        path: Path,
-    ) -> Dict[str, Any]:
-        dataset = HdfResultsMesh.get_boundary_conditions_timeseries(source)
-        required = {"flow", "stage"}
-        missing = required - set(dataset.data_vars)
+        required = {"mesh_name", "cell_id", value_column, "geometry"}
+        missing = required - set(frame.columns)
         if missing:
             raise ValueError(
-                "Boundary hydrograph variables are missing: "
-                + ", ".join(sorted(missing))
+                f"{label} output is missing columns: {sorted(missing)}"
             )
+        if frame.empty or frame.crs is None:
+            raise ValueError(f"{label} output is empty or has no CRS")
+        if CRS.from_user_input(frame.crs) != expected_crs:
+            raise ValueError(f"{label} output CRS differs from inspected CRS")
+        if frame.duplicated(["mesh_name", "cell_id"]).any():
+            raise ValueError(f"{label} output contains duplicate mesh/cell IDs")
 
-        frames = []
-        units_by_variable: Dict[str, list[str]] = {}
-        for variable in ("flow", "stage"):
-            frame = (
-                dataset[variable]
-                .to_dataframe(name="value")
-                .reset_index()
+        expected_names = set(inspection["mesh_names"])
+        actual_names = set(frame["mesh_name"].astype(str))
+        if actual_names != expected_names:
+            raise ValueError(
+                f"{label} mesh names differ from inspection: expected "
+                f"{sorted(expected_names)}, got {sorted(actual_names)}"
             )
-            frame.insert(2, "variable", variable)
-            units_coordinate = f"{variable}_units"
-            if units_coordinate in dataset.coords:
-                unit_lookup = {
-                    str(name): str(unit)
-                    for name, unit in zip(
-                        dataset["bc_name"].values,
-                        dataset[units_coordinate].values,
-                    )
-                }
-                frame["units"] = frame["bc_name"].map(unit_lookup)
-            else:
-                frame["units"] = ""
-            if "area_2d" in dataset.coords:
-                area_lookup = {
-                    str(name): str(area)
-                    for name, area in zip(
-                        dataset["bc_name"].values,
-                        dataset["area_2d"].values,
-                    )
-                }
-                frame["area_2d"] = frame["bc_name"].map(area_lookup)
-            else:
-                frame["area_2d"] = ""
-            frames.append(frame)
-            units_by_variable[variable] = sorted(
-                {
-                    value
-                    for value in frame["units"].astype(str)
-                    if value.strip()
-                }
+        for mesh in inspection["meshes"]:
+            mesh_name = mesh["mesh_name"]
+            # Result frames hold physical cells only; ghost cells are excluded.
+            cell_count = int(mesh.get("declared_cell_count", mesh["cell_count"]))
+            subset = frame.loc[frame["mesh_name"] == mesh_name].sort_values(
+                "cell_id",
+                kind="stable",
             )
-
-        table = pd.concat(frames, ignore_index=True)
-        table = table[
-            ["time", "bc_name", "variable", "value", "units", "area_2d"]
-        ].sort_values(
-            ["time", "bc_name", "variable"],
-            kind="stable",
-        )
-        table.reset_index(drop=True, inplace=True)
-        table.to_parquet(
-            path,
-            index=False,
-            engine="pyarrow",
-            compression="zstd",
-        )
-        return {
-            "row_count": len(table),
-            "columns": [
-                {"name": "time", "type": "timestamp"},
-                {"name": "bc_name", "type": "string"},
-                {"name": "variable", "type": "string"},
-                {"name": "value", "type": "float64"},
-                {"name": "units", "type": "string"},
-                {"name": "area_2d", "type": "string"},
-            ],
-            "variables": ["flow", "stage"],
-            "units": units_by_variable,
-            "missing_value_count": int(table["value"].isna().sum()),
-            "time_start": pd.Timestamp(table["time"].min()).isoformat(),
-            "time_end": pd.Timestamp(table["time"].max()).isoformat(),
-        }
+            cell_ids = subset["cell_id"].to_numpy(dtype=np.int64)
+            if len(subset) != cell_count or not np.array_equal(
+                cell_ids,
+                np.arange(cell_count, dtype=np.int64),
+            ):
+                raise ValueError(
+                    f"{label} rows do not align with mesh '{mesh_name}'"
+                )
+            values = pd.to_numeric(subset[value_column], errors="coerce")
+            if not np.isfinite(values.to_numpy(dtype=float)).any():
+                raise ValueError(
+                    f"{label} contains no finite values for mesh '{mesh_name}'"
+                )
+            geometry = subset.geometry
+            if (
+                geometry.isna().any()
+                or geometry.is_empty.any()
+                or not np.isfinite(geometry.x.to_numpy(dtype=float)).all()
+                or not np.isfinite(geometry.y.to_numpy(dtype=float)).all()
+            ):
+                raise ValueError(
+                    f"{label} contains invalid cell points for mesh '{mesh_name}'"
+                )
 
     @staticmethod
     def _result_metadata(
         source: Path,
-        inspection: Dict[str, Any],
+        inspection: dict[str, Any],
         bbox: tuple[float, float, float, float],
         *,
         source_size: int,
         source_hash: str,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         return {
             "schema": "ras-commander/result-hdf-metadata/1.0",
             "source": {
                 "href": source.name,
                 "size_bytes": source_size,
                 "sha256": source_hash,
+                "producer": "HEC-RAS",
+                "access": "read_only",
+            },
+            "product_artifacts": {
+                "generated_by": "ras-commander",
+                "hec_ras_model_output_generated": False,
             },
             "completion": {
                 "completed_successfully": inspection[
                     "completed_successfully"
                 ],
                 "time_axis_consistent": inspection["time_axis_consistent"],
+                "evidence": inspection["completion_evidence"],
             },
             "time": inspection["time"],
             "spatial": {
                 "crs": inspection["crs"],
                 "bbox": [float(value) for value in bbox],
                 "mesh_names": inspection["mesh_names"],
+                "meshes": inspection["meshes"],
             },
             "units": {
                 "system": inspection["unit_system"],
@@ -861,21 +738,31 @@ class HdfResultsProducts:
             "derivations": {
                 "maximum-wse": "HEC-RAS Maximum Water Surface summary",
                 "maximum-depth": (
-                    "maximum stored Depth or Water Surface minus Cells "
-                    "Minimum Elevation, clipped at zero"
+                    "maximum stored Depth or Water Surface minus Cells Minimum "
+                    "Elevation, clipped at zero"
                 ),
                 "maximum-velocity": (
                     "maximum absolute adjacent-face velocity across time"
+                ),
+                "hydraulic-hydrographs": (
+                    "available HEC-RAS boundary Flow and Stage series serialized "
+                    "with required-core pyarrow; an empty schema-correct table is "
+                    "generated when the producer HDF has no boundary series"
                 ),
             },
         }
 
     @staticmethod
-    def _numerical_qaqc(source: Path) -> Dict[str, Any]:
+    def _numerical_qaqc(source: Path) -> dict[str, Any]:
         unsteady_summary = HdfResultsPlan.get_unsteady_summary(source)
         volume_accounting = HdfResultsPlan.get_volume_accounting(source)
-        maximum_wse_error = HdfResultsMesh.get_mesh_max_ws_err(source)
-        messages = HdfResultsPlan.get_compute_messages_hdf_only(source)
+        with h5py.File(source, "r") as hdf_file:
+            messages = HdfResultsProducts._dataset_text(
+                hdf_file.get(HdfResultsProducts._COMPUTE_MESSAGES_PATH)
+            )
+            maximum_wse_error = HdfResultsProducts._mesh_wse_error_summary(
+                hdf_file
+            )
 
         patterns = {
             "ignored_boundary": r"not used because",
@@ -894,7 +781,7 @@ class HdfResultsProducts:
             )
             if match:
                 iteration_counts.append(int(match.group(1)))
-        findings: Dict[str, Any] = {}
+        findings: dict[str, Any] = {}
         for key, pattern in patterns.items():
             matches = [
                 line
@@ -913,189 +800,632 @@ class HdfResultsProducts:
             "volume_accounting": _frame_records(volume_accounting),
             "mesh": {
                 "maximum_iterations_observed": {
-                    "maximum": (
-                        max(iteration_counts) if iteration_counts else None
-                    ),
+                    "maximum": max(iteration_counts) if iteration_counts else None,
                     "reported_row_count": len(iteration_counts),
-                    "source": "compute messages",
+                    "source": "embedded HEC-RAS compute messages",
                 },
-                "maximum_water_surface_error": {
-                    "row_count": len(maximum_wse_error),
-                    "maximum": HdfResultsProducts._numeric_max(
-                        maximum_wse_error,
-                        "cell_maximum_water_surface_error",
-                    ),
-                },
+                "maximum_water_surface_error": maximum_wse_error,
             },
             "compute_message_findings": findings,
             "compute_message_sha256": hashlib.sha256(
                 messages.encode("utf-8")
             ).hexdigest(),
+            "compute_message_source": "embedded_hdf_only",
         }
 
     @staticmethod
-    def _numeric_max(frame: pd.DataFrame, column: str) -> Optional[float]:
-        if frame.empty or column not in frame:
-            return None
-        values = pd.to_numeric(frame[column], errors="coerce")
-        if not values.notna().any():
-            return None
-        return float(values.max())
-
-    @staticmethod
-    def _raster_asset(path: Path, *, units: str) -> Dict[str, Any]:
-        import rasterio
-
-        with rasterio.open(path) as source:
-            band = source.read(1, masked=True)
-            finite = band.compressed()
-            asset = HdfResultsProducts._file_asset(
-                path,
-                media_type=(
-                    "image/tiff; application=geotiff; "
-                    "profile=cloud-optimized"
-                ),
-                roles=["data", "visual"],
-                extra={
-                    "proj:code": source.crs.to_string(),
-                    "proj:bbox": [float(value) for value in source.bounds],
-                    "proj:shape": [source.height, source.width],
-                    "proj:transform": [
-                        float(value) for value in source.transform[:6]
-                    ],
-                    "raster:bands": [
-                        {
-                            "data_type": source.dtypes[0],
-                            "nodata": source.nodata,
-                            "unit": units,
-                            "spatial_resolution": float(abs(source.transform.a)),
-                            "statistics": {
-                                "minimum": (
-                                    float(np.min(finite))
-                                    if finite.size
-                                    else None
-                                ),
-                                "maximum": (
-                                    float(np.max(finite))
-                                    if finite.size
-                                    else None
-                                ),
-                            },
-                        }
-                    ],
-                    "cog": {
-                        "layout": source.tags(
-                            ns="IMAGE_STRUCTURE"
-                        ).get("LAYOUT"),
-                        "overviews": source.overviews(1),
-                    },
-                },
+    def _mesh_wse_error_summary(hdf_file: h5py.File) -> dict[str, Any]:
+        attributes = hdf_file.get("Geometry/2D Flow Areas/Attributes")
+        if attributes is None:
+            return {
+                "row_count": 0,
+                "maximum": None,
+                "datasets": [],
+                "missing_meshes": [],
+            }
+        row_count = 0
+        maximum: float | None = None
+        datasets = []
+        missing_meshes = []
+        physical_counts = HdfMesh._physical_cell_counts(hdf_file)
+        for row in read_typed(attributes, slice(None)):
+            mesh_name = HdfUtils.convert_ras_string(row[0])
+            path = (
+                f"{HdfResultsProducts._SUMMARY_BASE}/2D Flow Areas/"
+                f"{mesh_name}/Cell Maximum Water Surface Error"
             )
-        return asset
-
-    @staticmethod
-    def _file_asset(
-        path: Path,
-        *,
-        media_type: str,
-        roles: list[str],
-        extra: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        asset = {
-            "href": path.name,
-            "type": media_type,
-            "roles": roles,
-            "size_bytes": path.stat().st_size,
-            "sha256": _sha256(path),
-        }
-        if extra:
-            asset.update(extra)
-        return asset
-
-    @staticmethod
-    def _write_preview(
-        depth_path: Path,
-        preview_path: Path,
-        *,
-        units: str,
-    ) -> None:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import rasterio
-
-        with rasterio.open(depth_path) as source:
-            depth = source.read(1, masked=True)
-            extent = (
-                source.bounds.left,
-                source.bounds.right,
-                source.bounds.bottom,
-                source.bounds.top,
+            dataset = hdf_file.get(path)
+            if not isinstance(dataset, h5py.Dataset):
+                missing_meshes.append(mesh_name)
+                continue
+            if not np.issubdtype(dataset.dtype, np.number) or not (
+                dataset.ndim == 1
+                or (dataset.ndim == 2 and dataset.shape[0] == 2)
+            ):
+                raise ValueError(
+                    f"Maximum water-surface error dataset is invalid: {path}"
+                )
+            datasets.append(path)
+            # Ghost cells follow the physical cells and carry no solution.
+            value_count = min(
+                int(dataset.shape[-1]),
+                physical_counts.get(str(mesh_name), int(dataset.shape[-1])),
             )
-        figure, axis = plt.subplots(figsize=(10, 7), dpi=120)
-        image = axis.imshow(
-            depth,
-            extent=extent,
-            cmap="Blues",
-            origin="upper",
-        )
-        axis.set_title("Maximum Depth")
-        axis.set_xlabel("Model X")
-        axis.set_ylabel("Model Y")
-        colorbar = figure.colorbar(image, ax=axis, shrink=0.82)
-        colorbar.set_label(f"Depth ({units})")
-        figure.tight_layout()
-        figure.savefig(
-            preview_path,
-            metadata={"Software": "ras-commander"},
-        )
-        plt.close(figure)
-
-    @staticmethod
-    def _unit_metadata(hdf_file: h5py.File) -> Dict[str, str]:
-        geometry = hdf_file.get("Geometry")
-        raw_si = (
-            HdfResultsProducts._decode(geometry.attrs.get("SI Units"))
-            if geometry is not None
-            else None
-        )
-        raw_system = HdfResultsProducts._decode(
-            hdf_file.attrs.get("Units System")
-        )
-        text = str(raw_system or "").strip().casefold()
-        si_units = str(raw_si or "").strip().casefold() in {
-            "true",
-            "1",
-            "yes",
-            "si",
-        } or text.startswith("si")
-        length = "m" if si_units else "ft"
+            row_count += value_count
+            chunk_size = max(1, min(1_000_000, value_count))
+            for start in range(0, value_count, chunk_size):
+                selection = (
+                    slice(start, start + chunk_size)
+                    if dataset.ndim == 1
+                    else (0, slice(start, start + chunk_size))
+                )
+                values = np.asarray(read_typed(dataset, selection), dtype=float)
+                finite = values[np.isfinite(values)]
+                if finite.size:
+                    chunk_maximum = float(np.max(finite))
+                    maximum = (
+                        chunk_maximum
+                        if maximum is None
+                        else max(maximum, chunk_maximum)
+                    )
         return {
-            "unit_system": "SI" if si_units else "US Customary",
-            "length_units": length,
-            "depth_units": length,
-            "velocity_units": "m/s" if si_units else "ft/s",
+            "row_count": row_count,
+            "maximum": maximum,
+            "datasets": datasets,
+            "missing_meshes": missing_meshes,
         }
+
+    @staticmethod
+    def _validate_package(
+        directory: Path,
+        manifest: dict[str, Any],
+    ) -> None:
+        from ._HdfResultsProductRenderers import _ProductRenderers
+
+        manifest_path = directory / HdfResultsProducts.MANIFEST_FILENAME
+        if not manifest_path.is_file():
+            raise RuntimeError("Hydraulic product manifest is missing")
+        reopened_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if reopened_manifest != _json_value(manifest):
+            raise RuntimeError("Hydraulic product manifest readback changed")
+
+        assets = manifest.get("assets")
+        if not isinstance(assets, dict) or not assets:
+            raise RuntimeError("Hydraulic product manifest contains no assets")
+        expected_files = {HdfResultsProducts.MANIFEST_FILENAME}
+        for key, asset in assets.items():
+            if key not in HdfResultsProducts.FILENAMES:
+                raise RuntimeError(f"Unknown hydraulic product asset key: {key}")
+            if not isinstance(asset, dict):
+                raise RuntimeError(f"Invalid hydraulic product asset: {key}")
+            expected_href = HdfResultsProducts.FILENAMES[key]
+            href = asset.get("href")
+            if href != expected_href or Path(str(href)).name != href:
+                raise RuntimeError(
+                    f"Hydraulic product asset has an unsafe or unstable href: {key}"
+                )
+            if href in expected_files:
+                raise RuntimeError(f"Duplicate hydraulic product href: {href}")
+            expected_files.add(href)
+            _ProductRenderers.validate_asset(directory, asset)
+
+        actual_files = {
+            path.name for path in directory.iterdir() if path.is_file()
+        }
+        if actual_files != expected_files:
+            raise RuntimeError(
+                "Hydraulic product package file set differs from manifest: "
+                f"expected {sorted(expected_files)}, got {sorted(actual_files)}"
+            )
+        if any(path.is_dir() for path in directory.iterdir()):
+            raise RuntimeError("Hydraulic product package contains a directory")
+
+    @staticmethod
+    def _publish_package(
+        stage: Path,
+        output: Path,
+        manifest: dict[str, Any],
+    ) -> None:
+        output.mkdir(exist_ok=False)
+        linked: list[str] = []
+        try:
+            assets = manifest["assets"]
+            for asset in sorted(assets.values(), key=lambda item: item["href"]):
+                href = asset["href"]
+                os.link(stage / href, output / href)
+                linked.append(href)
+            manifest_name = HdfResultsProducts.MANIFEST_FILENAME
+            os.link(stage / manifest_name, output / manifest_name)
+            linked.append(manifest_name)
+        except Exception:
+            HdfResultsProducts._cleanup_linked_files(
+                stage,
+                output,
+                linked,
+            )
+            raise
+
+    @staticmethod
+    def _cleanup_published_package(
+        stage: Path,
+        output: Path,
+        manifest: dict[str, Any],
+    ) -> None:
+        names = [
+            asset["href"] for asset in manifest.get("assets", {}).values()
+        ]
+        names.append(HdfResultsProducts.MANIFEST_FILENAME)
+        HdfResultsProducts._cleanup_linked_files(stage, output, names)
+
+    @staticmethod
+    def _cleanup_linked_files(
+        stage: Path,
+        output: Path,
+        names: list[str],
+    ) -> None:
+        for name in reversed(names):
+            staged = stage / name
+            published = output / name
+            try:
+                if (
+                    staged.is_file()
+                    and published.is_file()
+                    and os.path.samefile(staged, published)
+                ):
+                    published.unlink()
+            except OSError as exc:
+                logger.warning(
+                    "Could not remove incomplete generated product '%s': %s",
+                    published,
+                    exc,
+                )
+        try:
+            output.rmdir()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            logger.warning(
+                "Incomplete hydraulic product directory remains at '%s': %s",
+                output,
+                exc,
+            )
+
+    @staticmethod
+    def _require_unchanged_source(
+        source: Path,
+        *,
+        expected_size: int,
+        expected_hash: str,
+        checkpoint: str,
+    ) -> None:
+        try:
+            size = source.stat().st_size
+            digest = _sha256(source)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Source result HDF cannot be verified {checkpoint}: {source}"
+            ) from exc
+        if size != expected_size or digest != expected_hash:
+            raise RuntimeError(
+                f"Source result HDF changed {checkpoint}: {source.name}"
+            )
+
+    @staticmethod
+    def _is_reparse_point(path: Path) -> bool:
+        try:
+            attributes = getattr(os.lstat(path), "st_file_attributes", 0)
+        except FileNotFoundError:
+            return False
+        marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        return bool(marker and attributes & marker)
+
+    @staticmethod
+    def _finite_float(value: Any, *, label: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(f"{label} must be a finite real number")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{label} must be a finite real number") from exc
+        if not np.isfinite(numeric):
+            raise ValueError(f"{label} must be a finite real number")
+        return numeric
+
+    @staticmethod
+    def _optional_positive_float(value: Any, *, label: str) -> float | None:
+        if value is None:
+            return None
+        numeric = HdfResultsProducts._finite_float(value, label=label)
+        if numeric <= 0.0:
+            raise ValueError(f"{label} must be greater than zero")
+        return numeric
+
+    @staticmethod
+    def _finite_float32(value: Any, *, label: str) -> float:
+        numeric = HdfResultsProducts._finite_float(value, label=label)
+        limit = float(np.finfo(np.float32).max)
+        if numeric < -limit or numeric > limit:
+            raise ValueError(f"{label} must be representable as float32")
+        return float(np.float32(numeric))
+
+    @staticmethod
+    def _completion_evidence(hdf_file: h5py.File) -> dict[str, Any]:
+        event_conditions = hdf_file.get("Event Conditions")
+        raw_attribute = (
+            None
+            if event_conditions is None
+            else read_attr(event_conditions, "Completed Successfully", None)
+        )
+        attribute = HdfResultsProducts._optional_bool(
+            raw_attribute,
+            label="Event Conditions/Completed Successfully",
+        )
+        message_text = HdfResultsProducts._dataset_text(
+            hdf_file.get(HdfResultsProducts._COMPUTE_MESSAGES_PATH)
+        )
+        from ..results.ResultsParser import ResultsParser
+
+        message_complete = ResultsParser._has_complete_process_record(
+            message_text
+        )
+
+        if attribute is False:
+            if message_complete:
+                raise ValueError(
+                    "Result HDF has conflicting completion evidence: "
+                    "Completed Successfully=False but compute messages contain "
+                    "Complete Process"
+                )
+            raise ValueError(
+                "Result HDF reports Completed Successfully=False"
+            )
+        if attribute is None and not message_complete:
+            raise ValueError(
+                "Result HDF has no accepted completion evidence: expected "
+                "Completed Successfully=True or an embedded Complete Process "
+                "compute-message marker"
+            )
+
+        accepted_sources = []
+        if attribute is True:
+            accepted_sources.append("event_conditions_attribute")
+        if message_complete:
+            accepted_sources.append("embedded_compute_messages")
+        return {
+            "event_conditions_completed_successfully": attribute,
+            "embedded_compute_messages_complete_process": message_complete,
+            "accepted_sources": accepted_sources,
+        }
+
+    @staticmethod
+    def _time_axis(
+        hdf_file: h5py.File,
+    ) -> tuple[list[pd.Timestamp], list[str]]:
+        axes: dict[str, pd.DatetimeIndex] = {}
+        specifications = (
+            ("Time Date Stamp (ms)", HdfUtils.parse_ras_datetime_ms),
+            ("Time Date Stamp", HdfUtils.parse_ras_datetime),
+        )
+        for name, parser in specifications:
+            path = f"{HdfResultsProducts._TIME_SERIES_BASE}/{name}"
+            dataset = hdf_file.get(path)
+            if dataset is None:
+                continue
+            try:
+                axes[path] = pd.DatetimeIndex(
+                    [parser(HdfResultsProducts._decode(value))
+                     for value in read_typed(dataset, slice(None))]
+                )
+            except Exception as exc:
+                reraise_required(exc)
+                raise ValueError(
+                    f"Could not parse result time dataset '{path}': {exc}"
+                ) from exc
+
+        if not axes:
+            raise ValueError("Result HDF contains no unsteady timestamp dataset")
+        paths = list(axes)
+        primary = axes[paths[0]]
+        for path in paths[1:]:
+            candidate = axes[path]
+            candidate_seconds = candidate.to_numpy(dtype="datetime64[s]")
+            primary_seconds = primary.to_numpy(dtype="datetime64[s]")
+            if len(candidate) != len(primary) or not np.array_equal(
+                candidate_seconds,
+                primary_seconds,
+            ):
+                raise ValueError(
+                    "Result HDF timestamp datasets disagree: "
+                    f"'{paths[0]}' versus '{path}'"
+                )
+        return list(primary), paths
+
+    @staticmethod
+    def _embedded_crs(hdf_file: h5py.File, source: Path) -> str:
+        raw_projection = read_attr(hdf_file, "Projection", None)
+        if raw_projection is None:
+            raise ValueError(
+                "Result HDF does not contain an embedded Projection attribute"
+            )
+        projection = HdfResultsProducts._decode(raw_projection).strip()
+        if not projection:
+            raise ValueError("Result HDF contains an empty Projection attribute")
+        crs = HdfBase._wkt_to_crs_string(
+            projection,
+            f"HDF file {source.name}",
+        )
+        if not crs:
+            raise ValueError("Result HDF Projection attribute is not resolvable")
+        return str(crs)
+
+    @staticmethod
+    def _unit_metadata(hdf_file: h5py.File) -> dict[str, str]:
+        metadata = HdfBase._result_unit_metadata_from_file(
+            hdf_file,
+            source_file=Path(hdf_file.filename),
+            strict=True,
+        )
+        return {
+            key: metadata[key]
+            for key in (
+                "unit_system",
+                "length_units",
+                "depth_units",
+                "velocity_units",
+            )
+        }
+
+    @staticmethod
+    def _inspect_meshes(
+        hdf_file: h5py.File,
+        *,
+        timestamp_count: int,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        attributes_path = "Geometry/2D Flow Areas/Attributes"
+        attributes = hdf_file.get(attributes_path)
+        if attributes is None or len(attributes) == 0:
+            raise ValueError("Result HDF contains no 2D flow areas")
+
+        meshes: list[dict[str, Any]] = []
+        checked = [attributes_path]
+        for row in read_typed(attributes, slice(None)):
+            mesh_name = HdfUtils.convert_ras_string(row[0])
+            declared_cell_count = int(row[-1])
+            if not mesh_name or declared_cell_count <= 0:
+                raise ValueError(
+                    "Result HDF contains an invalid 2D flow-area attribute row"
+                )
+
+            geometry_base = f"Geometry/2D Flow Areas/{mesh_name}"
+            series_base = (
+                f"{HdfResultsProducts._TIME_SERIES_BASE}/2D Flow Areas/"
+                f"{mesh_name}"
+            )
+            summary_base = (
+                f"{HdfResultsProducts._SUMMARY_BASE}/2D Flow Areas/{mesh_name}"
+            )
+            centers_path = f"{geometry_base}/Cells Center Coordinate"
+            centers = HdfResultsProducts._require_numeric_dataset(
+                hdf_file,
+                centers_path,
+                minimum_columns=2,
+            )
+            cell_count = int(centers.shape[0])
+            if cell_count <= 0 or declared_cell_count > cell_count:
+                raise ValueError(
+                    f"Declared Cell Count {declared_cell_count} is incompatible "
+                    f"with {cell_count} result cell centers for mesh '{mesh_name}'"
+                )
+            checked.append(centers_path)
+
+            wse_path = f"{series_base}/Water Surface"
+            HdfResultsProducts._require_numeric_dataset(
+                hdf_file,
+                wse_path,
+                shape=(timestamp_count, cell_count),
+            )
+            checked.append(wse_path)
+
+            maximum_wse_path = f"{summary_base}/Maximum Water Surface"
+            HdfResultsProducts._require_numeric_dataset(
+                hdf_file,
+                maximum_wse_path,
+                shape=(2, cell_count),
+            )
+            checked.append(maximum_wse_path)
+
+            depth_path = f"{series_base}/Depth"
+            depth = hdf_file.get(depth_path)
+            if depth is not None:
+                HdfResultsProducts._validate_numeric_shape(
+                    depth,
+                    depth_path,
+                    (timestamp_count, cell_count),
+                )
+                depth_source = "stored_depth"
+                checked.append(depth_path)
+            else:
+                minimum_path = f"{geometry_base}/Cells Minimum Elevation"
+                HdfResultsProducts._require_numeric_dataset(
+                    hdf_file,
+                    minimum_path,
+                    shape=(cell_count,),
+                )
+                depth_source = "derived_water_surface_minus_minimum_elevation"
+                checked.append(minimum_path)
+
+            velocity_path = f"{series_base}/Face Velocity"
+            velocity = hdf_file.get(velocity_path)
+            if velocity is None or velocity.ndim != 2:
+                raise ValueError(
+                    f"Required result dataset is missing or not 2D: {velocity_path}"
+                )
+            if velocity.shape[0] != timestamp_count or velocity.shape[1] <= 0:
+                raise ValueError(
+                    f"Time-axis mismatch or invalid face count: required result dataset has shape {velocity.shape}, expected "
+                    f"({timestamp_count}, positive face count): {velocity_path}"
+                )
+            if not np.issubdtype(velocity.dtype, np.number):
+                raise ValueError(
+                    f"Required result dataset is not numeric: {velocity_path}"
+                )
+            face_count = int(velocity.shape[1])
+            checked.append(velocity_path)
+
+            face_info_path = f"{geometry_base}/Cells Face and Orientation Info"
+            face_info = HdfResultsProducts._require_numeric_dataset(
+                hdf_file,
+                face_info_path,
+                leading_shape=(cell_count,),
+                minimum_columns=2,
+                require_integer=True,
+            )
+            face_values_path = (
+                f"{geometry_base}/Cells Face and Orientation Values"
+            )
+            face_values = HdfResultsProducts._require_numeric_dataset(
+                hdf_file,
+                face_values_path,
+                minimum_columns=1,
+                require_integer=True,
+            )
+            info = np.asarray(read_typed(face_info, (slice(None), slice(None, 2))), dtype=np.int64)
+            if np.any(info < 0) or np.any(info[:, 0] + info[:, 1] > len(face_values)):
+                raise ValueError(
+                    f"Cell-face topology offsets are invalid for mesh '{mesh_name}'"
+                )
+            face_ids = np.asarray(read_typed(face_values, (slice(None), 0)), dtype=np.int64)
+            if np.any(face_ids < 0) or np.any(face_ids >= face_count):
+                raise ValueError(
+                    f"Cell-face topology IDs are invalid for mesh '{mesh_name}'"
+                )
+            checked.extend((face_info_path, face_values_path))
+
+            if centers.shape[0] != len(info):
+                raise ValueError(
+                    f"Cell topology count does not align for mesh '{mesh_name}'"
+                )
+            meshes.append(
+                {
+                    "mesh_name": mesh_name,
+                    "cell_count": cell_count,
+                    "declared_cell_count": declared_cell_count,
+                    "face_count": face_count,
+                    "depth_source": depth_source,
+                }
+            )
+
+        return meshes, checked
+
+    @staticmethod
+    def _require_numeric_dataset(
+        hdf_file: h5py.File,
+        path: str,
+        *,
+        shape: tuple[int, ...] | None = None,
+        leading_shape: tuple[int, ...] | None = None,
+        minimum_columns: int | None = None,
+        require_integer: bool = False,
+    ) -> h5py.Dataset:
+        dataset = hdf_file.get(path)
+        if not isinstance(dataset, h5py.Dataset):
+            raise ValueError(f"Required HDF dataset is missing: {path}")
+        HdfResultsProducts._validate_numeric_shape(
+            dataset,
+            path,
+            shape,
+            leading_shape=leading_shape,
+            minimum_columns=minimum_columns,
+            require_integer=require_integer,
+        )
+        return dataset
+
+    @staticmethod
+    def _validate_numeric_shape(
+        dataset: h5py.Dataset,
+        path: str,
+        shape: tuple[int, ...] | None,
+        *,
+        leading_shape: tuple[int, ...] | None = None,
+        minimum_columns: int | None = None,
+        require_integer: bool = False,
+    ) -> None:
+        if not np.issubdtype(dataset.dtype, np.number):
+            raise ValueError(f"Required HDF dataset is not numeric: {path}")
+        if require_integer and not np.issubdtype(dataset.dtype, np.integer):
+            raise ValueError(f"Required HDF dataset is not integer-valued: {path}")
+        if shape is not None and dataset.shape != shape:
+            raise ValueError(
+                f"Required HDF dataset has shape {dataset.shape}, expected "
+                f"{shape}: {path}"
+            )
+        if (
+            leading_shape is not None
+            and dataset.shape[: len(leading_shape)] != leading_shape
+        ):
+            raise ValueError(
+                f"Required HDF dataset has shape {dataset.shape}, expected "
+                f"leading shape {leading_shape}: {path}"
+            )
+        if minimum_columns is not None and (
+            dataset.ndim != 2 or dataset.shape[1] < minimum_columns
+        ):
+            raise ValueError(
+                f"Required HDF dataset has shape {dataset.shape}, expected at "
+                f"least {minimum_columns} columns: {path}"
+            )
+
+    @staticmethod
+    def _dataset_text(dataset: h5py.Dataset | h5py.Group | None) -> str:
+        if not isinstance(dataset, h5py.Dataset):
+            return ""
+        raw = read_typed(dataset)
+        if isinstance(raw, np.ndarray):
+            return "\n".join(
+                HdfResultsProducts._decode(value) for value in raw.flat
+            )
+        return HdfResultsProducts._decode(raw)
 
     @staticmethod
     def _first_attribute(
         hdf_file: h5py.File,
         candidates: tuple[tuple[str, str], ...],
-    ) -> Optional[str]:
+    ) -> str | None:
         for group_path, attribute in candidates:
             group = hdf_file if not group_path else hdf_file.get(group_path)
             if group is None:
                 continue
-            value = HdfResultsProducts._decode(group.attrs.get(attribute))
-            if value is not None and str(value).strip():
-                return str(value).strip()
+            value = read_attr(group, attribute, None)
+            if value is not None and HdfResultsProducts._decode(value).strip():
+                return HdfResultsProducts._decode(value).strip()
         return None
 
     @staticmethod
-    def _decode(value: Any) -> Any:
+    def _required_bool(value: Any, *, label: str) -> bool:
+        parsed = HdfResultsProducts._optional_bool(value, label=label)
+        if parsed is None:
+            raise ValueError(f"Required boolean metadata is absent: {label}")
+        return parsed
+
+    @staticmethod
+    def _optional_bool(value: Any, *, label: str) -> bool | None:
+        if value is None:
+            return None
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        if isinstance(value, (int, np.integer)) and int(value) in {0, 1}:
+            return bool(value)
+        text = HdfResultsProducts._decode(value).strip().casefold()
+        if text in {"true", "1", "yes"}:
+            return True
+        if text in {"false", "0", "no"}:
+            return False
+        raise ValueError(f"Unrecognized boolean metadata for {label}: {text!r}")
+
+    @staticmethod
+    def _decode(value: Any) -> str:
         if isinstance(value, (bytes, np.bytes_)):
             return value.decode("utf-8", errors="replace")
         if isinstance(value, np.ndarray) and value.size == 1:
             return HdfResultsProducts._decode(value.flat[0])
-        return value
+        return str(value)

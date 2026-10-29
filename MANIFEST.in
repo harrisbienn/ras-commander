@@ -1,10 +1,17 @@
 include ras_commander/LLM_GUIDE.md
 include CITATION.cff
+include ras_commander/fim/THIRD_PARTY_NOTICES.md
+include ras_commander/native/InvokeRas5GeometryLandCover.ps1
+include ras_commander/native/InvokeRas5LandCover.ps1
 include ras_commander/native/RasStoreMapHelper.exe
+include ras_commander/native/RasStoreMapHelper.exe.config
 include ras_commander/native/RasStoreMapHelper.cs
-include ras_commander/resources/land_classification/*.hdf
+include ras_commander/native/RasMapperTerrainExportHelper.exe
+include ras_commander/native/RasMapperTerrainExportHelper.cs
+include ras_commander/native/BuildRasMapperTerrainExportHelper.ps1
 recursive-include ras_commander/resources/templates *
 global-exclude *.py[cod]
 prune ras_commander/resources/templates/__pycache__
 recursive-include ras_commander/contracts *.schema.json
 
+include ras_commander/native/RasMetImportHelper.cs

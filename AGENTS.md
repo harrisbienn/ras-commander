@@ -52,12 +52,48 @@ This file is the canonical shared instruction contract for repository-local codi
 - Use local ignored working folders such as `working/`, `scripts/`, or `ras_agent/` at repo root for temporary outputs and extracted scripts.
 - If a `TASK.md` contains stale `C:\GH\...` paths, remap them to `G:\GH\...` before failing.
 
+## Commander Entry Points
+
+- “Just Ask for RAS Commander” routes through the shared
+  [.claude/skills/ras-commander/SKILL.md](.claude/skills/ras-commander/SKILL.md) coordinator.
+- GIS/archive work uses [.claude/skills/cloud-native-gis/SKILL.md](.claude/skills/cloud-native-gis/SKILL.md)
+  and canonical installed ras2cng/hms2cng contracts. HMS work routes to the HMS repository's shared
+  `hms-commander` skill when available.
+- Claude-native `ras-commander` and `cloud-native-gis` roles are thin adapters.
+  Codex uses shared skills and its native worker mechanisms.
+- RAS/HMS project MCP calls belong only in a bounded subagent. They are read-only text-information
+  queries with non-spatial/non-gridded outputs. The full Python APIs handle heavier or modifying work.
+- Follow installed package contracts, check released versions at setup when possible, and prefer
+  current compatible PyPI releases in authorized managed environments. Preserve user pins and
+  report updates/blockers instead of silently changing shared environments.
+
+## Defects And Contributions
+
+- When a task exposes a suspected defect or feature gap in RAS Commander, HMS Commander, or their
+  MCP servers, follow the shared
+  [.claude/skills/ras-commander-contributing/SKILL.md](.claude/skills/ras-commander-contributing/SKILL.md) workflow.
+- Protect the user's task first. Push access to the owning `gpt-cmdr` repository selects the
+  maintainer path: fix in a disposable clone, add a regression test, run the checks, and open a PR
+  without merging. Otherwise draft an issue or fork PR and submit it only with the user's approval.
+- Keep private project data out of issues, PRs, and tests. Unsupported scope is not a defect.
+
 ## RAS Commander First
 
 - Hard rule: RAS Commander rules everything around RAS. Never invoke `Ras.exe` directly from ad hoc shell commands, raw subprocess calls, one-off scripts, manual command-line probes, notebooks, tests, or agent harness glue.
 - All HEC-RAS execution, preprocessing, compute-message reading, result inspection, path resolution, and validation must go through ras-commander APIs such as `RasCmdr`, `RasControl`, `RasPlan`, `RasPrj`, `RasMap`, `Hdf*`, or focused helper modules.
 - If a useful RAS capability is only available through a manual GUI action, command-line experiment, external script, or native HEC-RAS behavior, bring that capability back into the ras-commander API layer before relying on it as a repeatable workflow.
 - If ras-commander lacks the needed API, add or repair the API rather than bypassing it.
+
+## Controlled CLB runtime qualification
+
+On 2026-09-11, the maintainer explicitly authorized accepting the HEC-RAS
+Terms and Conditions for Use for **all versions**, including legacy releases,
+when preparing controlled CLB runtime profiles and qualification hosts.
+This includes explicit acceptance through `RasTcu.accept()` for the selected
+installed version. Retain the version, runtime identity, acceptance method,
+and before/after status in external evidence. Distinguish API registry
+acceptance from clicking a vendor GUI prompt; never report an interaction
+that did not occur. Preserve source profiles and unrelated registry state.
 
 ## Open-Source Recognition
 
@@ -90,6 +126,31 @@ This file is the canonical shared instruction contract for repository-local codi
   - `uv pip install -e .`
   - `uv run python -c "import ras_commander as ras; print(ras.__version__)"`
 - HEC-RAS execution requires an installed `Ras.exe`. Pass an explicit executable path when the active environment does not already resolve one.
+
+## Short-Path Workspaces For External Models
+
+- Preflight the maximum expanded path before extracting external HEC-RAS,
+  eBFE/BLE, or similar archives. On Windows, keep HEC-RAS-active organized
+  project and run paths at or below 240 characters so HEC-RAS and legacy
+  utilities retain temporary-file headroom below `MAX_PATH`.
+- Use the caller-configured workspace root. For eBFE work, prefer
+  `RAS_COMMANDER_EBFE_ROOT`; the shared Windows-host convention is
+  `H:\Testing\eBFE\<HUC8>` with `raw/`, `organized/`, `runs/`, and `reports/`
+  beneath the study folder.
+- Do not improvise task folders directly under a drive root. If the configured
+  location is too long, choose a shorter named workspace under the approved
+  root and record the path choice in the task report.
+- Some archive member names exceed `MAX_PATH` before a destination is added.
+  Preserve those raw files through extended-length-path I/O under `raw/`, but
+  keep deeply nested supplemental reports outside the HEC-RAS-active organized
+  project tree. Do not flatten or rename source members inside the raw cache.
+- Extraction code must remain long-path safe even when the selected workspace
+  is short. Extract through a verified temporary sibling, prevent path
+  traversal, preserve archive timestamps, audit member counts, sizes, and
+  CRC32 values, and write a completion receipt before accepting the cache.
+- A non-empty extraction directory is not evidence of success. Audit legacy
+  caches before reuse, and never delete or relocate retained model data without
+  explicit approval.
 
 ## Repository Map
 
@@ -156,16 +217,45 @@ generator fails the live build — treat the docs as production.
   `/ras/version.json`. The DataFrame column contracts come from **`ras_commander/schemas.py`** — the
   single source of truth. **If you add, rename, or remove a column on `plan_df` / `geom_df` /
   `boundaries_df` / `rasmap_df` (or add a new public DataFrame), update `schemas.py` in the SAME
-  change** — there is no automated guard for column drift. Keep `__all__` accurate; the surface
+  change** — the shared schema validator checks declarations and selected live frames, not every dynamic or semantic contract. Keep `__all__` accurate; the surface
   enumerates it.
 - **Examples gallery metadata.** When adding or renaming an example notebook, run
   `.claude/scripts/generate_notebooks_metadata.py` (seeds/refreshes `examples/notebooks.yml`, the
   metadata source of truth) then `.claude/scripts/validate_notebooks_yml.py` (coverage + required
   fields are build-fatal). Curate the new entry's `summary` / `tags` / `difficulty`.
-- **Authoring voice (docs & notebooks).** Mechanics-forward: lead with *how to drive the API*; defer
-  method selection, parameter appropriateness, and regulatory / standard-of-care questions to HEC's
-  manuals and the reader's regional/agency references. Examples demonstrate mechanics on real data —
-  they are not endorsed engineering workflows.
+- **Authoring voice (docs & notebooks).** Mechanics-forward: lead with *how to drive the API*.
+  State supported library capabilities and observations confidently. Explain HEC methods with
+  relevant manual references; identify project recommendations and support them with evidence.
+  Regulatory acceptance and standard-of-care decisions depend on applicable requirements and
+  professional judgment. Examples demonstrate mechanics on real data; do not imply agency endorsement.
+
+## Technical Writing
+
+This editorial contract applies only to repository-maintained RAS Commander content and intended
+contributions. It does not govern user-created work outside the repository, even when produced
+with RAS Commander or its agents. External writing assistance follows the user’s requirements.
+
+- Follow [the concise writing guide](.claude/references/writing/technical-writing-guide.md) for authored
+  technical prose and [the extended standard](.claude/references/writing/technical-writing-standard.md)
+  for terminology, evidence, citations, and surface-specific styles.
+- HEC documentation is the primary technical source for HEC-RAS terminology, methods, controls,
+  and documented behavior. Select the relevant document/version. Library behavior comes from
+  current source, schemas, and qualification evidence; do not infer it from a HEC manual alone.
+- Speak with authority about supported RAS Commander capabilities, observations, and original
+  findings. HEC approval or citation is not required for project evidence. Match explanation to
+  the audience; distinguish established results, interpretations, recommendations, and uncertainty.
+- RAS Commander is an independent open source project that complements HEC's work. Maintain an
+  objective, respectful third-party voice without implying HEC/USACE affiliation, endorsement,
+  certification, or support.
+- Published HEC references must be passive citations and reader-activated links. Do not introduce
+  citation-driven runtime fetching, live embeds, mirrored/scraped manuals, or automated HEC contact.
+  Research browsing is permitted; separately governed software/data acquisition is unchanged.
+- Preserve technical meaning, identifiers, exact labels, numerical values, units, formulas,
+  uncertainty, and retained outputs. Explain claim scope and evidence; flag unresolved conflicts.
+- Use the shared `technical-writing-auditor` skill for requested writing reviews or scoped
+  editorial revisions. Its canonical source is
+  [.claude/skills/technical-writing-auditor/SKILL.md](.claude/skills/technical-writing-auditor/SKILL.md);
+  Codex exposure uses the existing generated bridge. A writing audit is not hydraulic approval.
 
 ## Testing And Validation
 
@@ -184,4 +274,15 @@ generator fails the live build — treat the docs as production.
 - If a change is Claude-only, keep it in `CLAUDE.md`, `.claude/rules/`, `.claude/agents/`, or `.claude/commands/` as appropriate.
 - If you change the instruction architecture, also update:
   - [docs/development/multi-harness-agent-contract.md](docs/development/multi-harness-agent-contract.md)
-  - [agent_tasks/2026-04-25_multi_harness_agent_framework_migration_plan.md](agent_tasks/2026-04-25_multi_harness_agent_framework_migration_plan.md)
+  - [portable plugin packaging guidance](.claude/plugin/README.md)
+
+## Portable Plugin Maintenance
+
+Canonical selected skills are packaged by `scripts/agent_framework/build_plugin.py` using
+`.claude/plugin/package.json`. Generated distributions contain rebased supporting references
+and source hashes; maintain the canonical sources rather than editing bundles. Read
+[plugin packaging and activation guidance](.claude/plugin/README.md) before preparing a release.
+A skills-only plugin grants no Python/runtime/project access and does not enforce client tool isolation.
+PyPI discovery automation proposes review PRs, not unattended installs or publication.
+Repository writing standards govern repository content and contributions only, including packaged
+instructions; they do not govern external user deliverables produced with these workflows.

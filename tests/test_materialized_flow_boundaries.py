@@ -6,7 +6,7 @@ import pytest
 
 from ras_commander import RasBoundaryLink, RasScenario, RasScenarioWorkspace, RasUnsteady
 from test_ras_scenario import RAS_EXE, _write_project
-from test_rasunsteady_dss_link_selectors import _write_unsteady
+from test_rasunsteady_dss_link_selectors_fork import _write_unsteady
 
 
 def _source(tmp_path, newline="\r\n", modifier="Flow Hydrograph QMult= 0.5\n"):

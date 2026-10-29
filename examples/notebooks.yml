@@ -2,7 +2,9 @@
 #
 # Seeded + refreshed by .claude/scripts/generate_notebooks_metadata.py (merge-aware: it
 # refreshes factual fields and only FILLS MISSING curation fields -- it never overwrites
-# human edits). Curate: summary, tags, difficulty, est_runtime, hec_refs, learning_paths.
+# human edits). Curate: summary, tags, difficulty, est_runtime, hec_refs, learning_paths,
+# input_families, operations, outputs, runtime_requirements, evidence_scope.
+# Functional fields are optional; absence means not curated, not unsupported.
 # Drives the gallery (generate_examples_index.py), learning paths, cross-links, llms.txt.
 notebooks:
 - id: 100_using_ras_examples
@@ -11,7 +13,9 @@ notebooks:
   series: 100
   series_name: Initialization & Execution
   summary: extract official HEC-RAS example projects
-  tags: []
+  tags:
+  - example-projects
+  - model-sources
   difficulty: beginner
   est_runtime: null
   data_project: BeaverLake
@@ -20,19 +24,20 @@ notebooks:
   - RasExamples.get_example_projects
   - RasExamples.list_categories
   - RasExamples.list_projects
-  - RasExamples.projects_dir
   hec_refs: []
   learning_paths: []
   excluded: false
   code_cells: 17
-  executed_cells: 14
+  executed_cells: 17
 - id: 101_project_initialization
   filename: 101_project_initialization.ipynb
   title: Project Initialization
   series: 100
   series_name: Initialization & Execution
   summary: initialize projects and inspect project DataFrames
-  tags: []
+  tags:
+  - project-inventory
+  - dataframes
   difficulty: beginner
   est_runtime: null
   data_project: null
@@ -40,24 +45,36 @@ notebooks:
   - RasExamples.extract_project
   - ras.boundaries_df
   - ras.geom_df
-  - ras.get_hdf_entries
   - ras.plan_df
   - ras.prj_file
   - ras.project_folder
   - ras.project_name
-  - ras.unsteady_df
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - HEC-RAS project text and associated files
+  operations:
+  - Initialize independent project objects
+  - Inspect file relationships and DataFrames
+  outputs:
+  - Project/plan/geometry/boundary inventories
+  runtime_requirements:
+  - Python; HEC-RAS installation optional for file inspection
+  evidence_scope: Inventory and path resolution do not establish that a plan can compute.
   code_cells: 19
-  executed_cells: 16
+  executed_cells: 19
 - id: 102_multiple_project_operations
   filename: 102_multiple_project_operations.ipynb
   title: Multiple Project Operations
   series: 100
   series_name: Initialization & Execution
-  summary: ''
-  tags: []
+  summary: Manage separate project objects, clone and configure plans, execute the projects concurrently,
+    and compare their execution records with explicit ras_object context.
+  tags:
+  - project-inventory
+  - execution
+  - parallel
   difficulty: beginner
   est_runtime: null
   data_project: null
@@ -74,13 +91,14 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 13
-  executed_cells: 11
+  executed_cells: 13
 - id: 103_plan_and_geometry_operations
   filename: 103_plan_and_geometry_operations.ipynb
   title: Plan and Geometry Operations
   series: 100
   series_name: Initialization & Execution
-  summary: ''
+  summary: Clone, associate, configure, and delete plan, geometry, and unsteady files; inspect project
+    metadata and compute the modified plan in a working project.
   tags:
   - geometry
   difficulty: beginner
@@ -126,14 +144,17 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 27
-  executed_cells: 25
+  executed_cells: 27
 - id: 104_plan_parameter_operations
   filename: 104_plan_parameter_operations.ipynb
   title: Plan Parameter Operations
   series: 100
   series_name: Initialization & Execution
-  summary: ''
-  tags: []
+  summary: Read and update run flags, computation/output intervals, file descriptions, and simulation
+    dates, then inspect the saved plan configuration.
+  tags:
+  - plan-authoring
+  - execution
   difficulty: beginner
   est_runtime: null
   data_project: Balde Eagle Creek
@@ -142,7 +163,6 @@ notebooks:
   - RasExamples.extract_project
   - RasPlan.get_plan_path
   - RasPlan.get_plan_value
-  - RasPlan.get_results_path
   - RasPlan.read_flow_description
   - RasPlan.read_geom_description
   - RasPlan.read_plan_description
@@ -166,7 +186,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 22
-  executed_cells: 19
+  executed_cells: 21
 - id: 110_single_plan_execution
   filename: 110_single_plan_execution.ipynb
   title: Single Plan Execution
@@ -191,15 +211,31 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - Initialized HEC-RAS project and selected plan
+  operations:
+  - Execute one plan through RasCmdr
+  - Inspect return values and computation messages
+  outputs:
+  - ComputeResult
+  - Native result and diagnostic files
+  runtime_requirements:
+  - Installed HEC-RAS release compatible with the project; notebook config selects 7.0
+  - Writable working-copy destination
+  evidence_scope: Execution and completion evidence are separate from hydraulic acceptance; inspect the
+    final result and diagnostics.
   code_cells: 15
-  executed_cells: 14
+  executed_cells: 15
 - id: 111_executing_plan_sets
   filename: 111_executing_plan_sets.ipynb
   title: Executing Plan Sets
   series: 100
   series_name: Initialization & Execution
-  summary: ''
-  tags: []
+  summary: Select explicit or metadata-filtered plan sets and execute them sequentially in a test copy,
+    including plans that lack retained HDF results.
+  tags:
+  - execution
+  - plan-selection
   difficulty: beginner
   est_runtime: null
   data_project: Balde Eagle Creek
@@ -214,13 +250,14 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 8
-  executed_cells: 6
+  executed_cells: 8
 - id: 112_sequential_plan_execution
   filename: 112_sequential_plan_execution.ipynb
   title: Sequential Plan Execution
   series: 100
   series_name: Initialization & Execution
-  summary: ''
+  summary: Run dependent plans sequentially with compute_test_mode, inspect the copied project, and summarize
+    per-plan execution outcomes.
   tags:
   - execution
   difficulty: beginner
@@ -237,7 +274,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 11
-  executed_cells: 9
+  executed_cells: 11
 - id: 113_parallel_execution
   filename: 113_parallel_execution.ipynb
   title: Parallel Execution
@@ -257,7 +294,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 10
-  executed_cells: 9
+  executed_cells: 10
 - id: 114_parameter_permutation
   filename: 114_parameter_permutation.ipynb
   title: Parameter Permutation Sweeps with RasPermutation
@@ -292,7 +329,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 9
-  executed_cells: 8
+  executed_cells: 9
 - id: 115_real_time_execution_monitoring
   filename: 115_real_time_execution_monitoring.ipynb
   title: Real-Time Execution Monitoring with Callbacks
@@ -313,7 +350,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 7
-  executed_cells: 6
+  executed_cells: 7
 - id: 116_hdf_output_options_benchmark
   filename: 116_hdf_output_options_benchmark.ipynb
   title: HDF Output Options Read Benchmark
@@ -353,15 +390,14 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 15
-  executed_cells: 12
+  executed_cells: 15
 - id: 117_monte_carlo_uncertainty
   filename: 117_monte_carlo_uncertainty.ipynb
-  title: Monte Carlo Uncertainty Analysis (Hardened API)
+  title: Monte Carlo Preparation and Ensemble Workflow
   series: 100
   series_name: Initialization & Execution
-  summary: This notebook demonstrates Monte Carlo uncertainty quantification for HEC-RAS hydraulic models
-    using the **hardened** `RasMonteCarlo` public API. The workflow generates parameter samples from user-defined
-    distributions, runs an ensemble...
+  summary: Inspect a real model and generate parameter samples; retain an unexecuted ensemble recipe with
+    explicit convergence and failure-handling requirements.
   tags:
   - sensitivity
   difficulty: beginner
@@ -384,42 +420,48 @@ notebooks:
   - RasMonteCarlo.status_histogram
   - RasPermutation.discover_batch_folders
   - RasPlan.get_geom_path
-  - ras.boundaries_df
   - ras.plan_df
   hec_refs: []
   learning_paths: []
   excluded: false
+  evidence_scope: Saved outputs demonstrate model inspection and sampling only; no hydraulic ensemble
+    or uncertainty estimate was computed.
   code_cells: 16
-  executed_cells: 14
+  executed_cells: 4
 - id: 120_automating_ras_with_win32com
   filename: 120_automating_ras_with_win32com.ipynb
   title: Win32COM Automation
   series: 100
   series_name: Initialization & Execution
-  summary: ''
-  tags: []
+  summary: Demonstrate Windows HEC-RAS GUI automation helpers for dialogs, RAS Mapper, and stored-map
+    workflows that require an interactive desktop.
+  tags:
+  - windows
+  - gui
+  - rasmapper
   difficulty: beginner
   est_runtime: null
   data_project: null
   functions_used:
   - RasExamples.extract_project
-  - RasGuiAutomation.handle_already_running_dialog
-  - RasGuiAutomation.open_rasmapper
-  - RasGuiAutomation.run_unsteady_gui
-  - RasMap.postprocess_stored_maps
   - ras.prj_file
   hec_refs: []
   learning_paths: []
   excluded: false
   code_cells: 11
-  executed_cells: 10
+  executed_cells: 11
 - id: 121_legacy_hecrascontroller_and_rascontrol
   filename: 121_legacy_hecrascontroller_and_rascontrol.ipynb
   title: HECRASController Profiles
   series: 100
   series_name: Initialization & Execution
-  summary: ''
-  tags: []
+  summary: Use the Windows HECRASController through RasControl to execute configured legacy plans and
+    extract steady profiles or unsteady time series.
+  tags:
+  - windows
+  - com
+  - legacy
+  - results
   difficulty: beginner
   est_runtime: null
   data_project: Balde Eagle Creek
@@ -444,7 +486,8 @@ notebooks:
   title: RASMapper Spatial Review
   series: 100
   series_name: Initialization & Execution
-  summary: ''
+  summary: Inspect RAS Mapper layer inventories, control map views and visibility, and capture screenshots
+    and spatial review packages.
   tags:
   - rasmapper
   difficulty: beginner
@@ -478,17 +521,19 @@ notebooks:
   - RasMap.set_terrain_layer_visibility
   - RasMap.set_update_legend_with_view
   - RasMap.zoom_to_geometry_layer
+  - RasPrj.find_ras_prj
   hec_refs: []
   learning_paths: []
   excluded: false
   code_cells: 18
-  executed_cells: 17
+  executed_cells: 16
 - id: 123_rasmapper_geometry_layer_updates
   filename: 123_rasmapper_geometry_layer_updates.ipynb
   title: RASMapper Geometry Layer Updates
   series: 100
   series_name: Initialization & Execution
-  summary: ''
+  summary: Apply selected native RAS Mapper geometry-layer commands across real example projects and inspect
+    updated cross sections, structures, and storage curves.
   tags:
   - geometry
   - rasmapper
@@ -508,18 +553,18 @@ notebooks:
   - RasPlan.set_shortid
   - RasPlan.update_plan_description
   - RasPlan.update_run_flags
-  - ras.exe
   hec_refs: []
   learning_paths: []
   excluded: false
   code_cells: 30
-  executed_cells: 28
+  executed_cells: 30
 - id: 124_rasmapper_bank_lines
   filename: 124_rasmapper_bank_lines.ipynb
   title: RASMapper Bank Lines
   series: 100
   series_name: Initialization & Execution
-  summary: ''
+  summary: Generate RAS Mapper bank lines from cross-section bank stations through a supervised Windows
+    GUI workflow.
   tags:
   - rasmapper
   difficulty: beginner
@@ -528,12 +573,11 @@ notebooks:
   functions_used:
   - RasExamples.extract_project
   - RasMapperBankLineWorkflow.create_bank_lines_from_xs_bank_stations
-  - ras.exe
   hec_refs: []
   learning_paths: []
   excluded: false
   code_cells: 6
-  executed_cells: 4
+  executed_cells: 6
 - id: 125_rasmapper_stored_maps_arrival_duration
   filename: 125_rasmapper_stored_maps_arrival_duration.ipynb
   title: 'RASMapper Stored Maps: Arrival Time, Duration, and Percent Time Inundated'
@@ -598,7 +642,6 @@ notebooks:
   functions_used:
   - GeomCrossSection.get_cross_sections
   - GeomCrossSection.get_station_elevation
-  - GeomCrossSection.set_station_elevation
   - GeomLateral.get_lateral_structures
   - GeomLateral.get_weir_profile
   - HdfHydraulicTables.get_all_xs_htabs
@@ -612,7 +655,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 25
-  executed_cells: 23
+  executed_cells: 25
 - id: 202_2d_plaintext_geometry
   filename: 202_2d_plaintext_geometry.ipynb
   title: 2D Geometry File Parsing
@@ -644,7 +687,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 20
-  executed_cells: 19
+  executed_cells: 20
 - id: 203_htab_parameter_optimization
   filename: 203_htab_parameter_optimization.ipynb
   title: HTAB Parameter Optimization for Model Stability
@@ -684,13 +727,14 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 28
-  executed_cells: 27
+  executed_cells: 28
 - id: 204_culvert_gis_validation
   filename: 204_culvert_gis_validation.ipynb
   title: Culvert GIS Reconstruction and Hydraulic-Validity Checks (1D)
   series: 200
   series_name: Geometry & Calibration
-  summary: ''
+  summary: Reconstruct 1D culvert barrel locations from geometry, screen invert placement, and compare
+    a pipe-to-box retrofit using computed steady profiles.
   tags:
   - 1d
   difficulty: intermediate
@@ -702,7 +746,6 @@ notebooks:
   - GeomCulvert.get_adjacent_cross_sections
   - GeomCulvert.get_all
   - GeomCulvert.get_culverts
-  - GeomCulvertGIS.INVERT_TOLERANCE
   - GeomCulvertGIS.reconstruct_barrels
   - GeomCulvertGIS.validate_placement
   - HdfResultsPlan.get_steady_wse
@@ -712,7 +755,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 14
-  executed_cells: 13
+  executed_cells: 14
 - id: 205_extract_xs_xyz_from_geometry
   filename: 205_extract_xs_xyz_from_geometry.ipynb
   title: Extract Cross Section XYZ Coordinates from Plain Text Geometry
@@ -767,17 +810,20 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 18
-  executed_cells: 17
+  executed_cells: 18
 - id: 207_reference_lines_and_points
   filename: 207_reference_lines_and_points.ipynb
   title: Reference Lines and Points for 2D Calibration
   series: 200
   series_name: Geometry & Calibration
-  summary: This notebook demonstrates `GeomReferenceFeatures` — inserting and reading reference lines
-    and reference points in HEC-RAS plain text geometry files.
+  summary: Author native reference lines and points, compute a one-day copied plan, and read recorded
+    HDF output.
   tags:
   - 2d
   - calibration
+  - reference-lines
+  - reference-points
+  - geometry
   difficulty: intermediate
   est_runtime: null
   data_project: BaldEagleCrkMulti2D
@@ -786,13 +832,36 @@ notebooks:
   - GeomReferenceFeatures.add_reference_points
   - GeomReferenceFeatures.get_reference_lines
   - GeomReferenceFeatures.get_reference_points
+  - HdfBndry.get_reference_points
+  - HdfMesh.get_mesh_cell_polygons
+  - HdfResultsXsec.get_ref_lines_timeseries
+  - HdfResultsXsec.get_ref_points_timeseries
+  - RasCmdr.compute_plan
   - RasExamples.extract_project
-  - ras.geom_df
+  - RasExamples.get_example_projects
+  - RasPlan.set_hdf_output_variable
+  - RasPlan.update_simulation_date
+  - ras.plan_df
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - Working geometry text
+  - Named line and point coordinates in model CRS
+  operations:
+  - Write reference locations
+  - Read geometry text back
+  - Compute copied plan and inspect native HDF results
+  outputs:
+  - Updated geometry text
+  - Reference location inventories
+  - Native point geometry and recorded time series
+  runtime_requirements:
+  - Installed HEC-RAS 6.6; RasCmdr computes a separate one-day destination
+  evidence_scope: Fresh HEC-RAS 6.6 computation with native point geometry and recorded point/line series;
+    not hydraulic acceptance.
   code_cells: 6
-  executed_cells: 5
+  executed_cells: 6
 - id: 208_bridge_method_comparison
   filename: 208_bridge_method_comparison.ipynb
   title: Bridge Method Comparison
@@ -800,7 +869,10 @@ notebooks:
   series_name: Geometry & Calibration
   summary: Compare bridge hydraulic method selections with a real HEC-RAS bridge example and show the
     effect on computed WSE.
-  tags: []
+  tags:
+  - bridges
+  - hydraulic-methods
+  - sensitivity
   difficulty: intermediate
   est_runtime: null
   data_project: null
@@ -815,23 +887,24 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 10
-  executed_cells: 9
+  executed_cells: 10
 - id: 209_culvert_authoring
   filename: 209_culvert_authoring.ipynb
   title: Culvert Authoring
   series: 200
   series_name: Geometry & Calibration
-  summary: ''
-  tags: []
+  summary: Write taxonomy-checked culvert records and adjacent ineffective-flow areas, inspect spatial
+    placement, and compute an edited plan for result review.
+  tags:
+  - culverts
+  - geometry
+  - authoring
   difficulty: intermediate
   est_runtime: null
   data_project: null
   functions_used:
   - GeomCrossSection.get_ineffective_flow
   - GeomCrossSection.get_xs_coords
-  - GeomCulvert.CULVERT_TAXONOMY_SHAPES
-  - GeomCulvert.MAX_CULVERT_GROUPS_PER_CROSSING
-  - GeomCulvert.MAX_IDENTICAL_BARRELS_PER_GROUP
   - GeomCulvert.get_adjacent_cross_sections
   - GeomCulvert.get_all
   - GeomCulvert.get_culverts
@@ -846,19 +919,22 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 14
-  executed_cells: 13
+  executed_cells: 14
 - id: 210_xs_interpolation_settings
   filename: 210_xs_interpolation_settings.ipynb
   title: Cross-Section Interpolation Settings
   series: 200
   series_name: Geometry & Calibration
-  summary: ''
-  tags: []
+  summary: Interpolate cross sections and update bank stations, station/elevation arrays, and expansion/contraction
+    coefficients in an example geometry.
+  tags:
+  - cross-sections
+  - geometry
+  - interpolation
   difficulty: intermediate
   est_runtime: null
   data_project: null
   functions_used:
-  - GeomCrossSection.MAX_XS_POINTS
   - GeomCrossSection.get_bank_stations
   - GeomCrossSection.get_cross_sections
   - GeomCrossSection.get_expansion_contraction
@@ -905,13 +981,15 @@ notebooks:
   executed_cells: 9
 - id: 212_landcover_mannings_n_write
   filename: 212_landcover_mannings_n_write.ipynb
-  title: NLCD Land Cover Layer Authoring for RASMapper
+  title: Native NLCD Land Cover Authoring and Controlled Manning Validation
   series: 200
   series_name: Geometry & Calibration
-  summary: Create a RASMapper land-cover sidecar HDF from an NLCD-coded raster, register it in `.rasmap`,
-    write the authoritative base Manning's n table to the plain-text geometry file, and associate the
-    compiled geometry HDF with the new layer.
+  summary: Author matching NLCD land-cover layers through native RASMapper APIs, change exactly two Manning
+    classes, recompute and solve both projects, and validate final cell, face, WSE, and breach responses
+    with explicit active-cell and regenerated-key accounting.
   tags:
+  - 2d
+  - calibration
   - rasmapper
   difficulty: intermediate
   est_runtime: null
@@ -921,51 +999,99 @@ notebooks:
   - GeomLandCover.replace_base_mannings_n
   - GeomStorage.get_2d_flow_area_settings
   - GeomStorage.set_2d_flow_area_settings
+  - HdfBndry.get_bc_lines
+  - HdfBndry.get_breaklines
+  - HdfLandCover.audit_final_mannings_n
   - HdfLandCover.get_landcover_raster_map
   - HdfLandCover.get_preprocessed_mannings_n
+  - HdfLandCover.set_landcover_mannings_n
+  - HdfMesh.get_mesh_areas
+  - HdfMesh.get_mesh_cell_points
+  - HdfMesh.get_mesh_cell_polygons
+  - HdfMesh.get_mesh_face_property_tables
+  - HdfResultsBreach.get_breach_summary
+  - HdfResultsMesh.get_mesh_max_ws
+  - HdfStruc.get_structures
   - RasCmdr.compute_plan
   - RasExamples.extract_project
+  - RasExamples.get_example_projects
   - RasMap.add_landcover_layer
   - RasMap.associate_geometry_layers
+  - RasMap.get_geometry_layer_bounds
   - RasMap.get_hdf_geometry_association
   - RasMap.list_landcover_layers
   - RasMap.list_terrain_layers
-  - ras.geom_df
-  - ras.plan_df
+  - RasMap.recompute_property_tables
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 9
-  executed_cells: 8
+  input_families:
+  - Copied 2D projects
+  - NLCD classes and geometry land-cover associations
+  operations:
+  - Author native land-cover sidecars
+  - Modify selected Manning classes
+  - Recompute and compare final values
+  outputs:
+  - Authored sidecars and geometry overrides
+  - Cell/face roughness, WSE, and breach comparisons
+  runtime_requirements:
+  - Windows native RASMapper dependencies and HEC-RAS; notebook config selects 7.0
+  - NLCD data and writable project copies
+  evidence_scope: The notebook retains controlled authoring and response comparisons for its selected
+    models/classes; they do not qualify every land-cover or runtime combination.
+  code_cells: 11
+  executed_cells: 11
 - id: 213_land_classification_polygon_authoring
   filename: 213_land_classification_polygon_authoring.ipynb
-  title: Land Classification Polygon Authoring
+  title: Native Land Classification Polygon Authoring
   series: 200
   series_name: Geometry & Calibration
-  summary: When editing ras-commander locally, run this notebook from the repository root with `PYTHONPATH`
-    set to that root before launching Jupyter or `nbconvert`. Restore this pip-mode import cell before
-    committing.
-  tags: []
+  summary: Add, update, list, and delete existing-class land-cover polygons through native RASMapper,
+    reject unsupported multipart and interior-ring inputs before mutation, and verify final Manning, WSE,
+    association, backup, and breach behavior.
+  tags:
+  - 2d
+  - rasmapper
   difficulty: intermediate
   est_runtime: null
-  data_project: null
+  data_project: BaldEagleCrkMulti2D
   functions_used:
-  - HdfLandCover.get_classification_polygons
-  - HdfLandCover.get_landcover_association
+  - GeomLandCover.get_base_mannings_n
+  - GeomLandCover.get_region_mannings_n
+  - GeomLateral.get_connection_line_coords
+  - HdfBase.get_projection
+  - HdfBndry.get_bc_lines
+  - HdfLandCover.audit_final_mannings_n
   - HdfLandCover.get_landcover_raster_map
   - HdfLandCover.get_preprocessed_mannings_n
+  - HdfMesh.get_mesh_cell_points
+  - HdfMesh.get_mesh_cell_polygons
+  - HdfMesh.get_mesh_face_property_tables
+  - HdfPlan.get_plan_information
+  - HdfResultsBreach.get_breach_summary
+  - HdfResultsBreach.get_breach_timeseries
+  - HdfResultsMesh.get_mesh_max_ws
+  - HdfResultsPlan.get_unsteady_info
+  - HdfResultsPlan.get_unsteady_summary
   - RasCmdr.compute_plan
   - RasExamples.extract_project
+  - RasExamples.get_example_projects
   - RasMap.add_land_classification_polygon
   - RasMap.associate_geometry_layers
+  - RasMap.delete_land_classification_polygon
+  - RasMap.get_hdf_geometry_association
+  - RasMap.list_infiltration_layers
+  - RasMap.list_land_classification_polygons
   - RasMap.list_landcover_layers
-  - RasPlan.get_plan_path
-  - RasPlan.set_geom_preprocessor
+  - RasMap.list_terrain_layers
+  - RasMap.recompute_property_tables
+  - RasMap.update_land_classification_polygon
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 9
-  executed_cells: 8
+  code_cells: 10
+  executed_cells: 10
 - id: 214_connection_authoring
   filename: 214_connection_authoring.ipynb
   title: SA/2D Connection Authoring
@@ -999,7 +1125,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 17
-  executed_cells: 16
+  executed_cells: 17
 - id: 215_sa2d_bridge_connection_authoring
   filename: 215_sa2d_bridge_connection_authoring.ipynb
   title: SA/2D Bridge Connection Authoring
@@ -1029,13 +1155,14 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 15
-  executed_cells: 14
+  executed_cells: 15
 - id: 216_1d_bridge_authoring
   filename: 216_1d_bridge_authoring.ipynb
   title: 1D Bridge Authoring
   series: 200
   series_name: Geometry & Calibration
-  summary: ''
+  summary: Author bridge decks, piers, abutments, coefficients, approach sections, and HTAB settings;
+    read back the geometry and inspect computed messages/results.
   tags:
   - 1d
   difficulty: intermediate
@@ -1068,7 +1195,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 10
-  executed_cells: 9
+  executed_cells: 10
 - id: 217_1d_levee_authoring
   filename: 217_1d_levee_authoring.ipynb
   title: 1D Cross-Section Levee Authoring
@@ -1098,28 +1225,42 @@ notebooks:
   executed_cells: 14
 - id: 218_infiltration_base_override_authoring
   filename: 218_infiltration_base_override_authoring.ipynb
-  title: Infiltration Base Override Authoring
+  title: Native Infiltration Base and Region Override Authoring
   series: 200
   series_name: Geometry & Calibration
-  summary: Programmatically create and modify SCS Curve Number infiltration overrides in HEC-RAS geometry
-    HDF files — no GUI required. Demonstrates `HdfInfiltration.create_infiltration_group()` and `HdfInfiltration.set_infiltration_baseoverrides()`.
+  summary: Create native infiltration override regions, edit geometry-wide Base Overrides and one named
+    regional parameter table through RASMapper, then verify spatial attribution in final geometry and
+    plan infiltration arrays and hydraulic results.
   tags:
+  - 2d
   - infiltration
+  - rasmapper
   difficulty: intermediate
   est_runtime: null
   data_project: BaldEagleCrkMulti2D
   functions_used:
-  - HdfInfiltration.SOIL_GROUPS
-  - HdfInfiltration.create_infiltration_group
+  - HdfInfiltration.create_infiltration_override_regions
   - HdfInfiltration.get_infiltration_baseoverrides
-  - HdfInfiltration.set_infiltration_baseoverrides
+  - HdfInfiltration.get_infiltration_calibration_regions
+  - HdfInfiltration.get_infiltration_region_names
+  - HdfInfiltration.get_infiltration_region_overrides
+  - HdfInfiltration.get_infiltration_region_polygons
+  - HdfInfiltration.get_preprocessed_infiltration
+  - HdfInfiltration.set_infiltration_base_overrides
+  - HdfInfiltration.set_infiltration_region_overrides
+  - HdfMesh.get_mesh_cell_points
+  - HdfMesh.get_mesh_cell_polygons
+  - HdfResultsMesh.get_mesh_max_ws
+  - HdfResultsMesh.get_mesh_timeseries
+  - RasCmdr.compute_plan
   - RasExamples.extract_project
-  - ras.geom_df
+  - RasExamples.get_example_projects
+  - RasMap.recompute_property_tables
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 13
-  executed_cells: 12
+  code_cells: 10
+  executed_cells: 10
 - id: 219_1d_bridge_xs_plotting
   filename: 219_1d_bridge_xs_plotting.ipynb
   title: 1D Bridge Cross-Section Plotting with Deck/Pier Overlay
@@ -1141,7 +1282,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 8
-  executed_cells: 6
+  executed_cells: 8
 - id: 220_calibration_workflow
   filename: 220_calibration_workflow.ipynb
   title: Manning's n Calibration with RasCalibrate
@@ -1161,11 +1302,9 @@ notebooks:
   - HdfProject.get_project_crs
   - HdfResultsPlan.get_runtime_data
   - RasCalibrate.compute_objective
-  - RasCalibrate.evaluate_multi_event
   - RasCalibrate.extract_modeled
   - RasCalibrate.grid_search
   - RasCalibrate.make_mannings_apply_fn
-  - RasCalibrate.optimize
   - RasMap.list_landcover_layers
   - RasMap.list_terrain_layers
   - ras.geom_df
@@ -1173,8 +1312,24 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - Real 2D model
+  - Declared observation or synthetic-target dataset
+  - Parameter bounds
+  operations:
+  - Evaluate objectives
+  - Search Manning parameters
+  - Compare event diagnostics
+  outputs:
+  - Objective values and parameter candidates
+  - Modeled/target comparisons
+  runtime_requirements:
+  - Scientific Python stack
+  - Installed HEC-RAS required when RUN_HECRAS is enabled; configured default 6.6
+  evidence_scope: The execution switch and target provenance determine what a run establishes. Synthetic
+    targets demonstrate estimation mechanics, not observational validation.
   code_cells: 23
-  executed_cells: 22
+  executed_cells: 23
 - id: 221_calibration_1d_workflow
   filename: 221_calibration_1d_workflow.ipynb
   title: 1D Manning's N Calibration Workflow
@@ -1195,7 +1350,6 @@ notebooks:
   - RasCmdr.compute_plan
   - RasExamples.extract_project
   - RasPermutation.define_parameters
-  - RasUsgsCore.get_discharge
   - ras.geom_df
   - ras.plan_df
   hec_refs: []
@@ -1208,7 +1362,8 @@ notebooks:
   title: Steady Flow Calibration
   series: 200
   series_name: Geometry & Calibration
-  summary: ''
+  summary: Demonstrate steady-flow Manning roughness estimation against a synthetic observed WSE profile;
+    inspect objective values without treating the target as field validation.
   tags:
   - calibration
   - steady
@@ -1228,46 +1383,14 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 12
-  executed_cells: 11
-- id: 223_steady_floodway_encroachment
-  filename: 223_steady_floodway_encroachment.ipynb
-  title: Steady Floodway Encroachment
-  series: 200
-  series_name: Geometry & Calibration
-  summary: ''
-  tags:
-  - floodway
-  - steady
-  difficulty: intermediate
-  est_runtime: null
-  data_project: null
-  functions_used:
-  - HdfResultsPlan.get_steady_results
-  - HdfXsec.get_cross_sections
-  - HdfXsec.get_river_bank_lines
-  - HdfXsec.get_river_centerlines
-  - RasCmdr.compute_plan
-  - RasExamples.extract_project
-  - RasFloodway.check_floodway
-  - RasFloodway.create_method_4_trial_profiles
-  - RasFloodway.create_method_5_trial_profiles
-  - RasFloodway.parse_encroachments
-  - RasFloodway.set_encroachments
-  - RasPlan.clone_plan
-  - RasPlan.clone_steady
-  - RasPlan.get_plan_title
-  - RasPlan.set_steady
-  hec_refs: []
-  learning_paths: []
-  excluded: false
-  code_cells: 12
-  executed_cells: 10
+  executed_cells: 12
 - id: 224_steady_flow_authoring
   filename: 224_steady_flow_authoring.ipynb
   title: Steady Flow Authoring
   series: 200
   series_name: Geometry & Calibration
-  summary: ''
+  summary: Create, read, and update steady-flow files with profile discharges and typed boundary conditions,
+    then inspect HEC-RAS execution messages.
   tags:
   - steady
   difficulty: intermediate
@@ -1289,8 +1412,23 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - Real steady-flow project
+  - Profile discharges and typed downstream boundaries
+  operations:
+  - Create and update steady-flow files
+  - Read back authored records
+  - Compute and inspect messages
+  outputs:
+  - Steady-flow files and linked plan inputs
+  - Readback and execution diagnostics
+  runtime_requirements:
+  - Python for text authoring
+  - Installed HEC-RAS for the notebook computation stage
+  evidence_scope: Text roundtrip and native computation are distinct checks; this example does not qualify
+    floodway encroachment authoring.
   code_cells: 5
-  executed_cells: 3
+  executed_cells: 5
 - id: 225_fixit_blocked_obstructions
   filename: 225_fixit_blocked_obstructions.ipynb
   title: Fixing Blocked Obstruction Overlaps with RasFixit
@@ -1298,7 +1436,10 @@ notebooks:
   series_name: Geometry & Calibration
   summary: This notebook demonstrates using the `RasFixit` module to automatically detect and repair overlapping
     blocked obstructions in HEC-RAS geometry files.
-  tags: []
+  tags:
+  - geometry
+  - repair
+  - blocked-obstructions
   difficulty: intermediate
   est_runtime: null
   data_project: null
@@ -1313,13 +1454,14 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 20
-  executed_cells: 18
+  executed_cells: 20
 - id: 226_2d_connection_culvert_invert_validation
   filename: 226_2d_connection_culvert_invert_validation.ipynb
   title: 2D Connection Culvert Invert Validation (Terrain Cell Minimum)
   series: 200
   series_name: Geometry & Calibration
-  summary: ''
+  summary: Compare proposed and authored SA/2D culvert inverts with terrain-derived mesh-cell minima and
+    visualize placement along the connection.
   tags:
   - 2d
   - terrain
@@ -1337,13 +1479,14 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 11
-  executed_cells: 10
+  executed_cells: 11
 - id: 227_2d_connection_culvert_authoring
   filename: 227_2d_connection_culvert_authoring.ipynb
   title: Authoring a 2D Connection Culvert (`Connection Culv=`)
   series: 200
   series_name: Geometry & Calibration
-  summary: ''
+  summary: Author a culvert in a previously weir-only SA/2D connection, read back Connection Culv records,
+    and review placement and native acceptance.
   tags:
   - 2d
   difficulty: intermediate
@@ -1362,7 +1505,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 8
-  executed_cells: 7
+  executed_cells: 8
 - id: 228_mannings_n_from_nlcd
   filename: 228_mannings_n_from_nlcd.ipynb
   title: Manning's n from NLCD Validation
@@ -1371,7 +1514,10 @@ notebooks:
   summary: Validate `ManningsFromLandCover` on the real `BaldEagleCrkMulti2D` RasExamples project. The
     workflow compares the existing 1D geometry Manning's n blocks against automated NLCD-derived horizontal
     variation, checks the project RAS Mapper...
-  tags: []
+  tags:
+  - roughness
+  - land-cover
+  - cross-sections
   difficulty: intermediate
   est_runtime: null
   data_project: BaldEagleCrkMulti2D
@@ -1387,7 +1533,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 9
-  executed_cells: 8
+  executed_cells: 9
 - id: 229_model_extent_polygons
   filename: 229_model_extent_polygons.ipynb
   title: Model Extent Polygons (1D, 2D, and Overall Footprints)
@@ -1458,17 +1604,23 @@ notebooks:
   executed_cells: 13
 - id: 231_pipe_network_mesh_generation
   filename: 231_pipe_network_mesh_generation.ipynb
-  title: Pipe Network Mesh Generation
+  title: 'Headless Mesh Generation: Pipe Networks and Refinement Regions'
   series: 200
   series_name: Geometry & Calibration
-  summary: 'This notebook demonstrates headless mesh generation on a project with **pipe networks**. The
-    Davis example project (HEC-RAS Pipes beta) contains:'
-  tags: []
+  summary: Headlessly regenerate a pipe-connected Davis mesh, then author and visually verify a 40-foot
+    refinement region on the Chippewa 2D fixture.
+  tags:
+  - 2d
+  - mesh
+  - refinement-regions
+  - pipes
   difficulty: intermediate
   est_runtime: null
-  data_project: null
+  data_project: Chippewa_2D
   functions_used:
+  - GeomMesh.add_refinement_region
   - GeomMesh.generate
+  - GeomMesh.get_refinement_regions
   - HdfMesh.get_mesh_areas
   - HdfMesh.get_mesh_cell_polygons
   - HdfPipe.get_pipe_conduits
@@ -1481,8 +1633,8 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 13
-  executed_cells: 13
+  code_cells: 14
+  executed_cells: 14
 - id: 232_weise_2d_sediment_mesh_sensitivity
   filename: 232_weise_2d_sediment_mesh_sensitivity.ipynb
   title: '2D Mesh Cell-Size Sensitivity for Sediment Transport - Second Case: Weise Flume'
@@ -1516,27 +1668,46 @@ notebooks:
   executed_cells: 8
 - id: 233_mannings_region_polygon_authoring
   filename: 233_mannings_region_polygon_authoring.ipynb
-  title: Manning's n Region Polygon Authoring
+  title: Manning's n Region Polygon Authoring and Solver Validation
   series: 200
   series_name: Geometry & Calibration
-  summary: This workflow writes Manning's n calibration region polygons to the plain-text HEC-RAS geometry
-    file with `GeomLandCover.set_mannings_region_polygons()` and checks the paired regional Manning's
-    n table remains readable.
-  tags: []
-  difficulty: intermediate
-  est_runtime: null
+  summary: Author a regional Manning's n polygon on the real Muncie fixture, explicitly associate terrain
+    and land cover, validate the temporary and final plan HDF cell values, and visually confirm solver
+    propagation.
+  tags:
+  - 2d
+  - mannings-n
+  - land-cover
+  - rasmapper
+  - preprocessing
+  - validation
+  difficulty: advanced
+  est_runtime: 1 min
   data_project: Muncie
   functions_used:
   - GeomLandCover.get_region_mannings_n
   - GeomLandCover.set_mannings_region_polygons
+  - GeomLandCover.set_region_mannings_n
+  - GeomMesh.compute_property_tables
+  - HdfLandCover.audit_final_mannings_n
+  - HdfLandCover.get_mannings_region_cell_mapping
   - HdfLandCover.get_mannings_region_polygons
+  - HdfLandCover.get_preprocessed_mannings_n
   - HdfMesh.get_mesh_areas
+  - HdfMesh.get_mesh_cell_points
+  - RasCmdr.compute_plan
   - RasExamples.extract_project
+  - RasMap.list_geometry_associations
+  - RasMap.set_geometry_association
+  - RasMap.validate_geometry_associations
+  - RasPlan.get_plan_path
+  - RasPlan.update_run_flags
+  - RasPreprocess.preprocess_plan
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 3
-  executed_cells: 3
+  code_cells: 7
+  executed_cells: 7
 - id: 234_rasmapper_geometry_completion
   filename: 234_rasmapper_geometry_completion.ipynb
   title: Headless RASMapper Geometry Completion (Edge Lines, Interpolation Surface, Flow Paths)
@@ -1569,18 +1740,162 @@ notebooks:
   excluded: false
   code_cells: 8
   executed_cells: 8
+- id: 235_1d_breakout_model
+  filename: 235_1d_breakout_model.ipynb
+  title: Clip a Texas FEMA eBFE Model to One NWM Reach
+  series: 200
+  series_name: Geometry & Calibration
+  summary: Classify real NOAA NWM v3 reaches against the Shiloh Branch eBFE footprint, retain 10% upstream
+    and 25% downstream hydraulic buffers around feature 5790868, rasterize a stricter one-cross-section-overlap
+    export domain, and compare the independent breakout to the source model.
+  tags:
+  - 1d
+  - steady
+  - breakout
+  - ebfe
+  - nwm
+  - conflation
+  - raster
+  - boundary-effects
+  - validation
+  difficulty: advanced
+  est_runtime: 1 min
+  data_project: null
+  functions_used:
+  - GeomParser.get_river_centerlines
+  - GeomParser.get_xs_cut_lines
+  - HdfProject.get_project_extent
+  - HdfResultsPlan.get_compute_messages_hdf_only
+  - HdfXsec.get_cross_sections
+  - HdfXsec.get_xs_interpolation_surface
+  - RasBreakout1D.compare_geometry
+  - RasBreakout1D.compare_results
+  - RasBreakout1D.extract_selection
+  - RasBreakout1D.run
+  - RasBreakout1D.select_domains_by_network_edge
+  - RasCmdr.compute_plan
+  - RasNetworkConflation.classify_edges
+  hec_refs: []
+  learning_paths: []
+  excluded: false
+  input_families:
+  - Real 1D source project
+  - NOAA NWM edge and selected hydraulic/export domains
+  operations:
+  - Select a reach slice
+  - Assemble an independent breakout
+  - Compare retained geometry and results
+  outputs:
+  - Standalone HEC-RAS project
+  - Selection provenance and comparison evidence
+  runtime_requirements:
+  - Source eBFE model and NWM network data
+  - Windows/native geometry dependencies and HEC-RAS; notebook config selects 7.0
+  evidence_scope: Checks apply to the selected Shiloh Branch edge and retained sections; domain and boundary
+    adequacy require review for a new extraction.
+  code_cells: 9
+  executed_cells: 0
+- id: 236_multi_model_1d_breakout_planning
+  filename: 236_multi_model_1d_breakout_planning.ipynb
+  title: Build a Texas FEMA eBFE Breakout from Adjacent Main-Stem Models
+  series: 200
+  series_name: Geometry & Calibration
+  summary: Catalog and join two adjacent Walnut Creek FEMA eBFE main-stem projects for NOAA NWM feature
+    5790954, write an independent restationed HEC-RAS project, retain source-block provenance, and visually
+    verify the centerline seam, computational/export domains, two-pass flow-path finalization, inherited
+    geometry diagnostics, and retained-section hydraulic response against both original plans.
+  tags:
+  - 1d
+  - steady
+  - breakout
+  - ebfe
+  - nwm
+  - conflation
+  - multi-model
+  - geoparquet
+  - validation
+  difficulty: advanced
+  est_runtime: 50 s
+  data_project: null
+  functions_used:
+  - GeomCrossSection.get_cross_sections
+  - GeomParser.get_river_centerlines
+  - HdfResultsPlan.get_compute_messages
+  - HdfResultsPlan.get_steady_results
+  - RasBreakout1D.assemble_network_edge
+  - RasBreakout1D.catalog_sources
+  - RasBreakout1D.extract_selection
+  - RasBreakout1D.plan_network_edge
+  - RasBreakout1D.run
+  - RasBreakout1D.select_by_stations
+  - RasCmdr.compute_plan
+  - RasGeometryCompute.assess_flow_path_policy
+  - RasGeometryCompute.audit_main_channel_lengths
+  - RasGeometryCompute.validate_geometry
+  hec_refs: []
+  learning_paths: []
+  excluded: false
+  code_cells: 14
+  executed_cells: 14
+- id: 237_hydraulic_subdomain_breakout
+  filename: 237_hydraulic_subdomain_breakout.ipynb
+  title: 'Hydraulic subdomains: split a rain-on-grid parent at normal-depth locations'
+  series: 200
+  series_name: Geometry & Calibration
+  summary: In the delivered HEC-RAS 6.4.1, delineate TauDEM stream links on the FEMA eBFE Salt Draw terrain,
+    find normal-depth split lines that hold in both the 1% and 0.2% AEP parent runs across the whole HUC,
+    nest them into tiered hydraulic subdomains, then cut, author, validate and run a headwater and a larger
+    main-stem subdomain as exact-cell breakouts and compare them with the parent; compare walled closed
+    edges with closed-edge Normal Depth outflow, map the 0.1 ft agreement envelope, and compare runtime
+    with the parent at 2 cores.
+  tags:
+  - 2d
+  - rain-on-grid
+  - breakout
+  - subdomain
+  - taudem
+  - ebfe
+  - normal-depth
+  - face-flow
+  - validation
+  difficulty: advanced
+  est_runtime: 36 min (cached parent runs; computing both parent events takes about 13 h each)
+  data_project: null
+  functions_used:
+  - HdfMesh.get_mesh_cell_polygons
+  - HdfResultsMesh.get_boundary_conditions_timeseries
+  - HdfResultsMesh.get_mesh_summary_values
+  - RasCmdr.compute_plan
+  - RasEbfeModels.organize_salt_draw
+  - RasPlan.add_hdf_output_variable
+  - RasSubdomain.apply_breakouts
+  - RasSubdomain.build_subdomains
+  - RasSubdomain.compare_to_parent
+  - RasSubdomain.compute_subdomains
+  - RasSubdomain.find_split_lines
+  - RasSubdomain.plan_breakouts
+  - RasSubdomain.validate_breakouts
+  - RasTauDem.delineate
+  - RasTauDem.get_taudem_info
+  - RasTcu.status
+  hec_refs: []
+  learning_paths: []
+  excluded: false
+  code_cells: 27
+  executed_cells: 27
 - id: 300_unsteady_flow_operations
   filename: 300_unsteady_flow_operations.ipynb
   title: Unsteady Flow Operations
   series: 300
   series_name: Unsteady & DSS
-  summary: ''
+  summary: Inspect and edit unsteady boundary tables, clone flow and plan files, scale hydrographs, and
+    compare computed cross-section water levels.
   tags:
   - steady
   - unsteady
   difficulty: intermediate
   est_runtime: null
-  data_project: null
+  data_project: Dam Breaching
   functions_used:
   - HdfResultsXsec.get_xsec_timeseries
   - RasCmdr.compute_plan
@@ -1597,12 +1912,11 @@ notebooks:
   - RasPlan.set_shortid
   - RasPlan.set_unsteady
   - RasPlan.update_plan_description
-  - RasPlan.update_plan_intervals
   - RasUnsteady.delete_boundary
   - RasUnsteady.extract_boundary_and_tables
   - RasUnsteady.extract_tables
-  - RasUnsteady.get_lateral_inflow_hydrograph
   - RasUnsteady.identify_tables
+  - RasUnsteady.inspect_boundary_blocks
   - RasUnsteady.parse_fixed_width_table
   - RasUnsteady.print_boundaries_and_tables
   - RasUnsteady.update_flow_title
@@ -1617,13 +1931,14 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 48
-  executed_cells: 44
+  executed_cells: 43
 - id: 301_flow_hydrograph_optimization
   filename: 301_flow_hydrograph_optimization.ipynb
   title: Flow Hydrograph Optimization
   series: 300
   series_name: Unsteady & DSS
-  summary: ''
+  summary: Configure native flow-hydrograph optimization, inspect trial results, and compare the optimized
+    hydrograph and WSE; retain a separate multiplier-search fallback.
   tags:
   - sensitivity
   difficulty: intermediate
@@ -1640,7 +1955,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 12
-  executed_cells: 11
+  executed_cells: 12
 - id: 310_dss_boundary_extraction
   filename: 310_dss_boundary_extraction.ipynb
   title: DSS Boundary Extraction
@@ -1665,34 +1980,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 16
-  executed_cells: 14
-- id: 311_2d_floodway_encroachment
-  filename: 311_2d_floodway_encroachment.ipynb
-  title: 2D Floodway Encroachment
-  series: 300
-  series_name: Unsteady & DSS
-  summary: ''
-  tags:
-  - 2d
-  - floodway
-  difficulty: intermediate
-  est_runtime: null
-  data_project: null
-  functions_used:
-  - HdfMesh.get_mesh_areas
-  - HdfMesh.get_mesh_cell_polygons
-  - HdfResultsMesh.get_mesh_max_ws
-  - RasCmdr.compute_plan
-  - RasEncroachments.list_2d_encroachment_regions
-  - RasEncroachments.list_2d_encroachment_zones
-  - RasEncroachments.setup_2d_floodway_encroachment_plan
-  - RasMap.add_wse_comparison_layers
-  - RasMap.ensure_results_plan_layer
-  hec_refs: []
-  learning_paths: []
-  excluded: false
-  code_cells: 13
-  executed_cells: 13
+  executed_cells: 15
 - id: 312_boundary_df_qmult_dss_paths
   filename: 312_boundary_df_qmult_dss_paths.ipynb
   title: 'Boundary DataFrame Enhancement: QMult, QMin, and DSS Path Parsing'
@@ -1707,14 +1995,10 @@ notebooks:
   functions_used:
   - HdfResultsXsec.get_xsec_timeseries
   - RasCmdr.compute_plan
+  - RasDss.get_file_version
   - RasDss.read_timeseries
+  - RasDss.write_timeseries
   - RasExamples.extract_project
-  - RasUnsteady.CLASTIC_METHODS
-  - RasUnsteady.HIGH_C_TRANSPORT_METHODS
-  - RasUnsteady.HINDERED_FV_METHODS
-  - RasUnsteady.NON_NEWTONIAN_METHODS
-  - RasUnsteady.VISCOSITY_METHODS
-  - RasUnsteady.YIELD_METHODS
   - RasUnsteady.get_gate_openings
   - RasUnsteady.get_groundwater_interflow
   - RasUnsteady.get_initial_conditions
@@ -1767,7 +2051,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 56
-  executed_cells: 54
+  executed_cells: 49
 - id: 313_hms_to_ras_boundary_matching
   filename: 313_hms_to_ras_boundary_matching.ipynb
   title: HMS-to-RAS Boundary Condition Matching
@@ -1775,7 +2059,11 @@ notebooks:
   series_name: Unsteady & DSS
   summary: This notebook demonstrates **correlation-based matching** between HEC-HMS DSS hydrograph outputs
     and HEC-RAS boundary condition locations using the **BaldEagleCrkMulti2D** example project.
-  tags: []
+  tags:
+  - dss
+  - boundary-conditions
+  - hms
+  - hydrographs
   difficulty: intermediate
   est_runtime: null
   data_project: null
@@ -1795,17 +2083,21 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 16
-  executed_cells: 15
+  executed_cells: 16
 - id: 314_reference_line_generation
   filename: 314_reference_line_generation.ipynb
   title: Breakline-Derived Reference Lines And USGS Gauge Points
   series: 300
   series_name: Unsteady & DSS
-  summary: This notebook authors 2D HEC-RAS reference features from hydraulic geometry, not arbitrary
-    straight lines. It uses channel-aligned 2D breaklines as longitudinal reference lines, generates 250
-    ft perpendicular transects from those centerl...
+  summary: Generate transverse reference lines and gauge points, compute a working plan, and batch plot
+    recorded line hydrographs alongside nearest-cell gauge samples.
   tags:
+  - 2d
   - usgs
+  - reference-lines
+  - reference-points
+  - hydrographs
+  - batch-plotting
   difficulty: intermediate
   est_runtime: null
   data_project: null
@@ -1834,14 +2126,31 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - Working 2D project and channel-aligned breaklines
+  - USGS gauge locations
+  operations:
+  - Generate and author reference locations
+  - Preprocess and compute a plan
+  - Plot recorded line hydrographs and nearest-cell gauge WSE
+  outputs:
+  - Authored reference geometry
+  - Computed plan results
+  - Line hydrograph and gauge sample figures
+  runtime_requirements:
+  - Configured HEC-RAS execution runtime
+  - Gauge discovery network access
+  evidence_scope: Retained outputs show the demonstrated run. Gauge WSE plots use nearest-cell sampling,
+    not solver-recorded reference-point hydrographs; generated lines still require engineering review.
   code_cells: 14
-  executed_cells: 12
+  executed_cells: 14
 - id: 315_2d_computation_options
   filename: 315_2d_computation_options.ipynb
   title: 2D Computation Options
   series: 300
   series_name: Unsteady & DSS
-  summary: ''
+  summary: Clone 2D plans with typed computation options, run scenario plans, and compare HDF settings,
+    stability messages, and maximum WSE.
   tags:
   - 2d
   difficulty: intermediate
@@ -1882,6 +2191,8 @@ notebooks:
   - HdfResultsMesh.get_mesh_max_ws
   - RasCmdr.compute_plan
   - RasExamples.extract_project
+  - RasMap.list_terrain_layers
+  - RasTerrain.export_rasmapper_terrain
   - RasTerrainMod.get_terrain_profile
   - RasTerrainMod.setup_gdal_bridge
   - RasTerrainModWriter.add_high_ground_modification
@@ -1892,15 +2203,18 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 12
-  executed_cells: 12
+  code_cells: 14
+  executed_cells: 14
 - id: 317_restart_file_settings
   filename: 317_restart_file_settings.ipynb
   title: Restart File Output and Warm-Start Settings
   series: 300
   series_name: Unsteady & DSS
   summary: 'This notebook validates the restart-file API split used by warm-start workflows:'
-  tags: []
+  tags:
+  - restart
+  - initial-conditions
+  - unsteady
   difficulty: intermediate
   est_runtime: null
   data_project: null
@@ -1958,7 +2272,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 24
-  executed_cells: 23
+  executed_cells: 24
 - id: 319_post_fire_debris_flow_nonnewtonian
   filename: 319_post_fire_debris_flow_nonnewtonian.ipynb
   title: Post-fire debris-flow 2D modeling, built from scratch (non-Newtonian)
@@ -1989,7 +2303,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 7
-  executed_cells: 6
+  executed_cells: 7
 - id: 320_1d_boundary_condition_visualization
   filename: 320_1d_boundary_condition_visualization.ipynb
   title: 1D Boundary Condition Visualization
@@ -2012,7 +2326,6 @@ notebooks:
   - RasMap.list_map_layers
   - RasMap.set_all_geometries_visibility
   - RasMap.set_geometry_visibility
-  - RasUnsteady.extract_boundary_and_tables
   - ras.boundaries_df
   - ras.geom_df
   - ras.plan_df
@@ -2023,13 +2336,14 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 14
-  executed_cells: 13
+  executed_cells: 14
 - id: 400_1d_hdf_data_extraction
   filename: 400_1d_hdf_data_extraction.ipynb
   title: 1D HDF Data Extraction
   series: 400
   series_name: HDF Results
-  summary: ''
+  summary: Read 1D unsteady HDF geometry and results, including cross-section time series, storage curves,
+    structures, runtime, and volume accounting.
   tags:
   - 1d
   - hdf
@@ -2061,6 +2375,7 @@ notebooks:
   - HdfXsec.get_river_centerlines
   - HdfXsec.get_river_edge_lines
   - RasCmdr.compute_plan
+  - RasCrossSections.get_points
   - RasExamples.extract_project
   - ras.boundaries_df
   - ras.geom_df
@@ -2072,14 +2387,29 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 70
-  executed_cells: 52
+  input_families:
+  - 1D unsteady plan-result HDF
+  - Geometry HDF or geometry embedded in results
+  operations:
+  - Read cross-section and structure results
+  - Inspect runtime and volume accounting
+  outputs:
+  - xarray cross-section Dataset
+  - Spatial geometry and tabular diagnostics
+  runtime_requirements:
+  - Python HDF/geospatial dependencies
+  - Retained compatible result HDF; no solver required for read-only extraction
+  evidence_scope: Dataset presence and extraction establish readable stored results, not freshness or
+    hydraulic acceptance.
+  code_cells: 73
+  executed_cells: 69
 - id: 401_steady_flow_analysis
   filename: 401_steady_flow_analysis.ipynb
   title: Steady Flow Analysis
   series: 400
   series_name: HDF Results
-  summary: ''
+  summary: Read steady HDF profile names, WSE arrays, messages, and metadata; select profiles by name
+    or index and compare their longitudinal elevations.
   tags:
   - steady
   difficulty: intermediate
@@ -2099,8 +2429,21 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - 1D steady plan-result HDF
+  operations:
+  - List and select steady profiles
+  - Extract and compare WSE
+  outputs:
+  - Profile-indexed water-surface arrays
+  - Steady metadata and plots
+  runtime_requirements:
+  - Python HDF dependencies for reading
+  - Installed HEC-RAS for the notebook initial example computation
+  evidence_scope: Steady profiles are separate from unsteady time series; the example comparisons do not
+    establish model calibration.
   code_cells: 24
-  executed_cells: 20
+  executed_cells: 24
 - id: 410_2d_hdf_data_extraction
   filename: 410_2d_hdf_data_extraction.ipynb
   title: 2D HDF Data Extraction
@@ -2131,6 +2474,7 @@ notebooks:
   - HdfPlan.get_plan_met_precip
   - HdfPlan.get_plan_parameters
   - HdfPlan.get_plan_start_time
+  - HdfResultsMesh.get_boundary_conditions_timeseries
   - HdfResultsMesh.get_mesh_cells_timeseries
   - HdfResultsMesh.get_mesh_faces_timeseries
   - HdfResultsMesh.get_mesh_max_face_v
@@ -2157,14 +2501,28 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 119
-  executed_cells: 111
+  input_families:
+  - 2D geometry and unsteady result HDFs
+  operations:
+  - Query mesh cells/faces and result variables
+  - Inspect time series and maximum values
+  outputs:
+  - GeoDataFrames
+  - DataArray/Dataset results indexed by mesh-local cell or face IDs
+  runtime_requirements:
+  - Python HDF, xarray, and geospatial dependencies
+  - Requested output variables must exist in retained HDFs
+  evidence_scope: Stored maxima, instantaneous time series, geometry, and derived quantities have different
+    meanings; missing optional output is not zero.
+  code_cells: 120
+  executed_cells: 119
 - id: 411_2d_hdf_pipes_and_pumps
   filename: 411_2d_hdf_pipes_and_pumps.ipynb
   title: Pipes and Pumps
   series: 400
   series_name: HDF Results
-  summary: ''
+  summary: Extract pipe-network and pump geometry/time series from HDF results and inspect pipe flow and
+    velocity along profile lines.
   tags:
   - 2d
   - hdf
@@ -2188,7 +2546,6 @@ notebooks:
   - HdfResultsQuery.query_polyline_pipe_flow_timeseries
   - HdfResultsQuery.query_polyline_pipe_velocity_profile
   - HdfResultsQuery.query_polyline_pipe_velocity_timeseries
-  - HdfUtils.get_hdf5_dataset_info
   - ras.boundaries_df
   - ras.get_hdf_entries
   - ras.plan_df
@@ -2198,7 +2555,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 36
-  executed_cells: 28
+  executed_cells: 34
 - id: 412_2d_detail_face_data_extraction
   filename: 412_2d_detail_face_data_extraction.ipynb
   title: 2D Face Data Extraction
@@ -2248,14 +2605,21 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 54
-  executed_cells: 42
+  executed_cells: 54
 - id: 413_profile_line_flow_extraction
   filename: 413_profile_line_flow_extraction.ipynb
   title: Profile Line Flow Extraction
   series: 400
   series_name: HDF Results
-  summary: HDF mesh and results extraction
-  tags: []
+  summary: Extract named-line flow series and peaks; distinguish native-associated hydrographs of unqualified
+    provenance from face-flow aggregation.
+  tags:
+  - 2d
+  - hdf
+  - profile-lines
+  - reference-lines
+  - flow
+  - hydrographs
   difficulty: intermediate
   est_runtime: null
   data_project: null
@@ -2265,43 +2629,69 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - Completed plan HDF and matching geometry
+  - Named profile-line layer or geometry reference line
+  operations:
+  - Extract named-line flow time series
+  - Find sampled peak and inspect face-flow comparison
+  outputs:
+  - Flow series with selection provenance
+  - Peak-flow summary and comparison plot
+  runtime_requirements:
+  - Current canonical API requires pythonnet and compatible RasMapperLib
+  - External Chippewa fixture described in notebook
+  evidence_scope: Saved outputs retain a historical six-face reconstruction, not current native qualification.
+    The native fixture uses seven faces with substantially different flow. Native-associated hydrograph
+    provenance remains unqualified; absolute hydrograph values and summed absolute face flows are different
+    quantities.
   code_cells: 6
-  executed_cells: 5
+  executed_cells: 6
 - id: 414_depth_varying_mannings_n
   filename: 414_depth_varying_mannings_n.ipynb
-  title: Depth-Varying Manning's n for HEC-RAS 2D Models
+  title: Controlled Depth-Varying Manning's n for HEC-RAS 2D Linux Solves
   series: 400
   series_name: HDF Results
-  summary: Manning's roughness coefficient varies with flow depth — this is well-established in hydraulic
-    literature (Chow 1959, HEC-15, Limerinos 1970, Jarrett 1984) and is a frequent topic in HEC-RAS community
-    discussions because many 2D models s...
+  summary: Experimental, non-production comparison of baseline, table-extension control, and depth-varying-Manning
+    scenarios in the single tested HEC-RAS 7.0 April 2026 Windows-preprocess/Linux-solve temporary-HDF
+    workflow; all other versions and workflows are untested.
   tags:
   - 2d
+  - hdf
   difficulty: intermediate
   est_runtime: null
   data_project: null
   functions_used:
+  - GeomCrossSection.get_cross_sections
   - GeomLandCover.get_base_mannings_n
   - GeomStorage.get_2d_flow_area_settings
   - HdfFluvialPluvial.generate_fluvial_pluvial_polygons
   - HdfLandCover.get_mannings_region_polygons
-  - HdfMesh.extend_face_property_tables
+  - HdfMesh.extend_linux_tmp_face_property_tables
   - HdfMesh.get_face_ids_in_calibration_region
   - HdfMesh.get_face_ids_in_polygon
   - HdfMesh.get_mesh_cell_faces
+  - HdfMesh.get_mesh_cell_points
+  - HdfMesh.get_mesh_cell_polygons
   - HdfMesh.get_mesh_face_property_tables
-  - HdfMesh.get_mesh_sloped_topology
-  - HdfMesh.set_face_mannings_n_values
+  - HdfMesh.set_mesh_pinned_attribute
+  - HdfMesh.transform_linux_tmp_face_mannings_n
   - HdfResultsMesh.get_mesh_max_ws
+  - HdfResultsPlan.get_unsteady_summary
+  - HdfResultsPlan.get_volume_accounting
+  - HdfXsec.get_cross_sections
   - HdfXsec.get_river_bank_lines
+  - HdfXsec.get_river_centerlines
   - RasCmdr.compute_plan_linux
   - RasExamples.extract_project
+  - RasExamples.get_example_projects
+  - RasMap.list_terrain_layers
   - RasPreprocess.preprocess_plan
   hec_refs: []
   learning_paths: []
   excluded: false
   code_cells: 15
-  executed_cells: 14
+  executed_cells: 15
 - id: 415_2d_spatial_result_queries
   filename: 415_2d_spatial_result_queries.ipynb
   title: 2D Spatial Result Queries with HdfResultsQuery
@@ -2331,16 +2721,20 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 10
-  executed_cells: 9
+  executed_cells: 10
 - id: 416_2d_velocity_profile_line
   filename: 416_2d_velocity_profile_line.ipynb
   title: 2D Velocity Profile Line Extraction
   series: 400
   series_name: HDF Results
-  summary: Extract velocity, depth, and terrain along a user-defined profile line from a completed 2D
-    plan HDF.
+  summary: Sample native RASMapper velocity, depth and terrain along a polyline at one saved time; distinguish
+    station profiles from recorded reference hydrographs.
   tags:
   - 2d
+  - profile-lines
+  - rasmapper
+  - velocity
+  - terrain
   difficulty: intermediate
   est_runtime: null
   data_project: null
@@ -2349,14 +2743,65 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - Completed 2D plan HDF and matching geometry
+  - RAS terrain HDF and line coordinates
+  operations:
+  - Select a saved result time
+  - Query a native station-wise velocity profile
+  outputs:
+  - Station/profile table
+  - Velocity, depth and terrain figure
+  runtime_requirements:
+  - pythonnet and compatible installed RasMapperLib
+  - Matching RAS terrain and geometry
+  evidence_scope: Retained example output illustrates a single-time station profile, not line-integrated
+    discharge or solver-recorded reference output; this editorial update does not requalify native execution.
   code_cells: 4
-  executed_cells: 3
+  executed_cells: 4
+- id: 417_inspect_results_and_generate_hydraulic_products
+  filename: 417_inspect_results_and_generate_hydraulic_products.ipynb
+  title: Inspecting Results and Generating Hydraulic Product Packages
+  series: 400
+  series_name: HDF Results
+  summary: Read and mechanically inspect an existing completed HEC-RAS result HDF, then generate and independently
+    verify a checksum-pinned COG, Arrow/Parquet, GeoJSON, JSON, and PNG derivative package without modifying
+    the producer HDF or generating model output.
+  tags:
+  - hdf
+  - results
+  - parquet
+  - cloud-native
+  difficulty: intermediate
+  est_runtime: null
+  data_project: null
+  functions_used:
+  - HdfResultsProducts.export
+  - HdfResultsProducts.inspect_result
+  hec_refs: []
+  learning_paths: []
+  excluded: false
+  input_families:
+  - Existing completed unsteady HEC-RAS result HDF
+  operations:
+  - Inspect result identity and completeness
+  - Export and independently check derivative products
+  outputs:
+  - Checksum-pinned COG, Arrow/Parquet, GeoJSON, JSON, and PNG package
+  runtime_requirements:
+  - Python export/geospatial dependencies
+  - Retained result HDF with required geometry, CRS, units, and outputs; no solver run
+  evidence_scope: Mechanical inspection and derivative verification do not modify the producer HDF or
+    establish hydraulic acceptance.
+  code_cells: 6
+  executed_cells: 6
 - id: 420_breach_results_extraction
   filename: 420_breach_results_extraction.ipynb
   title: Dam Breach Results
   series: 400
   series_name: HDF Results
-  summary: ''
+  summary: Read breach geometry and hydrographs, clone width and formation-time scenarios, execute the
+    plans, and compare peak flow and breach evolution.
   tags:
   - breach
   - results
@@ -2370,23 +2815,22 @@ notebooks:
   - HdfResultsPlan.get_compute_messages
   - HdfStruc.get_sa2d_breach_info
   - HdfStruc.list_sa2d_connections
-  - RasBreach.create_breach_block
   - RasBreach.list_breach_structures_plan
   - RasBreach.read_breach_block
   - RasBreach.set_breach_geom
-  - RasBreach.update_breach_block
   - RasCmdr.compute_parallel
   - RasCmdr.compute_plan
   - RasExamples.extract_project
   - RasPlan.clone_plan
   - ras.plan_df
   - ras.project_name
+  - ras.ras_version
   - ras.results_df
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 39
-  executed_cells: 35
+  code_cells: 29
+  executed_cells: 0
 - id: 430_1d_channel_capacity_analysis
   filename: 430_1d_channel_capacity_analysis.ipynb
   title: 1D Channel Capacity Analysis
@@ -2460,8 +2904,7 @@ notebooks:
   difficulty: advanced
   est_runtime: null
   data_project: null
-  functions_used:
-  - RasCmdr.compute_plan_linux
+  functions_used: []
   hec_refs: []
   learning_paths: []
   excluded: false
@@ -2492,6 +2935,41 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 4
+  executed_cells: 0
+- id: 512_docker_precompute_and_linux_compute
+  filename: 512_docker_precompute_and_linux_compute.ipynb
+  title: Docker Precompute and Native Linux Compute
+  series: 500
+  series_name: Remote Execution
+  summary: 'Run the same two Python calls on Windows or Linux: first prepare a HEC-RAS plan with the Wine
+    container, then execute the matching native Linux unsteady container. Both containers use [ras-commander](https://rascommander.info/ras/)
+    APIs...'
+  tags:
+  - execution
+  - remote
+  difficulty: advanced
+  est_runtime: null
+  data_project: null
+  functions_used:
+  - HdfBase.get_2d_flow_area_names_and_counts
+  - HdfMesh.get_mesh_cell_property_tables
+  - HdfMesh.get_mesh_face_property_tables
+  - HdfMesh.get_mesh_sloped_topology
+  - HdfPlan.get_plan_end_time
+  - HdfPlan.get_plan_start_time
+  - HdfResultsMesh.get_mesh_timeseries
+  - HdfResultsPlan.get_unsteady_summary
+  - HdfUtils.parse_ras_window_datetime
+  - RasDocker.compute_plan
+  - RasDocker.preprocess_plan
+  - RasDocker.run_batch
+  - RasPlan.get_plan_path
+  - RasPlan.get_plan_value
+  - RasPlan.update_simulation_date
+  hec_refs: []
+  learning_paths: []
+  excluded: false
+  code_cells: 12
   executed_cells: 0
 - id: 560_modpuls_routing_extraction
   filename: 560_modpuls_routing_extraction.ipynb
@@ -2530,7 +3008,10 @@ notebooks:
   series_name: Floodplain Mapping
   summary: 'This notebook demonstrates floodplain mapping using **HEC-RAS GUI automation** to generate:
     - Maximum Water Surface Elevation (WSE) rasters - Maximum Depth rasters'
-  tags: []
+  tags:
+  - floodplain-mapping
+  - rasmapper
+  - gui
   difficulty: intermediate
   est_runtime: null
   data_project: null
@@ -2572,13 +3053,50 @@ notebooks:
   excluded: false
   code_cells: 12
   executed_cells: 12
+- id: 602_rust_horizontal_mapping_comparison
+  filename: 602_rust_horizontal_mapping_comparison.ipynb
+  title: Compare Rust 2D horizontal mapping with RAS Mapper
+  series: 600
+  series_name: Floodplain Mapping
+  summary: Compare Rust and native horizontal 2D maps on two eBFE models, Bald Eagle dam/levees and bridges,
+    and Davis pipes, with identical depth filtering, configuration restoration and timing returns.
+  tags:
+  - floodplain-mapping
+  - rust
+  - rasmapper
+  - ebfe
+  - performance
+  - validation
+  difficulty: intermediate
+  est_runtime: null
+  data_project: null
+  functions_used:
+  - GeomLateral.get_connections
+  - HdfPipe.get_pipe_conduits
+  - HdfStruc.get_structures
+  - RasFim.canonicalize_terrain_crs
+  - RasFim.compare_rasters
+  - RasFim.compare_with_rasmapper
+  - RasFim.get_cells_from_plan_hdf
+  - RasFim.map_horizontal_profiles
+  - RasFim.validate_2d_model
+  - RasTerrain.export_rasmapper_terrain
+  hec_refs: []
+  learning_paths: []
+  excluded: false
+  code_cells: 5
+  executed_cells: 5
 - id: 610_generate_fluvial_pluvial_delineations_max_wse_arrival_time
   filename: 610_generate_fluvial_pluvial_delineations_max_wse_arrival_time.ipynb
   title: Generate Fluvial Pluvial Delineations using Max WSE Arrival Time
   series: 600
   series_name: Floodplain Mapping
-  summary: ''
-  tags: []
+  summary: Use differences in time of maximum 2D WSE to derive draft fluvial/pluvial transition lines
+    and polygons for interpretation and map review.
+  tags:
+  - 2d
+  - flood-source-screening
+  - gis
   difficulty: intermediate
   est_runtime: null
   data_project: null
@@ -2586,7 +3104,6 @@ notebooks:
   - HdfBase.get_projection
   - HdfFluvialPluvial.calculate_fluvial_pluvial_boundary
   - HdfFluvialPluvial.generate_fluvial_pluvial_polygons
-  - HdfFluvialPluvial.plot_cell_polygons
   - HdfMesh.get_mesh_cell_polygons
   - HdfResultsMesh.get_mesh_max_ws
   - HdfResultsPlot.plot_results_max_wsel
@@ -2604,13 +3121,14 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 30
-  executed_cells: 25
+  executed_cells: 29
 - id: 611_validating_map_layers
   filename: 611_validating_map_layers.ipynb
   title: Validating RAS Mapper Layers and Terrain Files
   series: 600
   series_name: Floodplain Mapping
-  summary: ''
+  summary: Discover registered RAS Mapper layers and screen their format, CRS, raster metadata, spatial
+    extent, and terrain/land-cover associations.
   tags:
   - terrain
   difficulty: intermediate
@@ -2647,7 +3165,11 @@ notebooks:
   summary: This example builds and computes HEC-RAS 7.0 conduit, second-pump, and combined alternatives,
     compares hydraulic performance, and maps categorical benefits, adverse depth increases, and building-footprint
     exposure.
-  tags: []
+  tags:
+  - benefit-area
+  - depth
+  - stormwater
+  - gis
   difficulty: intermediate
   est_runtime: null
   data_project: Davis
@@ -2674,8 +3196,22 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - Storm-system baseline and alternative projects
+  - Comparable stored Depth rasters
+  operations:
+  - Author pipe/pump alternatives
+  - Compute and compare benefits and adverse depth changes
+  outputs:
+  - BenefitArea rasters and polygons
+  - Hydraulic comparisons and adverse-depth screens
+  runtime_requirements:
+  - Installed HEC-RAS and native stored-map tooling
+  - Geospatial raster dependencies and writable model copies
+  evidence_scope: Benefit categories use declared depth thresholds and aligned pre/post rasters; no qualifying
+    benefit does not imply no physical change.
   code_cells: 11
-  executed_cells: 10
+  executed_cells: 11
 - id: 700_core_sensitivity
   filename: 700_core_sensitivity.ipynb
   title: Core Sensitivity Testing with results_df
@@ -2696,24 +3232,24 @@ notebooks:
   - RasExamples.extract_project
   - RasPlan.get_plan_path
   - RasPlan.set_num_cores
-  - RasUnsteady.update_flow_multiplier_by_station
-  - ras.boundaries_df
   - ras.project_name
   - ras.results_df
-  - ras.unsteady_df
   hec_refs: []
   learning_paths: []
   excluded: false
   code_cells: 8
-  executed_cells: 7
+  executed_cells: 8
 - id: 701_benchmarking_versions_6.1_to_6.6
   filename: 701_benchmarking_versions_6.1_to_6.6.ipynb
-  title: Version Benchmarking and Core Scaling (HEC-RAS 6.0, 6.3.1, 6.6, 7.0)
+  title: Version Benchmarking and Core Scaling (HEC-RAS 5.0.5, 6.0, 6.3.1, 6.6, 7.0)
   series: 700
   series_name: Sensitivity & Precipitation
-  summary: 'This notebook benchmarks the same 2D plan across four HEC-RAS versions and an explicit set
-    of processor core counts. The goal is to separate:'
-  tags: []
+  summary: Benchmark one 2D plan across selected HEC-RAS versions and core counts; compare execution time,
+    speedup, continuity diagnostics, and completion evidence.
+  tags:
+  - benchmarking
+  - execution
+  - version-comparison
   difficulty: intermediate
   est_runtime: null
   data_project: null
@@ -2725,12 +3261,13 @@ notebooks:
   - RasPlan.get_results_path
   - RasPlan.set_num_cores
   - RasPlan.update_run_flags
+  - RasTcu.status
   - RasUtils.discover_ras_versions
   hec_refs: []
   learning_paths: []
   excluded: false
   code_cells: 8
-  executed_cells: 6
+  executed_cells: 8
 - id: 710_mannings_sensitivity_bulk_analysis
   filename: 710_mannings_sensitivity_bulk_analysis.ipynb
   title: Manning's n Bulk Sensitivity Analysis
@@ -2751,7 +3288,6 @@ notebooks:
   - GeomMesh.set_geometry_association
   - HdfLandCover.get_preprocessed_mannings_n
   - HdfMesh.get_mesh_cell_points
-  - HdfMesh.get_mesh_sloped_topology
   - HdfResultsMesh.get_mesh_cells_timeseries
   - HdfResultsMesh.get_mesh_max_depth
   - HdfResultsMesh.get_mesh_max_face_v
@@ -2769,7 +3305,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 15
-  executed_cells: 14
+  executed_cells: 15
 - id: 711_mannings_sensitivity_multi_interval
   filename: 711_mannings_sensitivity_multi_interval.ipynb
   title: One-at-a-Time (OAT) Manning's n Sensitivity Analysis
@@ -2811,7 +3347,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 16
-  executed_cells: 14
+  executed_cells: 16
 - id: 720_precipitation_methods_comprehensive
   filename: 720_precipitation_methods_comprehensive.ipynb
   title: Precipitation Hyetograph Generation - Complete Method Comparison
@@ -2827,48 +3363,61 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - NOAA Atlas 14 depth-duration information
+  - Declared storm duration and temporal distribution
+  operations:
+  - Compare precipitation temporal methods
+  outputs:
+  - Hyetographs and comparison plots
+  runtime_requirements:
+  - Python precipitation dependencies
+  - Network or cached precipitation source data; optional StormGenerator sections depend on availability
+  evidence_scope: Method comparison demonstrates temporal construction; it does not select a locally appropriate
+    design storm or prove delivery to a hydraulic solver.
   code_cells: 15
-  executed_cells: 13
+  executed_cells: 15
 - id: 721_precipitation_hyetograph_comparison
   filename: 721_precipitation_hyetograph_comparison.ipynb
   title: Precipitation Hyetograph Comparison
   series: 700
   series_name: Sensitivity & Precipitation
-  summary: precipitation methods
+  summary: Generate and read back 30 precipitation patterns; verify intended, written and native accumulated
+    rainfall in two bounded HEC-RAS 7.0 Davis runs.
   tags:
   - precipitation
   difficulty: intermediate
   est_runtime: null
   data_project: null
   functions_used:
-  - HdfMesh.get_mesh_cell_polygons
   - HdfResultsMesh.get_mesh_max_ws
-  - RasCmdr.compute_parallel
+  - HdfResultsMesh.get_mesh_timeseries
+  - HdfResultsPlan.get_volume_accounting
+  - RasCmdr.compute_plan
+  - RasCmdr.inspect_execution_evidence
   - RasExamples.extract_project
   - RasPlan.clone_plan
   - RasPlan.clone_unsteady
   - RasPlan.set_unsteady
+  - RasUnsteady.extract_tables
+  - RasUnsteady.get_met_precipitation_config
   - RasUnsteady.set_precipitation_hyetograph
-  - ras.geom_df
-  - ras.plan_df
-  - ras.prj_file
-  - ras.project_folder
-  - ras.project_name
-  - ras.results_df
-  - ras.unsteady_df
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 25
-  executed_cells: 24
+  evidence_scope: All 30 patterns are authored and read back. Two hourly HEC-RAS 7.0 Davis runs verify
+    native precipitation across 2,705 rainfall-receiving cells and 217 times; other versions, SI units,
+    fixed-start boundaries, sub-hourly intervals and hydraulic acceptance remain unqualified.
+  code_cells: 10
+  executed_cells: 10
 - id: 722_gridded_precipitation_atlas14
   filename: 722_gridded_precipitation_atlas14.ipynb
-  title: Gridded Precipitation for Rain-on-Grid 2D Modeling
+  title: 'Gridded Precipitation with Atlas 14: Current Workflow'
   series: 700
   series_name: Sensitivity & Precipitation
-  summary: This notebook demonstrates **gridded precipitation (rain-on-grid)** workflows for 2D HEC-RAS
-    models using HMS-validated precipitation methods. Unlike hydrograph boundary conditions, gridded precipitation
-    applies directly to mesh cells.
+  summary: Migration guide to the implemented Atlas 14 workflow in notebook 727, with capability lookup
+    and links to GeoTIFF, MRMS, and HRRR examples. Retires obsolete placeholder APIs and raw meteorology
+    edits.
   tags:
   - 2d
   - precipitation
@@ -2876,36 +3425,29 @@ notebooks:
   est_runtime: null
   data_project: null
   functions_used:
-  - HdfMesh.get_mesh_area_names
   - HdfMesh.get_mesh_areas
-  - HdfMesh.get_mesh_cell_points
   - HdfMesh.get_mesh_cell_polygons
-  - HdfResultsMesh.get_mesh_max_ws
-  - RasCmdr.compute_plan
   - RasExamples.extract_project
-  - RasPlan.clone_plan
-  - RasPlan.clone_unsteady
-  - RasPlan.set_unsteady
-  - RasUnsteady.set_gridded_precipitation
-  - RasUnsteady.set_precipitation_hyetograph
-  - ras.geom_df
+  - RasUnsteady.get_gridded_precipitation_capabilities
   - ras.plan_df
   - ras.project_folder
   - ras.project_name
-  - ras.results_df
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 29
-  executed_cells: 0
+  code_cells: 11
+  executed_cells: 11
 - id: 723_storm_generator_abm_validation
   filename: 723_storm_generator_abm_validation.ipynb
   title: StormGenerator Alternating Block Method - Independent Textbook Validation
   series: 700
   series_name: Sensitivity & Precipitation
-  summary: 'This notebook validates ras-commander''s `StormGenerator` against an **independent reference
-    implementation** of the Alternating Block Method coded directly from:'
-  tags: []
+  summary: Compare StormGenerator alternating-block hyetographs with an independent reference calculation
+    and optional HMS storm classes; check depth conservation and temporal placement.
+  tags:
+  - precipitation
+  - design-storms
+  - abm
   difficulty: intermediate
   est_runtime: null
   data_project: null
@@ -2940,9 +3482,8 @@ notebooks:
   title: Gridded ABM Hyetograph Generation
   series: 700
   series_name: Sensitivity & Precipitation
-  summary: This notebook demonstrates how to generate spatially distributed precipitation hyetographs
-    using the Alternating Block Method (ABM) applied pixel-by-pixel across a NOAA Atlas 14 grid. The output
-    is a NetCDF file with dimensions `(time, l...
+  summary: Generate spatial ABM design-storm interval depths in CF NetCDF and identify the separate HEC-RAS
+    conversion and qualification steps.
   tags:
   - precipitation
   difficulty: intermediate
@@ -2955,6 +3496,127 @@ notebooks:
   excluded: false
   code_cells: 13
   executed_cells: 13
+- id: 727_atlas14_gridded_rain_on_grid_hecras
+  filename: 727_atlas14_gridded_rain_on_grid_hecras.ipynb
+  title: Atlas 14 Gridded Design Storm Rain-on-Grid in HEC-RAS
+  series: 700
+  series_name: Sensitivity & Precipitation
+  summary: Convert spatial NOAA Atlas 14 depths to projected ABM rain-on-grid forcing, execute controlled
+    no-rain, spatial, and equivalent-uniform Bald Eagle HEC-RAS scenarios, and quantify the modeled hydraulic
+    response.
+  tags:
+  - 2d
+  - unsteady
+  - precipitation
+  difficulty: advanced
+  est_runtime: 17 min
+  data_project: BaldEagleCrkMulti2D
+  functions_used:
+  - HdfMesh.get_mesh_areas
+  - HdfMesh.get_mesh_cell_polygons
+  - HdfResultsMesh.get_mesh_cells_timeseries
+  - HdfResultsMesh.get_mesh_max_ws
+  - HdfResultsMesh.get_mesh_timeseries
+  - HdfResultsPlan.get_compute_messages_hdf_only
+  - HdfStruc.get_structures
+  - RasCmdr.compute_plan
+  - RasExamples.extract_project
+  - RasPlan.clone_plan
+  - RasPlan.clone_unsteady
+  - RasPlan.update_simulation_date
+  - RasPreprocess.preprocess_plan
+  - RasUnsteady.get_gate_openings
+  - RasUnsteady.get_met_precipitation_config
+  - RasUnsteady.set_constant_precipitation
+  - RasUnsteady.set_gridded_precipitation
+  - ras.boundaries_df
+  - ras.plan_df
+  - ras.project_folder
+  - ras.project_name
+  - ras.rasmap_df
+  hec_refs: []
+  learning_paths: []
+  excluded: false
+  code_cells: 22
+  executed_cells: 22
+- id: 728_extend_gridded_dss_forcing_window
+  filename: 728_extend_gridded_dss_forcing_window.ipynb
+  title: Extending Gridded DSS Forcing Through the Simulation Window
+  series: 700
+  series_name: Sensitivity & Precipitation
+  summary: preserve and extend a model-covering gridded DSS family with three explicit dry intervals,
+    then verify temporary/final HDF forcing, a HEC-RAS 7.0 compute, the dry-tail plateau, active-cell
+    agreement, runtime diagnostics, and hydraulic results on Bald Eagle Creek
+  tags:
+  - dss
+  - precipitation
+  difficulty: intermediate
+  est_runtime: 1 min
+  data_project: BaldEagleCrkMulti2D
+  functions_used:
+  - HdfMesh.get_mesh_area_attributes
+  - HdfMesh.get_mesh_areas
+  - HdfMesh.get_mesh_cell_points
+  - HdfResultsMesh.get_mesh_max_ws_err
+  - HdfResultsMesh.get_mesh_timeseries
+  - HdfResultsPlan.get_compute_messages_hdf_only
+  - HdfResultsPlan.get_volume_accounting
+  - RasCmdr.compute_plan
+  - RasDss.copy_grid_with_zero_tail
+  - RasDss.get_catalog
+  - RasDss.get_file_version
+  - RasDss.read_grid
+  - RasExamples.extract_project
+  - RasPlan.clone_plan
+  - RasPlan.clone_unsteady
+  - RasPlan.update_simulation_date
+  - RasPreprocess.preprocess_plan
+  - RasUnsteady.configure_gridded_dss_precipitation
+  - RasUnsteady.get_met_precipitation_config
+  - ras.project_folder
+  - ras.project_name
+  hec_refs: []
+  learning_paths: []
+  excluded: false
+  code_cells: 9
+  executed_cells: 9
+- id: 729_direct_geotiff_gridded_rain_on_grid
+  filename: 729_direct_geotiff_gridded_rain_on_grid.ipynb
+  title: Direct GeoTIFF Gridded Rain-on-Grid
+  series: 700
+  series_name: Sensitivity & Precipitation
+  summary: Author projected precipitation GeoTIFFs, validate temporary plan-HDF rainfall, compute Bald
+    Eagle, and inspect final rainfall and hydraulics
+  tags:
+  - precipitation
+  - geotiff
+  - rain-on-grid
+  - validation
+  difficulty: intermediate
+  est_runtime: null
+  data_project: BaldEagleCrkMulti2D
+  functions_used:
+  - HdfMesh.get_mesh_areas
+  - HdfMesh.get_mesh_cell_points
+  - HdfResultsMesh.get_mesh_cells_timeseries
+  - HdfResultsPlan.get_compute_messages_hdf_only
+  - RasCmdr.compute_plan
+  - RasExamples.extract_project
+  - RasPlan.update_plan_intervals
+  - RasPlan.update_simulation_date
+  - RasPreprocess.preprocess_plan
+  - RasUnsteady.get_gridded_precipitation_capabilities
+  - RasUnsteady.get_met_precipitation_config
+  - RasUnsteady.set_gridded_precipitation_geotiff
+  - ras.plan_df
+  - ras.project_folder
+  - ras.project_name
+  hec_refs:
+  - HEC-RAS 2D Modeling User's Manual - Global Boundary Conditions
+  learning_paths: []
+  excluded: false
+  code_cells: 9
+  executed_cells: 9
 - id: 730_raster_processing_performance_profiling
   filename: 730_raster_processing_performance_profiling.ipynb
   title: Raster Processing Performance Profiling
@@ -2981,6 +3643,39 @@ notebooks:
   excluded: false
   code_cells: 14
   executed_cells: 0
+- id: 731_atlas14_shared_temporal_existing_model
+  filename: 731_atlas14_shared_temporal_existing_model.ipynb
+  title: Atlas 14 Shared Temporal Pattern for an Existing Model
+  series: 700
+  series_name: Sensitivity & Precipitation
+  summary: Apply a shared NOAA temporal curve to an existing model footprint, validate native rainfall
+    NetCDF, export Float32 intervals with explicit bilinear SHG conversion, and optionally configure a
+    staged model copy without computing.
+  tags:
+  - precipitation
+  difficulty: intermediate
+  est_runtime: null
+  data_project: null
+  functions_used:
+  - HdfLandCover.sanitize_classification_names
+  - HdfMesh.get_mesh_areas
+  - HdfPlan.get_plan_met_precip_values
+  - RasDss.get_catalog
+  - RasDss.read_grid
+  - RasMap.list_landcover_layers
+  - RasPlan.clone_plan
+  - RasPlan.clone_unsteady
+  - RasPreprocess.preprocess_plan
+  - RasUnsteady.configure_gridded_dss_precipitation
+  - RasUnsteady.delete_boundary
+  - RasUnsteady.get_met_precipitation_config
+  - RasUnsteady.inspect_boundary_blocks
+  - ras.plan_df
+  hec_refs: []
+  learning_paths: []
+  excluded: false
+  code_cells: 10
+  executed_cells: 0
 - id: 800_quality_assurance_rascheck
   filename: 800_quality_assurance_rascheck.ipynb
   title: Quality Assurance with RasCheck
@@ -2988,7 +3683,10 @@ notebooks:
   series_name: Quality Assurance
   summary: This notebook demonstrates how to use the RasCheck module for validating HEC-RAS steady flow
     models using **multiple example projects** to show different validation scenarios.
-  tags: []
+  tags:
+  - quality-assurance
+  - steady
+  - diagnostics
   difficulty: advanced
   est_runtime: null
   data_project: ProjectName
@@ -3002,8 +3700,21 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - Computed steady-flow example projects
+  operations:
+  - Run RasCheck diagnostics
+  - Review messages and thresholds
+  outputs:
+  - CheckResults messages
+  - Tabular/HTML review outputs
+  runtime_requirements:
+  - Python HDF dependencies
+  - Installed HEC-RAS for example computation when needed
+  evidence_scope: Diagnostics support review and may have incomplete dataset coverage. Floodway authoring/checking
+    remains experimental; empty messages are not a compliance finding.
   code_cells: 20
-  executed_cells: 19
+  executed_cells: 20
 - id: 801_advanced_structure_validation
   filename: 801_advanced_structure_validation.ipynb
   title: Advanced Structure Validation with RasCheck
@@ -3011,7 +3722,10 @@ notebooks:
   series_name: Quality Assurance
   summary: 'This notebook demonstrates the **advanced structure validation features** added to RasCheck
     in December 2025:'
-  tags: []
+  tags:
+  - quality-assurance
+  - structures
+  - steady
   difficulty: advanced
   est_runtime: null
   data_project: null
@@ -3031,7 +3745,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 19
-  executed_cells: 17
+  executed_cells: 19
 - id: 900_aorc_precipitation
   filename: 900_aorc_precipitation.ipynb
   title: AORC Precipitation for HEC-RAS Rain-on-Grid Models
@@ -3046,20 +3760,25 @@ notebooks:
   est_runtime: null
   data_project: null
   functions_used:
+  - HdfMesh.get_mesh_areas
+  - HdfMesh.get_mesh_cell_points
+  - HdfMesh.get_mesh_cell_polygons
   - HdfProject.get_project_bounds_latlon
-  - RasCmdr.compute_parallel
+  - HdfResultsMesh.get_mesh_cells_timeseries
+  - HdfResultsPlan.get_compute_messages_hdf_only
+  - RasCmdr.compute_plan
   - RasExamples.extract_project
-  - RasUsgsCore.retrieve_flow_data
-  - ras.get_plan_entries
+  - RasPlan.update_plan_intervals
+  - RasPreprocess.preprocess_plan
+  - RasUnsteady.get_met_precipitation_config
   - ras.plan_df
   - ras.project_folder
   - ras.project_name
-  - ras.results_df
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 23
-  executed_cells: 22
+  code_cells: 11
+  executed_cells: 11
 - id: 901_aorc_precipitation_catalog
   filename: 901_aorc_precipitation_catalog.ipynb
   title: AORC Precipitation Catalog for HEC-RAS Rain-on-Grid Models
@@ -3073,23 +3792,20 @@ notebooks:
   est_runtime: null
   data_project: null
   functions_used:
+  - HdfMesh.get_mesh_areas
   - HdfProject.get_project_bounds_latlon
-  - RasCmdr.compute_parallel
   - RasExamples.extract_project
+  - RasPreprocess.preprocess_plan
   - RasUnsteady.get_gate_openings
   - RasUnsteady.set_gate_openings
-  - RasUtils.remove_with_retry
-  - ras.boundaries_df
-  - ras.get_boundary_conditions
-  - ras.get_plan_entries
   - ras.plan_df
   - ras.project_folder
   - ras.project_name
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 18
-  executed_cells: 17
+  code_cells: 10
+  executed_cells: 10
 - id: 910_usgs_gauge_catalog
   filename: 910_usgs_gauge_catalog.ipynb
   title: USGS Gauge Catalog Generation
@@ -3114,7 +3830,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 17
-  executed_cells: 16
+  executed_cells: 17
 - id: 911_usgs_gauge_data_integration
   filename: 911_usgs_gauge_data_integration.ipynb
   title: USGS Gauge Data Integration for HEC-RAS
@@ -3139,28 +3855,29 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 45
-  executed_cells: 44
+  executed_cells: 45
 - id: 912_usgs_real_time_monitoring
   filename: 912_usgs_real_time_monitoring.ipynb
   title: USGS Real-Time Gauge Monitoring
   series: 900
   series_name: Data Integration
-  summary: This notebook demonstrates the real-time monitoring capabilities added to `ras-commander.usgs`
-    module (v0.87.0+).
+  summary: Inspect a real model domain with live USGS station metadata and illustrate monitoring APIs;
+    distinguish the refreshed map from historical monitoring outputs.
   tags:
   - usgs
   difficulty: advanced
   est_runtime: null
   data_project: null
   functions_used:
-  - HdfMesh.get_mesh_perimeter
-  - RasCmdr.compute_plan
+  - HdfMesh.get_mesh_areas
   - RasExamples.extract_project
   - ras.geom_df
   - ras.plan_df
   hec_refs: []
   learning_paths: []
   excluded: false
+  evidence_scope: Current saved setup/map output uses real HDF geometry and successful USGS station metadata.
+    Later monitoring outputs retain their historical configuration and were not rerun.
   code_cells: 12
   executed_cells: 12
 - id: 913_bc_generation_from_live_gauge
@@ -3177,9 +3894,7 @@ notebooks:
   est_runtime: null
   data_project: null
   functions_used:
-  - RasCmdr.compute_plan
   - RasExamples.extract_project
-  - RasUnsteady.update_flow_multiplier_by_station
   - ras.boundaries_df
   - ras.geom_df
   - ras.plan_df
@@ -3192,48 +3907,61 @@ notebooks:
   executed_cells: 15
 - id: 914_historical_event_validation
   filename: 914_historical_event_validation.ipynb
-  title: Historical Event Validation with AORC Precipitation and USGS Gauges
+  title: Historical AORC Event Diagnostic Comparison with USGS Stage
   series: 900
   series_name: Data Integration
-  summary: 'This notebook demonstrates a comprehensive historical flood event validation workflow using:
-    - AORC gridded precipitation (rain-on-grid on 2D mesh) - USGS gauge data for boundary conditions -
-    Multiple validation points - HUC12 watershed...'
+  summary: execute an archived 48-hour AORC rain-on-grid event under HEC-RAS 7.0, verify source precipitation
+    through durable, temporary, and final HDFs, inspect runtime and hydraulic results, and compare timezone-correct
+    USGS stage as a diagnostic rather than calibration validation
   tags:
+  - 2d
+  - aorc
+  - hdf
   - precipitation
   - usgs
   difficulty: advanced
-  est_runtime: null
-  data_project: null
+  est_runtime: 5 min
+  data_project: BaldEagleCrkMulti2D
   functions_used:
+  - HdfMesh.get_mesh_area_attributes
   - HdfMesh.get_mesh_areas
+  - HdfMesh.get_mesh_cell_points
+  - HdfMesh.get_mesh_cell_polygons
   - HdfProject.get_project_bounds_latlon
-  - HdfResultsXsec.get_ref_lines_timeseries
-  - HdfResultsXsec.get_xsec_timeseries
+  - HdfResultsMesh.get_mesh_max_ws_err
+  - HdfResultsMesh.get_mesh_timeseries
+  - HdfResultsPlan.get_compute_messages_hdf_only
+  - HdfResultsPlan.get_volume_accounting
   - RasCmdr.compute_plan
   - RasExamples.extract_project
   - RasPlan.clone_plan
   - RasPlan.clone_unsteady
   - RasPlan.update_simulation_date
+  - RasPreprocess.preprocess_plan
+  - RasUnsteady.get_met_precipitation_config
   - RasUnsteady.set_gridded_precipitation
-  - RasUtils.remove_with_retry
-  - ras.boundaries_df
-  - ras.plan_df
+  - ras.project_folder
+  - ras.project_name
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 21
-  executed_cells: 21
+  code_cells: 9
+  executed_cells: 9
 - id: 915_realtime_forecast_workflow
   filename: 915_realtime_forecast_workflow.ipynb
-  title: Real-Time Forecast Workflow with ras-commander
+  title: Operational Forecast Orchestration and Readiness
   series: 900
   series_name: Data Integration
-  summary: check and download current HRRR and STOFS-3D forecast inputs, extract coastal WSE when data
-    are available, and show the API calls for plan-date updates, stage-boundary writing, and HEC-RAS execution
-    without running a forecast model
-  tags: []
+  summary: build a deterministic timezone-explicit forecast-cycle manifest, inspect current public API
+    signatures, and visually audit the executed HRRR, STOFS-3D, MRMS, and WPC component artifacts without
+    claiming a duplicate model compute or independent format/version qualification
+  tags:
+  - forecast
+  - operations
+  - precipitation
+  - qaqc
   difficulty: advanced
-  est_runtime: null
+  est_runtime: 5 s
   data_project: null
   functions_used:
   - RasCmdr.compute_plan
@@ -3241,16 +3969,16 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 10
-  executed_cells: 9
+  code_cells: 6
+  executed_cells: 6
 - id: 916_hrrr_precipitation_forecast
   filename: 916_hrrr_precipitation_forecast.ipynb
-  title: 'HRRR Forecast to HEC-RAS: End-to-End Rain-on-Grid Execution'
+  title: 'HRRR Forecast to HEC-RAS: Executed Rain-on-Grid Qualification'
   series: 900
   series_name: Data Integration
-  summary: select one mature live HRRR cycle, preserve source timing, write and spatially verify hourly
-    SHG DSS forcing, run converged no-rain and forecast plans through HEC-RAS 7.0, and audit hydraulic
-    response
+  summary: reproduce an archived 8 August 2024 15Z HRRR event as 18 hourly native DSS grids, verify source-to-DSS-to-temporary-and-final-HDF
+    forcing, compare no-rain and forecast hydraulics under HEC-RAS 7.0, and map localized convergence
+    exceptions for manual review
   tags:
   - 2d
   - dss
@@ -3265,7 +3993,6 @@ notebooks:
   - HdfInfiltration.get_preprocessed_infiltration_stats
   - HdfMesh.get_mesh_area_attributes
   - HdfMesh.get_mesh_areas
-  - HdfMesh.get_mesh_cell_faces
   - HdfMesh.get_mesh_cell_points
   - HdfProject.get_project_bounds_latlon
   - HdfResultsMesh.get_mesh_max_ws_err
@@ -3280,12 +4007,12 @@ notebooks:
   - RasPlan.clone_plan
   - RasPlan.clone_unsteady
   - RasPlan.update_simulation_date
+  - RasPreprocess.preprocess_plan
   - RasUnsteady.configure_gridded_dss_precipitation
   - RasUnsteady.get_gate_openings
   - RasUnsteady.get_inline_hydrograph_boundaries
   - RasUnsteady.get_met_precipitation_config
   - RasUnsteady.set_constant_precipitation
-  - ras.boundaries_df
   - ras.plan_df
   - ras.project_folder
   - ras.project_name
@@ -3293,15 +4020,16 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 12
-  executed_cells: 12
+  code_cells: 11
+  executed_cells: 11
 - id: 917_mrms_precipitation_qpe
   filename: 917_mrms_precipitation_qpe.ipynb
-  title: MRMS QPE Rain-on-Grid Workflow
+  title: MRMS QPE Boundary-Hyetograph Hydraulic Comparison
   series: 900
   series_name: Data Integration
-  summary: download archived MRMS QPE, write and verify DSS precipitation forcing, compute Davis and New
-    Orleans rain-on-grid cases, and mosaic multi-terrain stored maps into hydraulic animations
+  summary: Align archived MRMS interval ends with the model clock, write uniform precipitation boundaries,
+    and inspect complete native cumulative rainfall histories and baseline/event hydraulic diagnostics
+    for Davis and New Orleans.
   tags:
   - 2d
   - dss
@@ -3313,22 +4041,29 @@ notebooks:
   functions_used:
   - HdfMesh.get_mesh_areas
   - HdfMesh.get_mesh_cell_points
+  - HdfMesh.get_mesh_cell_polygons
+  - HdfMesh.get_mesh_sloped_topology
   - HdfProject.get_project_bounds_latlon
   - HdfPump.get_pump_station_timeseries
   - HdfPump.get_pump_stations
   - HdfResultsMesh.export_depth_rasters_at_times
   - HdfResultsMesh.get_mesh_timeseries
+  - HdfResultsPlan.get_compute_messages_hdf_only
   - RasCmdr.compute_plan
+  - RasCmdr.inspect_plan_processes
   - RasDss.get_catalog
   - RasDss.read_grid
   - RasExamples.extract_project
   - RasPlan.get_plan_value
   - RasPlan.update_plan_intervals
   - RasPlan.update_simulation_date
+  - RasPrj.find_ras_prj
+  - RasPrj.get_project_units
   - RasProcess.get_plan_timestamps
-  - RasProcess.store_maps_at_timesteps
+  - RasUnsteady.extract_boundary_and_tables
   - RasUnsteady.set_precipitation_hyetograph
   - ras.boundaries_df
+  - ras.get_boundary_conditions
   - ras.plan_df
   - ras.project_folder
   - ras.project_name
@@ -3336,8 +4071,29 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 8
-  executed_cells: 6
+  input_families:
+  - Archived hourly MRMS MultiSensor QPE Pass2 GRIB2
+  - Davis and New Orleans Metro RasExamples projects
+  operations:
+  - Audit source units, absolute times and spatial support
+  - Author and read back uniform precipitation boundaries
+  - Compare baseline/event native cumulative rainfall and hydraulic diagnostics
+  outputs:
+  - Source and serialized rainfall tables
+  - Native computation receipts and cumulative rainfall comparisons
+  - Diagnostic maps, pump plots and animations
+  runtime_requirements:
+  - Windows with HEC-RAS 7.0 for native computation
+  - HEC-Vortex and RasDss Java dependencies; archived MRMS downloads or cache
+  - ffmpeg for animations
+  evidence_scope: 'Four hourly US-customary HEC-RAS 7.0 baseline/event runs verify complete cumulative
+    rainfall histories at 505 times across 2,705 Davis cells and 361 times across 19,711 New Orleans cells.
+    Saved outputs inspect retained runs and regenerate diagnostic figures; the gallery runtime covers
+    inspection/rendering only. Native run durations are recorded separately. Uniform boundaries follow
+    simulation start; spatial rain-on-grid, other configurations and hydraulic acceptance remain unqualified.
+    Follow-ups: issues 398, 438, 440 and 441.'
+  code_cells: 10
+  executed_cells: 10
 - id: 918_hms_ras_coupled_forecast
   filename: 918_hms_ras_coupled_forecast.ipynb
   title: HMS-RAS Coupled Forecast Execution
@@ -3351,13 +4107,7 @@ notebooks:
   difficulty: advanced
   est_runtime: null
   data_project: null
-  functions_used:
-  - HdfResultsMesh.get_mesh_max_depth
-  - HdfResultsMesh.get_mesh_max_ws
-  - RasCmdr.compute_plan
-  - RasDss.write_timeseries
-  - RasPlan.update_simulation_date
-  - RasUnsteady.set_boundary_inline_hydrograph
+  functions_used: []
   hec_refs: []
   learning_paths: []
   excluded: false
@@ -3371,7 +4121,10 @@ notebooks:
   summary: compare four deterministic synthetic QPF cycles with routed flow and rating-curve stage estimates,
     plot crest convergence and flood-threshold exceedance, and dry-run RAS-ready cycle metadata with optional
     execution hooks
-  tags: []
+  tags:
+  - forecasting
+  - synthetic-forcing
+  - workflow
   difficulty: advanced
   est_runtime: null
   data_project: null
@@ -3382,7 +4135,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 9
-  executed_cells: 8
+  executed_cells: 9
 - id: 920_terrain_creation
   filename: 920_terrain_creation.ipynb
   title: Creating a RAS Terrain with ras-commander
@@ -3400,18 +4153,18 @@ notebooks:
   - RasMap.associate_geometry_layers
   - RasMap.get_hdf_geometry_association
   - RasMap.list_terrain_layers
-  - RasProcess.exe
   - RasProcess.validate_geometry_association_cli
   - RasTerrain.create_terrain_from_rasters
   - RasTerrain.create_terrain_hdf
+  - RasTerrain.export_rasmapper_terrain
   - RasTerrain.vrt_to_tiff
   - ras.geom_df
   - ras.project_name
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 25
-  executed_cells: 25
+  code_cells: 26
+  executed_cells: 26
 - id: 921_usgs_study_package_from_primitives
   filename: 921_usgs_study_package_from_primitives.ipynb
   title: USGS Study Package From Primitives
@@ -3429,63 +4182,70 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 8
-  executed_cells: 6
+  executed_cells: 8
 - id: 922_model_validation_with_usgs
   filename: 922_model_validation_with_usgs.ipynb
-  title: Model Validation with USGS Gauge Data
+  title: Model Comparison with USGS Gauge Data
   series: 900
   series_name: Data Integration
-  summary: run the Bald Eagle Creek example plan and query USGS 01548005 metadata, then conditionally
-    retrieve, align, score, and plot modeled versus observed flow when a results HDF is available; the
-    committed run stops before timeseries validation
+  summary: Compare delivered Kalamazoo HDF water levels with 276 matched USGS gauge observations; retain
+    provenance, metrics, initialization error and calibration-comparison limits.
   tags:
   - usgs
+  - calibration
+  - hdf
+  - comparison
   difficulty: advanced
   est_runtime: null
   data_project: null
   functions_used:
-  - RasCmdr.compute_plan
-  - RasExamples.extract_project
-  - ras.plan_df
-  - ras.project_folder
-  hec_refs: []
+  - HdfBase.get_result_unit_metadata
+  - HdfBndry.get_reference_points
+  - HdfPlan.get_plan_information
+  - HdfResultsPlan.get_runtime_data
+  - HdfResultsXsec.get_ref_points_timeseries
+  hec_refs:
+  - https://pubs.usgs.gov/publication/sir20265026/full
   learning_paths: []
   excluded: false
-  code_cells: 15
-  executed_cells: 11
+  input_families:
+  - Delivered Kalamazoo HDF reference-point water levels
+  - USGS gauge observations for the matched period
+  operations:
+  - Align units and time references
+  - Calculate observation comparisons with provenance
+  outputs:
+  - Matched series and comparison metrics
+  - Recorded initialization/calibration limitations
+  runtime_requirements:
+  - Python HDF and USGS dependencies
+  - Retained model artifacts and gauge data or network access; no new solver run in the repaired comparison
+  evidence_scope: Retained evidence covers 276 matched observations. Initialization failed and a distinct
+    calibrated run was unavailable; no before/after calibration improvement is claimed.
+  code_cells: 8
+  executed_cells: 8
 - id: 923_stofs3d_coastal_boundary
   filename: 923_stofs3d_coastal_boundary.ipynb
-  title: STOFS-3D Coastal Boundary Integration
+  title: 'STOFS-3D Coastal Water Levels: Units and Datum'
   series: 900
   series_name: Data Integration
-  summary: gauge, validation, forecast, and coastal boundary workflows
-  tags: []
+  summary: Extract an archived NOAA station time series with explicit datum metadata, compare feet and
+    meters, and distinguish source inspection from experimental stage authoring.
+  tags:
+  - coastal
+  - stofs
+  - datum
+  - boundary-conditions
   difficulty: advanced
   est_runtime: null
   data_project: null
-  functions_used:
-  - HdfBndry.get_bc_lines
-  - HdfMesh.get_mesh_cell_points
-  - HdfResultsMesh.get_mesh_max_ws
-  - RasCmdr.compute_plan
-  - RasEbfeModels.organize_model
-  - RasGeomWriter.exe
-  - RasPlan.set_plan_title
-  - RasPlan.set_shortid
-  - RasPlan.update_plan_description
-  - RasPlan.update_simulation_date
-  - RasUnsteady.extract_boundary_and_tables
-  - RasUnsteady.update_flow_title
-  - ras.boundaries_df
-  - ras.plan_df
-  - ras.prj_file
-  - ras.ras_exe_path
-  - ras.unsteady_df
-  hec_refs: []
+  functions_used: []
+  hec_refs:
+  - https://polar.ncep.noaa.gov/estofs/atl.htm
   learning_paths: []
   excluded: false
-  code_cells: 25
-  executed_cells: 25
+  code_cells: 7
+  executed_cells: 7
 - id: 924_mrms_netcdf_rain_on_grid
   filename: 924_mrms_netcdf_rain_on_grid.ipynb
   title: MRMS NetCDF Rain-on-Grid Validation
@@ -3499,12 +4259,16 @@ notebooks:
   data_project: null
   functions_used:
   - HdfMesh.get_mesh_areas
+  - HdfMesh.get_mesh_cell_points
+  - HdfMesh.get_mesh_cell_polygons
   - HdfProject.get_project_bounds_latlon
   - HdfResultsMesh.get_mesh_cells_timeseries
+  - HdfResultsPlan.get_compute_messages_hdf_only
   - RasCmdr.compute_plan
   - RasExamples.extract_project
   - RasPlan.update_plan_intervals
   - RasPlan.update_simulation_date
+  - RasPreprocess.preprocess_plan
   - RasUnsteady.get_met_precipitation_config
   - RasUnsteady.set_gridded_precipitation
   - ras.plan_df
@@ -3513,15 +4277,19 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 12
-  executed_cells: 0
+  code_cells: 13
+  executed_cells: 13
 - id: 925_xs_interpolation_surface
   filename: 925_xs_interpolation_surface.ipynb
   title: Cross-Section Interpolation Surface
   series: 900
   series_name: Data Integration
-  summary: terrain and geometry surface workflows
-  tags: []
+  summary: Build cross-section TIN interpolation surfaces from real geometry, write spatial review layers
+    and optional rasters, and compare channel-only and full-extent surfaces.
+  tags:
+  - terrain
+  - cross-sections
+  - interpolation
   difficulty: advanced
   est_runtime: null
   data_project: Muncie
@@ -3538,25 +4306,52 @@ notebooks:
   executed_cells: 10
 - id: 926_wpc_qpf_precipitation_forecast
   filename: 926_wpc_qpf_precipitation_forecast.ipynb
-  title: WPC QPF Precipitation Forecast to DSS
+  title: WPC QPF DSS-to-HEC-RAS Rain-on-Grid Qualification
   series: 900
   series_name: Data Integration
-  summary: download current WPC QPF grids, crop them to a regional extent, write HEC-DSS, verify the fresh
-    catalog, and map the source precipitation field
+  summary: qualify a complete current WPC forecast through verified native-projection GRIB crops, 28 DSS
+    grids, temporary and final HDF forcing, no-rain/event HEC-RAS 7.0 simulations, hydraulic response,
+    mapped convergence exceptions, and explicit manual review
   tags:
   - dss
   - forecast
   - precipitation
   difficulty: advanced
   est_runtime: null
-  data_project: null
+  data_project: BaldEagleCrkMulti2D
   functions_used:
+  - HdfBndry.get_bc_lines
+  - HdfInfiltration.get_preprocessed_infiltration_stats
+  - HdfMesh.get_mesh_area_attributes
+  - HdfMesh.get_mesh_areas
+  - HdfMesh.get_mesh_cell_points
+  - HdfProject.get_project_bounds_latlon
+  - HdfResultsMesh.get_mesh_max_ws_err
+  - HdfResultsMesh.get_mesh_timeseries
+  - HdfResultsPlan.get_compute_messages_hdf_only
+  - HdfResultsPlan.get_volume_accounting
+  - HdfStruc.get_structures
+  - RasCmdr.compute_plan
   - RasDss.get_catalog
+  - RasDss.read_grid
+  - RasExamples.extract_project
+  - RasPlan.clone_plan
+  - RasPlan.clone_unsteady
+  - RasPlan.update_simulation_date
+  - RasPreprocess.preprocess_plan
+  - RasUnsteady.configure_gridded_dss_precipitation
+  - RasUnsteady.get_inline_hydrograph_boundaries
+  - RasUnsteady.get_met_precipitation_config
+  - RasUnsteady.set_constant_precipitation
+  - ras.plan_df
+  - ras.project_folder
+  - ras.project_name
+  - ras.rasmap_df
   hec_refs: []
   learning_paths: []
   excluded: false
-  code_cells: 5
-  executed_cells: 1
+  code_cells: 11
+  executed_cells: 11
 - id: 930_terrain_modification_analysis
   filename: 930_terrain_modification_analysis.ipynb
   title: Terrain Modification Analysis
@@ -3583,6 +4378,31 @@ notebooks:
   excluded: false
   code_cells: 10
   executed_cells: 10
+- id: 931_native_rasmapper_terrain_export
+  filename: 931_native_rasmapper_terrain_export.ipynb
+  title: Native RAS Mapper Terrain Export
+  series: 900
+  series_name: Data Integration
+  summary: export a registered, stitched RAS Mapper terrain to one bounded and semantically validated
+    GeoTIFF, then inspect its typed result, source inventory, receipt, grid alignment, and visual evidence
+  tags:
+  - rasmapper
+  - terrain
+  difficulty: advanced
+  est_runtime: null
+  data_project: Muncie
+  functions_used:
+  - RasExamples.extract_project
+  - RasMap.list_terrain_layers
+  - RasTerrain.export_rasmapper_terrain
+  - ras.project_folder
+  - ras.project_name
+  - ras.ras_version
+  hec_refs: []
+  learning_paths: []
+  excluded: false
+  code_cells: 9
+  executed_cells: 9
 - id: 950_ebfe_spring_creek
   filename: 950_ebfe_spring_creek.ipynb
   title: 'Using eBFE Models: Spring Creek 2D Analysis'
@@ -3613,6 +4433,19 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - FEMA eBFE/BLE archive and delivered model files
+  operations:
+  - Organize project files
+  - Inspect boundaries, geometry, and delivered results
+  outputs:
+  - Organized project inventory
+  - Data availability and model-review outputs
+  runtime_requirements:
+  - Archive download/cache and Python HDF/geospatial dependencies
+  - Installed HEC-RAS only for the optional geometry-preprocessor stage
+  evidence_scope: Delivered-result inspection is distinct from newly executed model verification; RUN_GEOMETRY_PREPROCESSOR
+    defaults to False.
   code_cells: 11
   executed_cells: 11
 - id: 951_ebfe_north_galveston_bay
@@ -3620,8 +4453,8 @@ notebooks:
   title: 'Using eBFE Models: North Galveston Bay HMS + RAS Integration'
   series: 950
   series_name: eBFE Delivery Validation
-  summary: This notebook demonstrates working with compound eBFE/BLE models that include both HEC-HMS
-    hydrologic and HEC-RAS hydraulic models.
+  summary: Organize a compound North Galveston Bay HMS/RAS delivery and inspect its model paths; file
+    discovery does not establish executable coupling.
   tags:
   - ebfe
   difficulty: advanced
@@ -3685,7 +4518,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 7
-  executed_cells: 6
+  executed_cells: 7
 - id: 954_ebfe_lake_maurepas_validation
   filename: 954_ebfe_lake_maurepas_validation.ipynb
   title: 'Using eBFE Models: Lake Maurepas Validation'
@@ -3707,7 +4540,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 11
-  executed_cells: 9
+  executed_cells: 11
 - id: 955_ebfe_tickfaw_validation
   filename: 955_ebfe_tickfaw_validation.ipynb
   title: 'Using eBFE Models: Tickfaw Results-Ready Validation'
@@ -3730,7 +4563,39 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 11
-  executed_cells: 9
+  executed_cells: 11
+- id: 956_hydrofabric_conflation_visual_qa
+  filename: 956_hydrofabric_conflation_visual_qa.ipynb
+  title: NextGen Hydrofabric Conflation Visual QA — Texas eBFE Shiloh Branch
+  series: 950
+  series_name: eBFE Delivery Validation
+  summary: Visually audits generic HEC-RAS-to-network conflation with the NextGen v2.2 adapter on the
+    Texas Lower Colorado-Cummins SHILOH BRANCH model, including native flowpath and catchment IDs, candidate
+    ranks, score components, explicit resolution states, HUC intersections, and cross-section measures.
+  tags:
+  - 1d
+  - ebfe
+  - geometry
+  - hydrofabric
+  - nextgen
+  - qa
+  difficulty: advanced
+  est_runtime: 5 min
+  data_project: null
+  functions_used:
+  - HdfProject.get_project_extent
+  - HdfXsec.get_cross_sections
+  - HdfXsec.get_river_centerlines
+  - RasCmdr.compute_plan
+  - RasEbfeModels.organize_model
+  - RasNetworkConflation.conflate
+  - RasPlan.update_run_flags
+  - ras.project_name
+  hec_refs: []
+  learning_paths: []
+  excluded: false
+  code_cells: 13
+  executed_cells: 13
 - id: 957_ebfe_spring_river_validation
   filename: 957_ebfe_spring_river_validation.ipynb
   title: 'Using eBFE Models: Spring River Validation'
@@ -3752,14 +4617,18 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 10
-  executed_cells: 9
+  executed_cells: 10
 - id: 958_model_sources_showcase
   filename: 958_model_sources_showcase.ipynb
   title: 'Model Sources: Unified Discovery, Download & Visualization'
   series: 950
   series_name: eBFE Delivery Validation
-  summary: FEMA eBFE/BLE organization and validation
-  tags: []
+  summary: Discover and download representative models from several public catalogs, initialize each project,
+    and optionally capture native RAS Mapper review images.
+  tags:
+  - model-sources
+  - catalog
+  - rasmapper
   difficulty: advanced
   est_runtime: null
   data_project: null
@@ -3771,6 +4640,71 @@ notebooks:
   excluded: false
   code_cells: 23
   executed_cells: 23
+- id: 959_ebfe_2d_breakout_geometry_preparation
+  filename: 959_ebfe_2d_breakout_geometry_preparation.ipynb
+  title: Austin Bayou SH 35 2D Breakout and NextGen Validation
+  series: 950
+  series_name: eBFE Delivery Validation
+  summary: Inspect the Austin Bayou completed child, conflate a NextGen reach, author external boundaries,
+    and review a parent-derived flow ladder and focused parent/child comparison.
+  tags:
+  - 2d
+  - breakout
+  - ebfe
+  - geometry
+  - mesh
+  - nextgen
+  - boundary-conditions
+  - validation
+  difficulty: advanced
+  est_runtime: null
+  data_project: AustinBayouSH35Firehose
+  functions_used:
+  - GeomBcLines.add_bc_lines
+  - GeomBcLines.delete_bc_line
+  - HdfBndry.get_bc_external_faces
+  - HdfBndry.get_bc_lines
+  - HdfMesh.get_mesh_areas
+  - HdfResultsMesh.get_mesh_max_depth
+  - HdfResultsMesh.get_mesh_max_ws
+  - HdfResultsMesh.get_mesh_timeseries
+  - RasBreakout2D.preflight
+  - RasBreakout2D.review_parent_boundary_flux
+  - RasCmdr.compute_plan
+  - RasExamples.extract_project
+  - RasNetworkConflation.classify_edges
+  - RasPlan.clone_plan
+  - RasPlan.clone_unsteady
+  - RasPlan.update_simulation_date
+  - RasUnsteady.extract_boundary_and_tables
+  - RasUnsteady.replace_2d_boundary_locations
+  - RasUnsteady.set_boundary_inline_hydrograph
+  - RasUnsteady.set_flow_hydrograph_slope
+  - RasUnsteady.set_normal_depth_boundary
+  hec_refs: []
+  learning_paths: []
+  excluded: false
+  input_families:
+  - Public Austin Bayou SH35 completed child fixture
+  - Optional organized Austin–Oyster parent model and retained results
+  - NextGen v2.2 flowpaths
+  operations:
+  - Inspect native boundary-face ownership
+  - Conflate and screen the reach-derived domain
+  - Author external boundaries in isolated copies
+  - Build parent-derived flow plateaus and review diagnostics
+  outputs:
+  - Boundary and domain evidence
+  - Flow-ladder plans and retained hydraulic diagnostics
+  - Focused parent/child gauge-location comparison
+  runtime_requirements:
+  - Installed compatible HEC-RAS for native preprocessing and new solves
+  - Organized parent required for optional parent-derived checks; not downloaded automatically
+  evidence_scope: Retained child and focused hydraulic diagnostics demonstrate the stated example. Compact
+    constant-flow domain omits tributary inflow and does not substitute for watershed-preserving rainfall
+    modeling or complete engineering validation.
+  code_cells: 15
+  executed_cells: 15
 - id: 960_cloud_native_geometry_export
   filename: 960_cloud_native_geometry_export.ipynb
   title: Cloud-Native Geometry Export with ras2cng
@@ -3789,7 +4723,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 16
-  executed_cells: 14
+  executed_cells: 16
 - id: 961_cloud_native_results_export
   filename: 961_cloud_native_results_export.ipynb
   title: Cloud-Native Results Export with ras2cng
@@ -3813,7 +4747,7 @@ notebooks:
   learning_paths: []
   excluded: false
   code_cells: 16
-  executed_cells: 14
+  executed_cells: 16
 - id: 962_cloud_native_cog_results_export
   filename: 962_cloud_native_cog_results_export.ipynb
   title: Cloud Optimized GeoTIFF Results Export with ras2cng
@@ -3834,5 +4768,53 @@ notebooks:
   hec_refs: []
   learning_paths: []
   excluded: false
+  input_families:
+  - Computed 2D result HDF and geometry
+  operations:
+  - Prepare example results
+  - Export cloud-native raster results with ras2cng
+  outputs:
+  - COG result rasters and export metadata
+  runtime_requirements:
+  - ras2cng and raster dependencies
+  - Installed HEC-RAS for the example compute stage; configured version 6.6
+  evidence_scope: Exported products reflect the selected producer results and options; product generation
+    alone does not establish hydraulic quality.
   code_cells: 13
-  executed_cells: 11
+  executed_cells: 13
+- id: 963_froude_shear_timestep_maps
+  filename: 963_froude_shear_timestep_maps.ipynb
+  title: Froude and shear-stress maps at selected timesteps
+  series: 960
+  series_name: Cloud-Native Export
+  summary: Configure and compute a copied Muncie plan, export maximum and selected-timestep Froude and
+    bed-shear-stress GeoTIFFs, verify their HDF sources and georeferencing, and visually review the real
+    hydraulic outputs.
+  tags:
+  - 2d
+  - results
+  - raster
+  - froude
+  - shear-stress
+  - qaqc
+  difficulty: advanced
+  est_runtime: 2-3 minutes
+  data_project: null
+  functions_used:
+  - HdfMesh.get_mesh_area_names
+  - HdfResultsPlan.get_compute_messages
+  - RasCmdr.compute_plan
+  - RasExamples.extract_project
+  - RasPlan.clone_plan
+  - RasPlan.get_hdf_output_options
+  - RasPlan.get_hdf_output_variables
+  - RasPlan.set_hdf_output_variables
+  - RasProcess.get_plan_timestamps
+  - RasProcess.store_maps
+  - RasProcess.store_maps_at_timesteps
+  - ras.plan_df
+  hec_refs: []
+  learning_paths: []
+  excluded: false
+  code_cells: 10
+  executed_cells: 10

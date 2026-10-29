@@ -7,7 +7,31 @@ Classes for reading and writing HEC-DSS files.
 Read HEC-DSS files for boundary condition extraction and write DSS time-series
 or gridded precipitation records.
 
+`write_grid_timeseries()` already supports direct array-to-grid writing using
+HEC Monolith. `write_precip_grid_arrays()` is an optional native alternative;
+pydsstools is not required for existing Monolith users.
+
 ### Methods
+
+#### write_precip_grid_arrays(dss_file, pathname, data, interval_bounds, *, transform, crs, units, nodata=None, overwrite=False)
+
+Write NumPy interval-depth arrays directly to DSS7 specified-time grids using
+optional `ras-commander[dss-native]` (gyanz/pydsstools). Requires no Java/Vortex.
+Windows still requires the Visual C runtime and UCRT; a compatible wheel does
+not require a compiler. Tested pydsstools 3.1.0 provides Windows x64 wheels for
+CPython 3.9–3.13, not 3.14. See the
+[runtime and Python dependency details](../user-guide/dss-operations.md#direct-precipitation-arrays-to-dss7)
+before selecting this backend.
+`data` is `(time, row, column)` with row zero north. Provide `n_times+1`
+timezone-naive whole-minute boundaries, projected CRS, square north-up Affine
+transform, and explicit inches or mm units. Records use PER-CUM depth. No
+reprojection or numeric unit conversion is performed. NaN/masked values and
+`nodata` become native DSS missing values. Existing files fail unless
+`overwrite=True`, which replaces the whole file after writing and readback.
+
+Returns exact pathnames with D/E interval start/end times. See
+[Direct precipitation arrays](../user-guide/dss-operations.md#direct-precipitation-arrays-to-dss7)
+for an example and compatibility limits.
 
 #### get_catalog(dss_file)
 Get catalog of all paths in a DSS file.
@@ -15,7 +39,7 @@ Get catalog of all paths in a DSS file.
 **Parameters:**
 - `dss_file` (str|Path): Path to DSS file
 
-**Returns:** DataFrame with columns A, B, C, D, E, F parts
+**Returns:** DataFrame with one `pathname` column containing full DSS paths
 
 #### read_timeseries(dss_file, pathname)
 Read a single time series from DSS.
@@ -35,7 +59,7 @@ Read multiple time series at once.
 
 **Returns:** Dict of {pathname: DataFrame}
 
-#### write_timeseries(dss_file, pathname, times, values)
+#### write_timeseries(dss_file, pathname, times, values, ..., dss_version=None)
 Write a single time series to DSS.
 
 **Parameters:**
@@ -45,8 +69,27 @@ Write a single time series to DSS.
 - `values` (list|ndarray): Numeric values
 - `units` (str): Units, default `CFS`
 - `data_type` (str): DSS data type, default `INST-VAL`
+- `create_if_missing` (bool): Create a missing file, default `True`
+- `dss_version` (int|None): Keyword-only DSS 6 or DSS 7 selection for new
+  files. The default `None` preserves the bridge's current default. An explicit
+  value must match an existing file.
 
-#### write_grid_timeseries(dss_file, pathname, data, times, grid_info)
+Datetime values must be timezone-naive and aligned exactly to whole minutes.
+Callers with timezone-aware data must explicitly convert it to the intended
+HEC-RAS model clock and remove timezone metadata before writing.
+For simulations spanning a daylight-saving fallback, choose a fixed-offset or
+otherwise strictly increasing model clock; merely stripping timezone metadata
+from a repeated local hour creates ambiguous duplicate model times.
+
+#### get_file_version(dss_file)
+Return the authoritative HEC-DSS major file version.
+
+**Parameters:**
+- `dss_file` (str|Path): Existing DSS file
+
+**Returns:** Integer `6` or `7`.
+
+#### write_grid_timeseries(dss_file, pathname, data, times, grid_info, ..., dss_version=None)
 Write a time-varying spatial grid series to DSS.
 
 **Parameters:**
@@ -58,8 +101,136 @@ Write a time-varying spatial grid series to DSS.
   `n_times` interval end times
 - `grid_info` (dict): Grid metadata such as `cellsize`, `origin`, `crs`,
   `units`, and `data_type`
+- `create_if_missing` (bool): Create a missing file, default `True`
+- `dss_version` (int|None): Keyword-only DSS 6 or DSS 7 selection for new
+  files. The default `None` preserves the bridge's current default. An explicit
+  value must match an existing file. Explicit DSS6 writes use the Monolith's
+  version-specific safe precipitation-compression base/scale ordering unless
+  those values are supplied in `grid_info`.
 
 **Returns:** List of DSS pathnames written.
+
+Grid timestamps must also be timezone-naive. ras-commander does not infer a
+model timezone or silently convert aware timestamps.
+
+#### copy_grid_with_zero_tail(source_dss, output_dss, pathname, tail_intervals, ...)
+
+Create a non-destructive DSS grid derivative containing one selected grid
+family followed by explicit zero-valued intervals.
+
+The intended workflow is to prepare a run-local gridded precipitation or
+rainfall-excess DSS derivative for a HEC-RAS rain-on-grid scenario. A caller can
+keep an AORC-like source immutable, optionally express UTC grid timestamps on
+the model clock with an explicitly chosen shift, optionally rename the forcing
+family and apply an approved whole-cell origin translation, then append
+explicit zero-forcing intervals. Those zero intervals allow the model run to
+continue through post-storm routing or recession after the source rainfall
+ends.
+
+In the source PR workflow, `RasScenario` accepted this already-prepared
+`forcing_excess_dss` and wired it to Gridded/DSS precipitation. The derivative
+was prepared upstream; `RasScenario` did not directly call this method.
+
+This method does not calculate rainfall or rainfall excess, scientifically
+transpose a storm, reproject, resample, or interpolate grids, infer a time
+zone, or decide engineering suitability. The caller remains responsible for
+those scientific and study-specific decisions.
+
+**Parameters:**
+
+- `source_dss` (str|Path): Existing DSS6 or DSS7 source. It is never modified.
+- `output_dss` (str|Path): Destination derivative. It must differ from the
+  source. An output symlink, junction, or other reparse point is rejected
+  before it can be followed. Only its parent directory is safely resolved;
+  the requested final path component is preserved lexically through
+  publication.
+- `pathname` (str): Exact A/B/C/F family selector with blank D and E parts,
+  such as `/SHG/BASIN/PRECIPITATION///AORC/`.
+- `tail_intervals` (int): Positive number of zero-valued intervals to append.
+- `time_shift_minutes` (int): Optional signed whole-minute shift applied to
+  every source and tail window.
+- `output_pathname` (str|None): Optional output A/B/C/F family, also with blank
+  D/E parts. When omitted, the caller selector's A/B/C/F casing is preserved;
+  source selection itself remains case-insensitive and rejects case-ambiguous
+  families.
+- `x_shift`, `y_shift` (float): Optional origin translations in the grid's
+  horizontal units. Each must be an exact whole-cell increment.
+- `overwrite` (bool): If `True`, atomically replace an existing destination
+  after complete temporary readback. If `False`, publish atomically with a
+  create-if-absent hard link; a filesystem without hard-link support fails
+  closed and never falls back to replacement.
+
+**Returns:** A summary dictionary containing DSS version, accepted source
+SHA-256, source/output coverage, interval, translations, rewritten source
+paths, and appended paths.
+
+The output always contains only the selected family plus its tail; unrelated
+source records are not copied. The source DSS major version is preserved. All
+matched records must form one unambiguous, uniform, contiguous family with
+consistent shape, spatial reference, resolution, origin, parameter metadata,
+NoData value and footprint, and compression configuration. Tail cells are zero
+where the source footprint contains data and remain NoData everywhere else.
+The safe-rewrite path currently supports Albers/SHG and specified grids; other
+grid metadata classes fail closed rather than being converted implicitly.
+Accepted legacy double-leading pathname syntax is canonicalized to the normal
+single-leading `/A/B/C/D/E/F/` form before records are written. D/E parts must
+use exact minute-granularity `DDMMMYYYY:HHMM` syntax with English uppercase
+month tokens. The narrow valid `2400` spelling means next-day midnight;
+`24:01` through `24:59` are rejected. Native HEC-DSS grid catalogs spell a
+midnight record end as prior-day `2400` and the same instant as a following
+record start as next-day `0000`. Returned derivative pathnames use this
+role-specific native spelling, while raw timing and parsed instants must still
+match exactly.
+
+The method validates the source in a streaming first pass, then rereads and
+writes one source frame per writer call and reuses one zero frame for the tail.
+It does not stack the source family or materialize the complete tail in memory.
+The source file is hashed in chunks before catalog access, after prevalidation,
+and after the write-read pass. Any detected digest mismatch aborts before
+publication; these checkpoints are not a continuous file lock.
+
+After writing, the temporary derivative must preserve the source DSS major
+version and contain the independently derived exact catalog. Every temporary
+record is then reopened one at a time. Rewritten source frames must match an
+exact normalized float32 digest (canonical NaN and signed zero), tails must
+contain exact zero on data cells and the stable source NoData mask, raw timing
+must match the expected window, and all write-relevant metadata must match the
+source reference except for the requested mechanical origin translation.
+
+For `overwrite=False`, hard-link creation is the atomic no-clobber instruction:
+if another writer wins the final race, `FileExistsError` is raised and that
+destination is preserved. Unsupported hard links raise `OSError` and leave the
+destination absent. For `overwrite=True`, same-directory `os.replace()` is
+atomic, but the new derivative replaces the old destination's timestamps,
+permissions/ACL details, hard-link identity, and other file metadata.
+Because the final output component is not resolved or followed after its
+initial reparse-point check, a competing entry at that exact name either wins
+the no-clobber hard-link race or is itself replaced under `overwrite=True`;
+the implementation does not redirect publication through that entry to a
+different target.
+
+Time, pathname, and origin changes are lexical/mechanical metadata transforms,
+not scientific transformations of the forcing.
+
+Stable failures include `FileNotFoundError` for a missing source,
+`FileExistsError` for no-clobber conflicts, `IsADirectoryError` for non-file DSS
+paths, `ValueError` for unsafe inputs/families/metadata, `ImportError` when the
+optional Java bridge is unavailable, `OSError` for filesystem publication
+failures, and `RuntimeError` for source-stability or DSS I/O/readback failures.
+
+```python
+result = RasDss.copy_grid_with_zero_tail(
+    "source.dss",
+    "derivative.dss",
+    "/SHG/BASIN/PRECIPITATION///AORC/",
+    3,
+    time_shift_minutes=-300,
+    output_pathname="/SHG/BASIN/PRECIPITATION///AORC-SHIFTED/",
+    x_shift=2000,
+    y_shift=3000,
+)
+print(result["appended_pathnames"])
+```
 
 Common SHG precipitation metadata:
 
@@ -73,14 +244,19 @@ grid_info = {
 }
 ```
 
-#### extract_boundary_timeseries(boundaries_df, ras_object)
+<a id="extract_boundary_timeseriesboundaries_df-ras_object"></a>
+
+#### extract_boundary_timeseries(boundaries_df, project_dir=None, ras_object=None)
 Extract all DSS boundary conditions from a project.
 
 **Parameters:**
 - `boundaries_df` (DataFrame): From ras.boundaries_df
-- `ras_object` (RasPrj): Project object
+- `project_dir` (str|Path|None): Directory for resolving relative DSS paths
+- `ras_object` (RasPrj|None): Project object, passed by keyword
 
-**Returns:** Dict of {boundary_name: DataFrame}
+**Returns:** Copy of the boundary DataFrame with a `dss_timeseries`
+column. Unread or unsuccessful entries remain `None`; inspect logged warnings
+for missing paths and read failures.
 
 #### get_info(dss_file)
 Get DSS file information.
@@ -88,7 +264,8 @@ Get DSS file information.
 **Parameters:**
 - `dss_file` (str|Path): Path to DSS file
 
-**Returns:** Dict with version, num_records, pathnames, file_size
+**Returns:** Dict with filepath, filename, file size, total pathname count, and
+a preview of the first five catalog rows.
 
 ## Usage
 
@@ -128,7 +305,7 @@ print(written)
 # Extract all boundary conditions from project
 from ras_commander import init_ras_project, ras
 init_ras_project("/path/to/project", "6.5")
-bc_data = RasDss.extract_boundary_timeseries(ras.boundaries_df, ras)
+bc_data = RasDss.extract_boundary_timeseries(ras.boundaries_df, ras_object=ras)
 ```
 
 ## Grid Java API Mapping
@@ -155,8 +332,64 @@ payload is `GridData` plus a `GridInfo` subclass (`AlbersInfo`,
 `GriddedData.storeGriddedData()` because that is the stable grid write path from
 pyjnius for the Monolith version used by ras-commander.
 
+## RasUnsteady DSS inventory
+
+### get_dss_boundaries(unsteady_file, ras_object=None)
+
+Return the DSS-linked boundary inventory for one unsteady-flow file. Canonical
+2D identity columns are `area_2d` and `bc_line_name`, matching
+`ras.boundaries_df`. The older `sa_2d_name` and `bc_line` columns remain equal
+compatibility aliases but are deprecated. The returned DataFrame records this
+mapping in `df.attrs["deprecated_columns"]`.
+
+The current mutation methods retain their compatibility parameter names. For
+example, pass `sa_2d_name=row["area_2d"]` and
+`bc_line=row["bc_line_name"]` to `set_boundary_dss_link()`. Canonical mutation
+keyword aliases are not added in this release.
+
+## Read behavior
+
+`read_timeseries()` accepts `start_date` and `end_date`, but the current
+implementation returns the complete series without applying those filters.
+Select the desired window from the returned DatetimeIndex explicitly. Returned
+`attrs` retain pathname, units, type, interval, and source path.
+
+Java DSS handles are write-capable. Check that a source exists before opening it;
+some read paths can create a missing file. Use a verified disposable copy when
+source immutability is required. These APIs do not guarantee read-only file access.
+
 ## Requirements
 
 - `pip install pyjnius`
 - Java 8+ (JRE or JDK)
 - HEC Monolith libraries (auto-downloaded on first use)
+
+## Complete source reference
+
+### RasDss source reference
+
+::: ras_commander.dss.RasDss.RasDss
+    options:
+      show_root_heading: false
+      heading_level: 3
+      show_source: false
+      members:
+        - check_data_availability
+        - check_file_exists
+        - check_pathname
+        - check_pathname_exists
+        - check_pathname_format
+        - copy_grid_with_zero_tail
+        - extract_boundary_timeseries
+        - get_catalog
+        - get_file_version
+        - get_info
+        - is_pathname_available
+        - is_valid_pathname
+        - read_grid
+        - read_multiple_timeseries
+        - read_timeseries
+        - shutdown_jvm
+        - write_grid_timeseries
+        - write_timeseries
+        - write_timeseries_from_dataframe

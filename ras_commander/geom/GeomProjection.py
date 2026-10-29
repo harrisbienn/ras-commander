@@ -16,11 +16,14 @@ import xml.etree.ElementTree as ET
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
+from .._ras_text import _write_ras_text, _write_ras_xml
 from ..Decorators import log_call
 from ..LoggingConfig import get_logger
+from ..fast_hdf import read_typed, reraise_required
 from ..RasUtils import RasUtils
 from .GeomParser import GeomParser
 from .GeomStorage import GeomStorage
+from ..fast_hdf import h5py_until_qualified
 
 logger = get_logger(__name__)
 
@@ -56,6 +59,7 @@ _POSITION_KEYWORDS = (
     "Reference Line Start Position",
     "Reference Line Middle Position",
     "Reference Line End Position",
+    "Reference Point Position",
     "IC Point Position",
 )
 
@@ -150,7 +154,7 @@ class GeomProjection:
             lines,
             transformer,
         )
-        out_path.write_text("".join(transformed_lines), encoding="utf-8")
+        _write_ras_text(out_path, "".join(transformed_lines), encoding="utf-8")
 
         qa = GeomProjection._qa_geometry_lines(transformed_lines)
         result = {
@@ -755,7 +759,8 @@ class GeomProjection:
         if not filename.lower().endswith(".prj"):
             filename = f"{filename}.prj"
         projection_path = projection_dir / filename
-        projection_path.write_text(
+        _write_ras_text(
+            projection_path,
             destination_crs.to_wkt(version="WKT1_ESRI"),
             encoding="utf-8",
         )
@@ -784,7 +789,7 @@ class GeomProjection:
             )
             projection_elem.set("Filename", new_ref)
             projection_elem.text = None
-            tree.write(rasmap_path, encoding="utf-8", xml_declaration=False)
+            _write_ras_xml(tree, rasmap_path, encoding="utf-8", xml_declaration=False)
             updates.append(
                 {
                     "rasmap_path": str(rasmap_path),
@@ -1051,8 +1056,8 @@ class GeomProjection:
             projection = HdfBase.get_projection(path)
             if projection:
                 return GeomProjection._crs_from_input(projection)
-        except Exception:
-            pass
+        except Exception as exc:
+            reraise_required(exc)
 
         if path.suffix.lower() in {".tif", ".tiff"}:
             try:
@@ -1073,6 +1078,7 @@ class GeomProjection:
             return GeomProjection._crs_label(left_crs) == GeomProjection._crs_label(right_crs)
 
     @staticmethod
+    @h5py_until_qualified
     def _inspect_compiled_geometry_hdfs(geom_paths: Sequence[Path]) -> List[Dict[str, Any]]:
         records = []
         for geom_path in geom_paths:
@@ -1108,6 +1114,7 @@ class GeomProjection:
                             GeomProjection._inspect_refinement_region_integrity(hdf)
                         )
                 except Exception as exc:
+                    reraise_required(exc)
                     record["compiled_hdf_warning"] = str(exc)
             records.append(record)
         return records
@@ -1158,9 +1165,9 @@ class GeomProjection:
             issues.append("Refinement region Polygon Parts must be an Nx2 dataset.")
 
         if not issues:
-            points = polygon_points[:]
-            parts = polygon_parts[:]
-            for region_index, row in enumerate(polygon_info[:]):
+            points = read_typed(polygon_points, slice(None))
+            parts = read_typed(polygon_parts, slice(None))
+            for region_index, row in enumerate(read_typed(polygon_info, slice(None))):
                 pnt_start, pnt_count, part_start, part_count = [
                     int(value) for value in row[:4]
                 ]

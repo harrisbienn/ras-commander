@@ -14,10 +14,12 @@ List of Functions:
 - identify_section() - Find section boundaries by keyword marker
 - extract_keyword_value() - Extract value following keyword
 - extract_comma_list() - Extract comma-separated list
+- extract_river_reach() - Parse modern and legacy 1D reach headers
 - create_backup() - Create .bak backup before modification
 - validate_river_reach_rs() - Validate river/reach/RS exists
 - get_geom_title() - Read the Geom Title from a geometry file
 - set_geom_title() - Write the Geom Title to a geometry file
+- get_1d_footprint() - Build reach footprints from text XS cut-line endpoints
 
 Example Usage:
     >>> from ras_commander import GeomParser
@@ -35,9 +37,11 @@ Example Usage:
 
 import re
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any, Union
+from typing import Any, List, Optional, Tuple, Union
 from datetime import datetime
 
+from .._fixed_width import _format_fixed_width_value
+from .._ras_text import _write_ras_text
 from ..LoggingConfig import get_logger
 from ..Decorators import log_call
 
@@ -122,6 +126,7 @@ class GeomParser:
         return values
 
     @staticmethod
+    @log_call
     def format_fixed_width(values: List[float],
                           column_width: int = 8,
                           values_per_line: int = 10,
@@ -143,6 +148,9 @@ class GeomParser:
         Returns:
             List[str]: Lines with fixed-width formatted values (with newlines)
 
+        Raises:
+            ValueError: A value is non-finite or cannot fit the column.
+
         Example:
             >>> values = [0.0, 963.04, 27.2, 963.04]
             >>> lines = GeomParser.format_fixed_width(values, 8, 10, 2)
@@ -157,7 +165,8 @@ class GeomParser:
 
         Notes:
             - Based on RasUnsteady.write_table_to_file() pattern
-            - Values are formatted as f'{value:{column_width}.{precision}f}'
+            - Requested decimals are retained where they fit, then reduced one
+              at a time; values that cannot fit raise ValueError
             - Right-aligned within column, left-padded with spaces
             - Last line may have fewer than values_per_line values
         """
@@ -166,7 +175,14 @@ class GeomParser:
         for i in range(0, len(values), values_per_line):
             row_values = values[i:i+values_per_line]
             # Format each value with specified width and precision
-            formatted_row = ''.join(f'{value:{column_width}.{precision}f}' for value in row_values)
+            formatted_row = ''.join(
+                _format_fixed_width_value(
+                    value, width=column_width, max_decimals=precision,
+                    normalize_negative_zero=False,
+                    preserve_decimal=True,
+                )
+                for value in row_values
+            )
             lines.append(formatted_row + '\n')
 
         return lines
@@ -385,6 +401,32 @@ class GeomParser:
         return values
 
     @staticmethod
+    def extract_river_reach(line: str) -> Optional[Tuple[str, str]]:
+        """Parse modern and legacy 1D reach headers.
+
+        HEC-RAS 5+ writes ``River Reach=<river>,<reach>``. Older projects can
+        instead contain the single-name ``Reach=<name>`` form; when HEC-RAS
+        upgrades those projects it materializes that name as both River and
+        Reach. Mirror that vendor conversion so legacy projects classify as
+        1D before they are opened or mutated by HEC-RAS.
+
+        Returns:
+            ``(river, reach)`` for a recognized non-empty header, otherwise
+            ``None``.
+        """
+        stripped = line.strip()
+        if stripped.startswith("River Reach="):
+            values = GeomParser.extract_comma_list(stripped, "River Reach")
+            if len(values) >= 2 and values[0] and values[1]:
+                return values[0], values[1]
+            return None
+        if stripped.startswith("Reach="):
+            name = GeomParser.extract_keyword_value(stripped, "Reach").strip()
+            if name:
+                return name, name
+        return None
+
+    @staticmethod
     @log_call
     def create_backup(file_path: Path) -> Path:
         """
@@ -481,7 +523,7 @@ class GeomParser:
 
     @staticmethod
     @log_call
-    def safe_write_geometry(geom_file: Path,
+    def safe_write_geometry(geom_file: Union[str, Path],
                             modified_lines: List[str],
                             create_backup: bool = True) -> Optional[Path]:
         """
@@ -499,7 +541,7 @@ class GeomParser:
             5. Return backup path for potential rollback
 
         Parameters:
-            geom_file (Path): Path to geometry file to write
+            geom_file (str | Path): Path to geometry file to write
             modified_lines (List[str]): Lines to write to file
             create_backup (bool): Create .bak file before modifying (default True)
 
@@ -539,9 +581,8 @@ class GeomParser:
                 backup_path = GeomParser.create_backup(geom_file)
                 logger.debug(f"Created backup: {backup_path}")
 
-            # Step 2: Write to temp file
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                f.writelines(modified_lines)
+            # Step 2: Write engine records with CRLF on every platform.
+            _write_ras_text(temp_path, "".join(modified_lines), encoding="utf-8")
 
             # Step 3: Basic validation - check temp file has content
             if temp_path.stat().st_size == 0:
@@ -549,14 +590,7 @@ class GeomParser:
 
             # Step 4: Atomic rename temp -> original
             import os
-            if os.name == 'nt':  # Windows
-                # Windows doesn't support atomic rename over existing file
-                # Remove original first, then rename
-                geom_file.unlink()
-                temp_path.rename(geom_file)
-            else:  # Unix-like
-                # Atomic rename
-                temp_path.rename(geom_file)
+            os.replace(temp_path, geom_file)
 
             logger.debug(f"Successfully wrote geometry file: {geom_file}")
             return backup_path
@@ -705,7 +739,7 @@ class GeomParser:
 
         Parameters:
             geom_file (Union[str, Path]): Path to geometry file (.g##)
-            ras_object: Optional RasPrj instance (unused, for API consistency)
+            ras_object (RasPrj, optional): Optional RasPrj instance (unused, for API consistency)
 
         Returns:
             gpd.GeoDataFrame: DataFrame with columns: river, reach, station,
@@ -874,6 +908,144 @@ class GeomParser:
 
     @staticmethod
     @log_call
+    def get_1d_footprint(
+        geom_file: Union[str, Path],
+        ras_object=None,
+        *,
+        crs: Optional[Any] = None,
+        dissolve: bool = False,
+    ):
+        """Build 1D reach footprints from plain-text cross-section cut lines.
+
+        Cross sections are grouped by river and reach in geometry-file order.
+        Their first and last coordinates form the two model edges, while the
+        complete first and last cut lines close the reach ends. This assumes the
+        canonical upstream-to-downstream file order used by HEC-RAS. Source-file
+        orientation is preserved because endpoint proximity is not a reliable
+        orientation signal for meandering reaches.
+
+        Parameters:
+            geom_file: Path to the plain-text HEC-RAS geometry file (``.g##``).
+            ras_object (RasPrj, optional): Optional RasPrj instance used for CRS context.
+            crs (pyproj.CRS or str, optional): Optional CRS assigned to the returned GeoDataFrame. When omitted,
+                ``ras_object.project_crs`` is used if available.
+            dissolve: Return one combined footprint row when True; otherwise
+                return one row per river/reach.
+
+        Returns:
+            gpd.GeoDataFrame: Columns ``River``, ``Reach``, ``source``, and
+                ``geometry``. Reaches with fewer than two usable cross sections
+                are omitted.
+        """
+        try:
+            import geopandas as gpd
+            from shapely.geometry import LineString, Polygon
+            from shapely.ops import unary_union
+        except ImportError:
+            raise ImportError(
+                "geopandas and shapely are required for get_1d_footprint(). "
+                "Install with: pip install geopandas shapely"
+            )
+
+        if crs is None and ras_object is not None:
+            crs = getattr(ras_object, "project_crs", None)
+
+        cut_lines = GeomParser.get_xs_cut_lines(
+            geom_file,
+            ras_object=ras_object,
+        )
+        empty = gpd.GeoDataFrame(
+            columns=["River", "Reach", "source", "geometry"],
+            geometry="geometry",
+            crs=crs,
+        )
+        if cut_lines is None or cut_lines.empty:
+            logger.debug("No cross-section cut lines found; returning empty footprint")
+            return empty
+
+        rows = []
+        for (river, reach), group in cut_lines.groupby(
+            ["river", "reach"],
+            sort=False,
+        ):
+            lines = [
+                geometry
+                for geometry in group.geometry
+                if isinstance(geometry, LineString)
+                and not geometry.is_empty
+                and len(geometry.coords) >= 2
+            ]
+            if len(lines) < 2:
+                logger.debug(
+                    f"Skipping {river}/{reach}: at least two cut lines are required"
+                )
+                continue
+
+            left_points = []
+            right_points = []
+            for line in lines:
+                coordinates = list(line.coords)
+                left = tuple(coordinates[0][:2])
+                right = tuple(coordinates[-1][:2])
+                if not left_points or left != left_points[-1]:
+                    left_points.append(left)
+                if not right_points or right != right_points[-1]:
+                    right_points.append(right)
+
+            downstream_interior = [
+                tuple(point[:2])
+                for point in list(lines[-1].coords)[1:-1]
+            ]
+            upstream_interior = [
+                tuple(point[:2])
+                for point in reversed(list(lines[0].coords)[1:-1])
+            ]
+            ring = (
+                left_points
+                + downstream_interior
+                + list(reversed(right_points))
+                + upstream_interior
+            )
+            if len(set(ring)) < 3:
+                logger.debug(f"Skipping {river}/{reach}: endpoint ring is degenerate")
+                continue
+
+            polygon = Polygon(ring)
+            if not polygon.is_valid:
+                logger.debug(
+                    "Repairing invalid text XS footprint for %s/%s",
+                    river,
+                    reach,
+                )
+                polygon = polygon.buffer(0)
+            if polygon.is_empty or polygon.area <= 0:
+                logger.debug(f"Skipping {river}/{reach}: endpoint ring is degenerate")
+                continue
+
+            rows.append({
+                "River": river,
+                "Reach": reach,
+                "source": "text_xs_endpoints",
+                "geometry": polygon,
+            })
+
+        if not rows:
+            logger.debug("Could not build any 1D footprints from text geometry")
+            return empty
+
+        footprints = gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
+        if not dissolve:
+            return footprints
+
+        combined = unary_union(footprints.geometry.tolist())
+        return gpd.GeoDataFrame(
+            {"source": ["text_xs_endpoints"]},
+            geometry=[combined],
+            crs=crs,
+        )
+
+    @staticmethod
+    @log_call
     def get_river_centerlines(
         geom_file: Union[str, Path],
         ras_object=None
@@ -886,7 +1058,7 @@ class GeomParser:
 
         Parameters:
             geom_file (Union[str, Path]): Path to geometry file (.g##)
-            ras_object: Optional RasPrj instance (unused, for API consistency)
+            ras_object (RasPrj, optional): Optional RasPrj instance (unused, for API consistency)
 
         Returns:
             gpd.GeoDataFrame: DataFrame with columns: river, reach,

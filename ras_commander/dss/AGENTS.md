@@ -5,12 +5,17 @@ This file is the canonical local instruction file for `ras_commander/dss/`.
 ## Scope
 
 - Parent guidance from `ras_commander/AGENTS.md` and the repo root still applies.
-- This directory handles HEC-DSS access through the Java-based monolith bridge.
+- This directory handles HEC-DSS access through the Java-based monolith bridge
+  and optional native precipitation-grid writing through pydsstools.
 
 ## Architecture
 
 - Public API: `RasDss`
 - Private support: `_hec_monolith.py`
+- Native direct arrays: `RasDss.write_precip_grid_arrays()` and private
+  `_native_grid.py`, using optional `dss-native` dependencies loaded on call.
+  This API writes DSS7 PER-CUM specified-time grids with explicit units,
+  projected square-cell geometry, and interval boundaries, without Java/Vortex.
 - Loading is intentionally staged:
   1. parent package lazy-import
   2. lightweight subpackage import
@@ -20,7 +25,10 @@ This file is the canonical local instruction file for `ras_commander/dss/`.
 
 - Configure the JVM before importing Java classes with `jnius`.
 - Resolve DSS paths to absolute paths before opening files.
-- Close DSS handles in `finally` blocks.
+- Close DSS handles in `finally` blocks. `HecDss.done()` and
+  `GriddedData.done()` do not close the native file; follow each with
+  `RasDss._release_dss_file(<exact path string used to open>)`. Never call
+  `HecDSSFileAccess.closeAllFiles()`, which closes every DSS file in the JVM.
 - Remember that the JVM can only be started once per process.
 - Keep Part D blank when writing standard DSS pathnames unless the method explicitly requires otherwise.
 

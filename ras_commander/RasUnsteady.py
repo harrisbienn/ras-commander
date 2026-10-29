@@ -41,9 +41,12 @@ List of Functions in RasUnsteady:
 - extract_tables()
 - write_table_to_file()
 - get_met_precipitation_config()
+- disable_meteorology()
 - set_precipitation_hyetograph()
 - set_constant_precipitation()
 - set_gridded_precipitation()
+- set_gridded_precipitation_geotiff()
+- set_gridded_precipitation_grib()
 - configure_gridded_dss_precipitation()
 - set_meteorological_station()
 - get_meteorological_stations()
@@ -52,8 +55,11 @@ List of Functions in RasUnsteady:
 
 Precipitation Functions:
 - get_met_precipitation_config() - Read Meteorological Data tab precipitation settings
+- disable_meteorology() - Disable all inherited meteorological forcing in text/HDF state
 - set_precipitation_hyetograph() - Write hyetograph DataFrame to unsteady file
 - set_gridded_precipitation() - Configure GDAL raster precipitation
+- set_gridded_precipitation_geotiff() - Normalize GeoTIFF precipitation and configure it
+- set_gridded_precipitation_grib() - Normalize GRIB precipitation and configure it
 - configure_gridded_dss_precipitation() - Configure gridded DSS precipitation
 
 Meteorological Point Data Functions:
@@ -65,10 +71,14 @@ Meteorological Point Data Functions:
 DSS Boundary Condition Functions:
 - get_dss_boundaries() - Extract all DSS-linked BCs with full path info
 - get_inline_hydrograph_boundaries() - Extract inline table BCs with time series data
-- delete_boundary() - Remove one Boundary Location block from an unsteady file
+- inspect_boundary_blocks() - Inventory exact Boundary Location blocks in an owned stage
+- delete_boundary() - Preview/remove one exact block from an owned staged project
+- ensure_2d_boundary_location() - Create an empty 2D boundary block after validating geometry
+- replace_2d_boundary_locations() - Reset 2D boundary blocks from geometry-backed specs
 - update_dss_run_identifier() - Update DSS path F-part for new scenarios
 - set_boundary_dss_link() - Convert inline BC to DSS-linked (complete state transition)
 - set_boundary_inline_hydrograph() - Write inline hydrograph, convert DSS to inline
+- set_stage_hydrograph_initial_stage() - Set one exact 2D stage boundary's initial-stage flag
 - set_flow_hydrograph_slope() - Add or update `Flow Hydrograph Slope=` (EG slope) for a Flow Hydrograph BC
 - set_normal_depth_boundary() - Add or update Normal Depth (Friction Slope=) for a 1D river or 2D BC line boundary
 - get_unique_dss_subbasins() - Get unique HMS subbasin names from DSS paths
@@ -98,7 +108,6 @@ Initial Conditions Method Selection:
 
 Initial Flow Distribution Table:
 - get_initial_conditions() - Read all IC entries (flow, storage, rrr) as DataFrame
-- get_initial_point_elevations() - Read named IC Point Elev records separately
 - set_initial_conditions() - Write IC entries from list of dicts or DataFrame (auto-sets IC method)
 - validate_initial_flow_stations() - Check IC flow stations match geometry cross sections
 
@@ -107,21 +116,34 @@ Non-Newtonian Method Selection:
 - set_non_newtonian_method() - Set the Non-Newtonian method by integer or name
 
 """
-import os
 import math
 import numbers
-import shutil
+import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
+import os
+from ._fixed_width import _format_fixed_width_value
 from .RasPrj import ras
-from .RasUtils import RasUtils
 from .LoggingConfig import get_logger
+from .RasUtils import RasUtils
 from .Decorators import log_call
+from .fast_hdf import read_attr, read_attrs, read_typed
 import pandas as pd
 import numpy as np
 import re
-from typing import Union, Optional, Any, Tuple, Dict, List
+from typing import TYPE_CHECKING, Union, Optional, Any, Tuple, Dict, List, Sequence
+from ._ras_text import _normalize_ras_newlines, _split_ras_records, _write_ras_text
+from .fast_hdf import h5py_until_qualified
+
+if TYPE_CHECKING:
+    from .ComputeResults import PrecipRasterImportResult
+    from .RasBoundary import BoundaryMutationResult
+    from .RasProject import StageProjectResult
+    from .precip import (
+        GriddedPrecipitationCapabilities,
+        GriddedPrecipitationImportResult,
+    )
 
 
 
@@ -148,6 +170,10 @@ class RasUnsteady:
         "precipitation",
         "rain",
     )
+    _DSS_BOUNDARY_DEPRECATED_COLUMNS = {
+        'sa_2d_name': 'area_2d',
+        'bc_line': 'bc_line_name',
+    }
     _BOUNDARY_TYPE_KEYWORDS: Tuple[Tuple[str, str], ...] = (
         ("Lateral Inflow Hydrograph=", "Lateral Inflow Hydrograph"),
         ("Uniform Lateral Inflow Hydrograph=", "Uniform Lateral Inflow Hydrograph"),
@@ -164,13 +190,9 @@ class RasUnsteady:
         ("Navigation Dam=", "Navigation Dam"),
         ("Rule Operation=", "Rule Operation"),
     )
-    _PROTECTED_BOUNDARY_TYPES = {
-        "Flow Hydrograph",
-        "Stage Hydrograph",
-        "Normal Depth",
-        "Rating Curve",
-    }
     _GLOBAL_TRAILER_PREFIXES = (
+        "Met Station=",
+        "Meteorological Station=",
         "Met Point Raster Parameters=",
         "Met Station Name=",
         "Met Station Gauge Height=",
@@ -215,6 +237,18 @@ class RasUnsteady:
     _MET_PRECIP_ANCHOR_PREFIXES: Tuple[str, ...] = (
         _MET_PRECIP_MANAGED_PREFIXES
         + ("Met BC=Precipitation|",)
+    )
+    _GRIDDED_REQUIRED_MET_MODES: Tuple[Tuple[str, str], ...] = (
+        ("Evapotranspiration", "None"),
+        ("Air Density", "Constant"),
+        ("Air Pressure", "Constant"),
+    )
+    _MET_HEADER_PREFIXES: Tuple[str, ...] = (
+        "Met Point Raster Parameters=",
+        "Precipitation Mode=",
+        "Wind Mode=",
+        "Air Density Mode=",
+        "Wave Mode=",
     )
 
     @staticmethod
@@ -329,23 +363,6 @@ class RasUnsteady:
         )
 
     @staticmethod
-    def _netcdf_interval_hours(times: Any) -> np.ndarray:
-        """Return per-row interval hours for instantaneous-rate NetCDF rasters."""
-        timestamps = pd.to_datetime(times)
-        n_times = len(timestamps)
-        interval_hours = np.zeros(n_times, dtype=np.float32)
-        if n_times <= 1:
-            return interval_hours
-
-        deltas = (timestamps[1:] - timestamps[:-1]).total_seconds() / 3600.0
-        deltas = np.asarray(deltas, dtype=np.float32)
-        if not np.all(np.isfinite(deltas)) or np.any(deltas <= 0):
-            raise ValueError("NetCDF precipitation times must be strictly increasing")
-
-        interval_hours[1:] = deltas
-        return interval_hours
-
-    @staticmethod
     def _fixed_width_data_line_count(record_count: int) -> int:
         """Return the number of 10-field fixed-width rows used by an inline table."""
         return (record_count + 9) // 10
@@ -407,8 +424,9 @@ class RasUnsteady:
         
         if updated:
             try:
-                with open(unsteady_path, 'w', encoding='utf-8', errors='replace') as f:
-                    f.writelines(lines)
+                _write_ras_text(
+                    unsteady_path, "".join(lines), encoding="utf-8", errors="replace"
+                )
                 logger.debug(f"Successfully wrote modifications to unsteady flow file: {unsteady_path}")
             except PermissionError:
                 logger.error(f"Permission denied when writing to unsteady flow file: {unsteady_path}")
@@ -529,64 +547,6 @@ class RasUnsteady:
 
     @staticmethod
     @log_call
-    def get_initial_point_elevations(
-        unsteady_number_or_path: Union[str, Path],
-        ras_object: Optional[Any] = None,
-    ) -> pd.DataFrame:
-        """Read named initial-elevation points without changing the file.
-
-        This table is separate from the existing flow/storage/RRR IC table.
-        Point names refer to geometry-defined IC points, not storage areas or
-        flow boundary lines. Geometry membership, units and vertical datum
-        must be verified from the selected model and its engineering contract.
-
-        Args:
-            unsteady_number_or_path: Unsteady number or explicit .u## path.
-            ras_object: Optional project context for number-based resolution.
-
-        Returns:
-            DataFrame with stable columns ``point_name`` (str), ``elevation``
-            (float), and ``trailing_fields`` (tuple of str). Trailing comma
-            fields are preserved without interpreting their meaning. An
-            absent point table returns an empty frame with the same columns.
-
-        Raises:
-            ValueError: Missing file, malformed/duplicate point records,
-                nonfinite elevation, or mixed newline conventions.
-        """
-        path = RasUnsteady._resolve_unsteady_file_path(
-            unsteady_number_or_path, ras_object=ras_object,
-        )
-        lines, _ = RasUtils._read_text_lines_preserving_newline(path)
-        records = []
-        names = set()
-        for line_number, line in enumerate(lines, start=1):
-            if not line.startswith("IC Point Elev="):
-                continue
-            fields = line.rstrip("\r\n").split("=", 1)[1].split(",")
-            if len(fields) < 2 or not fields[0].strip():
-                raise ValueError(f"Malformed IC Point Elev record at line {line_number}")
-            name = fields[0].strip()
-            try:
-                elevation = float(fields[1])
-            except ValueError as exc:
-                raise ValueError(f"Invalid IC point elevation at line {line_number}") from exc
-            if not np.isfinite(elevation):
-                raise ValueError(f"Nonfinite IC point elevation at line {line_number}")
-            if name.casefold() in names:
-                raise ValueError(f"Duplicate IC point name at line {line_number}: {name!r}")
-            names.add(name.casefold())
-            records.append({
-                "point_name": name,
-                "elevation": elevation,
-                "trailing_fields": tuple(fields[2:]),
-            })
-        return pd.DataFrame.from_records(
-            records, columns=["point_name", "elevation", "trailing_fields"],
-        ).astype({"point_name": "object", "elevation": "float64", "trailing_fields": "object"})
-
-    @staticmethod
-    @log_call
     def set_initial_conditions(
         unsteady_number_or_path: Union[str, Path],
         ic_entries,
@@ -653,20 +613,11 @@ class RasUnsteady:
             if auto_set_method and entries:
                 RasUnsteady.set_initial_flow_method(temporary, method="initial_flow_distribution")
             prepared, _ = RasUtils._read_text_lines_preserving_newline(temporary)
-            RasUnsteady._atomic_write_lines(unsteady_file_path, prepared)
+            RasUnsteady._atomic_write_lines(unsteady_file_path, prepared, preserve_newlines=True)
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
         RasUnsteady._refresh_initial_condition_context(unsteady_number_or_path, ras_object)
-
-    @staticmethod
-    def _refresh_initial_condition_context(unsteady_file, ras_object) -> None:
-        """Refresh only the context selected by a number or explicitly supplied."""
-        context = ras_object
-        if context is None and not Path(unsteady_file).is_file():
-            context = ras
-        if context is not None and getattr(context, "initialized", False):
-            context.unsteady_df = context.get_unsteady_entries()
 
     @staticmethod
     @log_call
@@ -700,6 +651,11 @@ class RasUnsteady:
             ``unmatched`` (list[dict]): Entries with no matching geometry XS.
             ``ic_count`` (int): Total flow IC entries checked.
             ``geom_xs_count`` (int): Total XS in geometry.
+            ``status`` (str): passed, failed, unavailable, or not_applicable.
+            ``reason`` (str): Explicit outcome reason. Present flow ICs with
+            missing or unreadable geometry are unavailable and ``valid=False``.
+            No flow IC entries is not_applicable and vacuously valid; this is
+            not a completeness check for the boundary conditions or the plan.
         """
         from ras_commander import ras as global_ras
         _ras = ras_object if ras_object is not None else global_ras
@@ -740,18 +696,40 @@ class RasUnsteady:
                     geom_path = Path(g_match.iloc[0]['full_path'])
 
         geom_stations = set()
+
+        def normalize_station(value):
+            # Geometry RS is a string and may carry one native interpolation
+            # marker; flow ICs normally expose the numeric station already.
+            if isinstance(value, str):
+                value = value.strip()
+                if value.endswith('*'):
+                    value = value[:-1]
+            station_value = float(value)
+            if not math.isfinite(station_value):
+                raise ValueError("Cross-section station must be finite")
+            return station_value
+
+        geometry_reason = 'geometry_not_resolved'
+        if geom_path is not None:
+            geometry_reason = 'geometry_file_missing'
         if geom_path is not None and geom_path.is_file():
             try:
                 from ras_commander.geom import GeomCrossSection
                 xs_df = GeomCrossSection.get_cross_sections(geom_path)
+                geometry_reason = 'geometry_has_no_cross_sections'
                 if xs_df is not None and len(xs_df) > 0:
                     for _, xs_row in xs_df.iterrows():
-                        river = str(xs_row.get('river', '')).strip()
-                        reach = str(xs_row.get('reach', '')).strip()
-                        station = xs_row.get('station')
-                        if station is not None:
-                            geom_stations.add((river, reach, float(station)))
+                        # GeomCrossSection's public schema uses River/Reach/RS.
+                        river = str(xs_row['River']).strip()
+                        reach = str(xs_row['Reach']).strip()
+                        station = normalize_station(xs_row['RS'])
+                        if not river or not reach or not math.isfinite(station):
+                            raise ValueError("Invalid geometry cross-section identity")
+                        geom_stations.add((river, reach, station))
+                    geometry_reason = None
             except Exception as e:
+                geom_stations.clear()
+                geometry_reason = 'geometry_read_failed'
                 logger.warning(f"Could not parse geometry for validation: {e}")
 
         matched = []
@@ -764,15 +742,27 @@ class RasUnsteady:
                 'river': river, 'reach': reach,
                 'station': station, 'value': ic_row.get('value'),
             }
-            if (river, reach, float(station)) in geom_stations:
+            try:
+                station_key = normalize_station(station)
+                station_matches = (river, reach, station_key) in geom_stations
+            except (TypeError, ValueError, OverflowError):
+                station_matches = False
+            if station_matches:
                 matched.append(entry)
             else:
                 unmatched.append(entry)
 
-        valid = len(unmatched) == 0 and len(flow_ics) > 0
-        if not geom_stations:
+        if len(flow_ics) == 0:
             valid = True
-            logger.info("No geometry XS available for validation; skipping station check")
+            status, reason = 'not_applicable', 'no_initial_flow_entries'
+        elif not geom_stations:
+            valid = False
+            status, reason = 'unavailable', geometry_reason
+            logger.warning("Geometry XS unavailable; initial flow stations could not be validated")
+        else:
+            valid = len(unmatched) == 0
+            status = 'passed' if valid else 'failed'
+            reason = 'stations_match_geometry' if valid else 'unmatched_flow_stations'
 
         logger.info(
             f"IC validation: {len(matched)} matched, {len(unmatched)} unmatched "
@@ -784,6 +774,8 @@ class RasUnsteady:
             'unmatched': unmatched,
             'ic_count': len(flow_ics),
             'geom_xs_count': len(geom_stations),
+            'status': status,
+            'reason': reason,
         }
 
     # -------------------------------------------------------------------------
@@ -913,6 +905,66 @@ class RasUnsteady:
         return result
 
     @staticmethod
+    def _read_output_profile_ic_entries(
+        source_plan_hdf: Path,
+        time_index: int,
+        include_1d: bool,
+        include_storage: bool,
+    ) -> list:
+        """Read the IC entries of :meth:`set_ic_from_output_profile` (read-only)."""
+        import h5py
+
+        entries: list = []
+        base = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series"
+
+        with h5py.File(source_plan_hdf, "r") as hdf:
+            if base not in hdf:
+                raise ValueError(f"No unsteady time series results in {source_plan_hdf.name}")
+
+            if include_1d:
+                xs_path = f"{base}/Cross Sections"
+                if xs_path in hdf and f"{xs_path}/Flow" in hdf:
+                    attrs = read_typed(hdf[f"{xs_path}/Cross Section Attributes"], slice(None))
+                    flow = read_typed(hdf[f"{xs_path}/Flow"], (time_index, slice(None)))
+                    for i, attr in enumerate(attrs):
+                        river = attr["River"].decode("utf-8").strip()
+                        reach = attr["Reach"].decode("utf-8").strip()
+                        station = attr["Station"].decode("utf-8").strip()
+                        try:
+                            station_val = float(station)
+                        except ValueError:
+                            station_val = station
+                        entries.append({
+                            "type": "flow",
+                            "river": river,
+                            "reach": reach,
+                            "station": station_val,
+                            "value": float(flow[i]),
+                            "area_name": None,
+                        })
+                    logger.info(f"Read flow at {len(attrs)} cross sections from {source_plan_hdf.name}")
+
+            if include_storage:
+                sa_path = f"{base}/Storage Areas"
+                geom_sa = "Geometry/Storage Areas/Attributes"
+                if sa_path in hdf and f"{sa_path}/Water Surface" in hdf and geom_sa in hdf:
+                    sa_attrs = read_typed(hdf[geom_sa], slice(None))
+                    ws = read_typed(hdf[f"{sa_path}/Water Surface"], (time_index, slice(None)))
+                    for i, sa in enumerate(sa_attrs):
+                        name = sa["Name"].decode("utf-8").strip() if isinstance(sa["Name"], bytes) else str(sa["Name"]).strip()
+                        if i < len(ws):
+                            entries.append({
+                                "type": "storage",
+                                "area_name": name,
+                                "value": float(ws[i]),
+                                "river": None,
+                                "reach": None,
+                                "station": None,
+                            })
+                    logger.info(f"Read WSE for {len(sa_attrs)} storage areas from {source_plan_hdf.name}")
+        return entries
+
+    @staticmethod
     @log_call
     def set_ic_from_output_profile(
         unsteady_number_or_path: Union[str, Path],
@@ -952,60 +1004,13 @@ class RasUnsteady:
             The IC entries that were written, with columns matching
             ``get_initial_conditions()`` output.
         """
-        import h5py
-
         source_plan_hdf = Path(source_plan_hdf)
         if not source_plan_hdf.exists():
             raise FileNotFoundError(f"Source plan HDF not found: {source_plan_hdf}")
 
-        entries: list = []
-        base = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series"
-
-        with h5py.File(source_plan_hdf, "r") as hdf:
-            if base not in hdf:
-                raise ValueError(f"No unsteady time series results in {source_plan_hdf.name}")
-
-            if include_1d:
-                xs_path = f"{base}/Cross Sections"
-                if xs_path in hdf and f"{xs_path}/Flow" in hdf:
-                    attrs = hdf[f"{xs_path}/Cross Section Attributes"][:]
-                    flow = hdf[f"{xs_path}/Flow"][time_index, :]
-                    for i, attr in enumerate(attrs):
-                        river = attr["River"].decode("utf-8").strip()
-                        reach = attr["Reach"].decode("utf-8").strip()
-                        station = attr["Station"].decode("utf-8").strip()
-                        try:
-                            station_val = float(station)
-                        except ValueError:
-                            station_val = station
-                        entries.append({
-                            "type": "flow",
-                            "river": river,
-                            "reach": reach,
-                            "station": station_val,
-                            "value": float(flow[i]),
-                            "area_name": None,
-                        })
-                    logger.info(f"Read flow at {len(attrs)} cross sections from {source_plan_hdf.name}")
-
-            if include_storage:
-                sa_path = f"{base}/Storage Areas"
-                geom_sa = "Geometry/Storage Areas/Attributes"
-                if sa_path in hdf and f"{sa_path}/Water Surface" in hdf and geom_sa in hdf:
-                    sa_attrs = hdf[geom_sa][:]
-                    ws = hdf[f"{sa_path}/Water Surface"][time_index, :]
-                    for i, sa in enumerate(sa_attrs):
-                        name = sa["Name"].decode("utf-8").strip() if isinstance(sa["Name"], bytes) else str(sa["Name"]).strip()
-                        if i < len(ws):
-                            entries.append({
-                                "type": "storage",
-                                "area_name": name,
-                                "value": float(ws[i]),
-                                "river": None,
-                                "reach": None,
-                                "station": None,
-                            })
-                    logger.info(f"Read WSE for {len(sa_attrs)} storage areas from {source_plan_hdf.name}")
+        entries = RasUnsteady._read_output_profile_ic_entries(
+            source_plan_hdf, time_index, include_1d, include_storage
+        )
 
         if not entries:
             logger.warning("No IC entries extracted from output profile")
@@ -1149,8 +1154,9 @@ class RasUnsteady:
             )
             return
 
-        with open(unsteady_file, 'w', encoding='utf-8', errors='replace') as f:
-            f.writelines(lines)
+        _write_ras_text(
+            unsteady_file, "".join(lines), encoding="utf-8", errors="replace"
+        )
 
         logger.info(
             f"Set Non-Newtonian method to {method_id} "
@@ -1272,8 +1278,9 @@ class RasUnsteady:
             elif max_cv is not None and line.startswith('Non-Newtonian Max Cv='):
                 lines[i] = f"Non-Newtonian Max Cv={max_cv}\n"
 
-        with open(unsteady_file, 'w', encoding='utf-8', errors='replace') as f:
-            f.writelines(lines)
+        _write_ras_text(
+            unsteady_file, "".join(lines), encoding="utf-8", errors="replace"
+        )
 
         changes = []
         if cv is not None:
@@ -1482,8 +1489,9 @@ class RasUnsteady:
             elif user_viscosity is not None and line.startswith('User Viscosity='):
                 lines[i] = f"User Viscosity={user_viscosity}\n"
 
-        with open(unsteady_file, 'w', encoding='utf-8', errors='replace') as f:
-            f.writelines(lines)
+        _write_ras_text(
+            unsteady_file, "".join(lines), encoding="utf-8", errors="replace"
+        )
 
         changes = []
         if yield_method is not None:
@@ -1592,8 +1600,9 @@ class RasUnsteady:
                 lines[i] = f"Herschel-Bulkley Coef={new_k}, {new_n}\n"
                 break
 
-        with open(unsteady_file, 'w', encoding='utf-8', errors='replace') as f:
-            f.writelines(lines)
+        _write_ras_text(
+            unsteady_file, "".join(lines), encoding="utf-8", errors="replace"
+        )
 
         changes = []
         if k is not None:
@@ -1824,8 +1833,9 @@ class RasUnsteady:
             elif high_c_transport is not None and line.startswith('Non-Newtonian High C Transport='):
                 lines[i] = f"Non-Newtonian High C Transport= {high_c_transport} \n"
 
-        with open(unsteady_file, 'w', encoding='utf-8', errors='replace') as f:
-            f.writelines(lines)
+        _write_ras_text(
+            unsteady_file, "".join(lines), encoding="utf-8", errors="replace"
+        )
 
         changes = []
         if clastic_method is not None:
@@ -1926,15 +1936,14 @@ class RasUnsteady:
                             elif line.startswith('Gate Openings='):
                                 count = int(line.split('=', 1)[1].strip())
                                 gate['count'] = count
-                                vals: list[float] = []
-                                i += 1
-                                while i < len(lines) and len(vals) < count:
-                                    parts = lines[i].split()
-                                    if not parts or lines[i].startswith('Boundary Location='):
-                                        break
-                                    vals.extend(float(v) for v in parts)
-                                    i += 1
-                                gate['values'] = vals[:count]
+                                data_start = i + 1
+                                i = RasUnsteady._fixed_width_data_end(
+                                    lines, data_start, count,
+                                    stop_at_blank_line=True,
+                                )
+                                gate['values'] = RasUnsteady._read_fixed_width_values(
+                                    lines, data_start, i, count
+                                )
                                 gate_blocks.append(gate)
                                 break  # done with this gate's data lines
                             i += 1
@@ -2019,20 +2028,18 @@ class RasUnsteady:
         # Determine the range of old data lines after Gate Openings=
         old_count = int(lines[target_openings_idx].split('=', 1)[1].strip())
         data_start = target_openings_idx + 1
-        data_end = data_start
-        vals_read = 0
-        while data_end < len(lines) and vals_read < old_count:
-            parts = lines[data_end].split()
-            if not parts or lines[data_end].startswith('Boundary Location='):
-                break
-            vals_read += len(parts)
-            data_end += 1
+        data_end = RasUnsteady._fixed_width_data_end(
+            lines, data_start, old_count, stop_at_blank_line=True,
+        )
 
         # Build new data lines: 8-char fixed-width fields, 10 per line
         new_data_lines = []
         for row_start in range(0, len(values), 10):
             chunk = values[row_start:row_start + 10]
-            line_str = ''.join(f'{v:8g}' for v in chunk) + '\n'
+            line_str = ''.join(
+                RasUnsteady._format_general_fixed_width_value(v)
+                for v in chunk
+            ) + '\n'
             new_data_lines.append(line_str)
 
         # Replace the Gate Openings= header + data lines
@@ -2047,8 +2054,9 @@ class RasUnsteady:
         if interval is not None and target_interval_idx is not None:
             lines[target_interval_idx] = f'Gate Time Interval={interval}\n'
 
-        with open(unsteady_file, 'w', encoding='utf-8', errors='replace') as f:
-            f.writelines(lines)
+        _write_ras_text(
+            unsteady_file, "".join(lines), encoding="utf-8", errors="replace"
+        )
 
         logger.info(
             f"Set {len(values)} gate openings (boundary_index={boundary_index}) "
@@ -2119,16 +2127,13 @@ class RasUnsteady:
                             'dss_path': '',
                             'use_dss': False,
                         }
-                        vals: list[float] = []
-                        i += 1
-                        while i < len(lines) and len(vals) < count:
-                            if lines[i].startswith('Boundary Location=') or lines[i].startswith('Ground Water Darcy'):
-                                break
-                            parts = lines[i].split()
-                            if parts:
-                                vals.extend(float(v) for v in parts)
-                            i += 1
-                        gw['values'] = vals[:count]
+                        data_start = i + 1
+                        i = RasUnsteady._fixed_width_data_end(
+                            lines, data_start, count, stop_at_blank_line=False,
+                        )
+                        gw['values'] = RasUnsteady._read_fixed_width_values(
+                            lines, data_start, i, count
+                        )
                         while i < len(lines) and not lines[i].startswith('Boundary Location='):
                             line = lines[i]
                             if line.startswith('Ground Water Darcy K='):
@@ -2218,15 +2223,10 @@ class RasUnsteady:
                             target_interval_idx = candidate_interval_idx
                             count = int(lines[i].split('=', 1)[1].strip())
                             target_data_start = i + 1
-                            j = target_data_start
-                            parsed = 0
-                            while j < len(lines) and parsed < count:
-                                if lines[j].startswith('Boundary Location=') or lines[j].startswith('Ground Water Darcy'):
-                                    break
-                                parts = lines[j].split()
-                                if parts:
-                                    parsed += len(parts)
-                                j += 1
+                            j = RasUnsteady._fixed_width_data_end(
+                                lines, target_data_start, count,
+                                stop_at_blank_line=False,
+                            )
                             target_data_end = j
                             while j < len(lines) and not lines[j].startswith('Boundary Location='):
                                 line = lines[j]
@@ -2259,7 +2259,7 @@ class RasUnsteady:
         for row_start in range(0, len(values), 10):
             row_vals = values[row_start:row_start + 10]
             row_str = ''.join(
-                f'{v:8.2f}' if v != int(v) or abs(v) > 99999 else f'{int(v):>8}'
+                RasUnsteady._format_legacy_integer_or_fixed(v, 2)
                 for v in row_vals
             )
             new_data_lines.append(row_str + '\n')
@@ -2280,8 +2280,9 @@ class RasUnsteady:
         if interval is not None and target_interval_idx is not None:
             lines[target_interval_idx_adj] = f'Interval={interval}\n'
 
-        with open(unsteady_file, 'w', encoding='utf-8', errors='replace') as f:
-            f.writelines(lines)
+        _write_ras_text(
+            unsteady_file, "".join(lines), encoding="utf-8", errors="replace"
+        )
 
         logger.info(
             f"Set {len(values)} GW interflow values (boundary_index={boundary_index}) "
@@ -2451,7 +2452,10 @@ class RasUnsteady:
                 for i in range(0, len(vals), 10):
                     chunk = vals[i:i+10]
                     result_lines.append(
-                        ''.join(f'{v:8g}' for v in chunk) + '\n'
+                        ''.join(
+                            RasUnsteady._format_general_fixed_width_value(v)
+                            for v in chunk
+                        ) + '\n'
                     )
                 return result_lines
 
@@ -2480,8 +2484,9 @@ class RasUnsteady:
             elif cp_max_pool is not None and line.startswith('Navigation Dam CP Max Pool='):
                 lines[i] = f'Navigation Dam CP Max Pool={cp_max_pool}\n'
 
-        with open(unsteady_file, 'w', encoding='utf-8', errors='replace') as f:
-            f.writelines(lines)
+        _write_ras_text(
+            unsteady_file, "".join(lines), encoding="utf-8", errors="replace"
+        )
 
         logger.info(
             f"Set Navigation Dam data (boundary_index={boundary_index}) "
@@ -2675,8 +2680,9 @@ class RasUnsteady:
                         break
                 lines[insert_pos:insert_pos] = new_gate_lines
 
-        with open(unsteady_file, 'w', encoding='utf-8', errors='replace') as f:
-            f.writelines(lines)
+        _write_ras_text(
+            unsteady_file, "".join(lines), encoding="utf-8", errors="replace"
+        )
 
         logger.info(
             f"Set Rules BC data (boundary_index={boundary_index}) "
@@ -2774,8 +2780,12 @@ class RasUnsteady:
 
         if retained_lines != original_lines:
             try:
-                with open(unsteady_path, 'w', encoding='utf-8', errors='replace') as f:
-                    f.writelines(retained_lines)
+                _write_ras_text(
+                    unsteady_path,
+                    "".join(retained_lines),
+                    encoding="utf-8",
+                    errors="replace",
+                )
                 logger.debug(f"Successfully wrote modifications to unsteady flow file: {unsteady_path}")
             except PermissionError:
                 logger.error(f"Permission denied when writing to unsteady flow file: {unsteady_path}")
@@ -2834,10 +2844,9 @@ class RasUnsteady:
             Dict[str, Optional[Any]]: Parsed usage settings and raw values.
         """
         ras_obj = ras_object or ras
-        ras_obj.check_initialized()
-
         unsteady_path = Path(unsteady_file)
         if not unsteady_path.is_file():
+            ras_obj.check_initialized()
             from .RasPlan import RasPlan
             resolved_path = RasPlan.get_unsteady_path(unsteady_file, ras_obj)
             if resolved_path:
@@ -3072,7 +3081,7 @@ class RasUnsteady:
             retained.insert(use_restart_idx + 1, f"Prior WS Filename={prior_ws_filename}{newline}")
             retained.insert(use_restart_idx + 2, f"Prior WS Profile={profile}{newline}")
 
-        RasUnsteady._atomic_write_lines(unsteady_path, retained)
+        RasUnsteady._atomic_write_lines(unsteady_path, retained, preserve_newlines=True)
 
         logger.info(f"Set IC method to '{method}' in {unsteady_path.name}")
 
@@ -3335,21 +3344,33 @@ class RasUnsteady:
                 if precip_path in hdf_file:
                     config["hdf_attributes"] = {
                         key: RasUnsteady._decode_hdf_attr_value(value)
-                        for key, value in hdf_file[precip_path].attrs.items()
+                        for key, value in read_attrs(hdf_file[precip_path]).items()
                     }
-        except Exception:
-            pass
+        except (OSError, KeyError, ValueError) as exc:
+            logger.warning(
+                f"Could not read precipitation attributes from {hdf_path.name}: {exc}"
+            )
 
     @staticmethod
     def _detect_line_ending(lines: List[str]) -> str:
-        """Return the dominant line ending used by a RAS text file."""
+        """Return the consistent line ending used by a RAS text file."""
+        detected_endings = set()
         for line in lines:
             if line.endswith("\r\n"):
-                return "\r\n"
+                detected_endings.add("\r\n")
+            elif line.endswith("\n"):
+                detected_endings.add("\n")
+            elif line.endswith("\r"):
+                detected_endings.add("\r")
+
+        if len(detected_endings) > 1:
+            raise ValueError("Mixed newline conventions are not supported")
+        if detected_endings:
+            return detected_endings.pop()
         return "\n"
 
     @staticmethod
-    def _atomic_write_lines(file_path: Path, lines: List[str]) -> None:
+    def _atomic_write_lines(file_path: Path, lines: List[str], *, encoding: str = "utf-8", preserve_newlines: bool = False) -> None:
         """
         Atomically replace a text file with the supplied lines.
 
@@ -3359,8 +3380,11 @@ class RasUnsteady:
         """
         target_path = Path(file_path)
         target_mode: Optional[int] = None
+        target_visibility = 0
         try:
-            target_mode = target_path.stat().st_mode & 0o777
+            target_stat = target_path.stat()
+            target_mode = target_stat.st_mode & 0o777
+            target_visibility = getattr(target_stat, "st_file_attributes", 0) & 0x6
         except OSError:
             target_mode = None
 
@@ -3368,8 +3392,8 @@ class RasUnsteady:
         try:
             with tempfile.NamedTemporaryFile(
                 "w",
-                encoding="utf-8",
-                errors="replace",
+                encoding=encoding,
+                errors="strict",
                 newline="",
                 dir=target_path.parent,
                 prefix=f".{target_path.name}.",
@@ -3377,7 +3401,11 @@ class RasUnsteady:
                 delete=False,
             ) as temp_file:
                 temp_path = Path(temp_file.name)
-                temp_file.writelines(lines)
+                if preserve_newlines:
+                    RasUnsteady._detect_line_ending(lines)
+                    temp_file.write("".join(lines))
+                else:
+                    temp_file.write(_normalize_ras_newlines("".join(lines)))
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
 
@@ -3387,6 +3415,21 @@ class RasUnsteady:
                 except OSError:
                     logger.debug("Could not preserve mode for %s", target_path)
 
+            if os.name == "nt":
+                # SMB can mark dot-prefixed temporary files Hidden. Preserve
+                # the destination's Hidden/System bits before replacement:
+                # VB6 Dir() otherwise reports an existing unsteady file missing.
+                import ctypes
+                from ctypes import wintypes
+                attributes = getattr(temp_path.stat(), "st_file_attributes", 0)
+                attributes = (attributes & ~0x6) | target_visibility
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                setter = kernel32.SetFileAttributesW
+                setter.argtypes = (wintypes.LPCWSTR, wintypes.DWORD)
+                setter.restype = wintypes.BOOL
+                if not setter(str(temp_path), attributes or 0x80):
+                    raise ctypes.WinError(ctypes.get_last_error())
+
             os.replace(temp_path, target_path)
             temp_path = None
         finally:
@@ -3395,6 +3438,102 @@ class RasUnsteady:
                     temp_path.unlink()
                 except FileNotFoundError:
                     pass
+
+    @staticmethod
+    def _complete_gridded_meteorology_block(
+        lines: List[str],
+    ) -> Tuple[List[str], Tuple[str, ...]]:
+        """Complete and order the HEC-RAS gridded-meteorology text block.
+
+        HEC-RAS 7.0 can exit successfully after ``Error processing event
+        conditions`` when gridded precipitation is enabled but one of the
+        baseline evapotranspiration, air-density, or air-pressure ``Mode``
+        records is absent.  RAS-authored gridded files make those modes
+        explicit.  Existing nonblank choices remain authoritative; only
+        absent or blank records receive the RAS defaults.
+
+        HEC-RAS also expects every ``Met BC=`` record to remain contiguous and
+        to follow the top-level meteorology headers (through ``Wave Mode=``
+        when present).  Preserve the relative order of all existing ``Met
+        BC=`` records while restoring that block position.
+
+        Returns
+        -------
+        tuple
+            Updated lines and the variables whose missing/blank modes were
+            completed.
+        """
+        newline = RasUnsteady._detect_line_ending(lines)
+        had_terminal_newline = bool(
+            lines and lines[-1].endswith(("\r\n", "\n", "\r"))
+        )
+        completed: List[str] = []
+
+        for met_type, default_mode in RasUnsteady._GRIDDED_REQUIRED_MET_MODES:
+            prefix = f"Met BC={met_type}|Mode="
+            mode_index = next(
+                (i for i, line in enumerate(lines) if line.startswith(prefix)),
+                None,
+            )
+            if mode_index is not None:
+                existing_mode = lines[mode_index][len(prefix):].strip()
+                if existing_mode:
+                    continue
+                lines[mode_index] = f"{prefix}{default_mode}{newline}"
+                completed.append(met_type)
+                continue
+
+            family_prefix = f"Met BC={met_type}|"
+            family_index = next(
+                (i for i, line in enumerate(lines) if line.startswith(family_prefix)),
+                None,
+            )
+            if family_index is None:
+                family_index = 1 + max(
+                    (
+                        i
+                        for i, line in enumerate(lines)
+                        if line.startswith("Met BC=")
+                    ),
+                    default=-1,
+                )
+            lines.insert(family_index, f"{prefix}{default_mode}{newline}")
+            completed.append(met_type)
+
+        met_bc_lines = [line for line in lines if line.startswith("Met BC=")]
+        non_met_lines = [line for line in lines if not line.startswith("Met BC=")]
+        header_index = max(
+            (
+                i
+                for i, line in enumerate(non_met_lines)
+                if line.startswith(RasUnsteady._MET_HEADER_PREFIXES)
+            ),
+            default=-1,
+        )
+        if header_index >= 0:
+            insert_index = header_index + 1
+        else:
+            insert_index = RasUnsteady._get_default_met_insert_index(non_met_lines)
+
+        ordered_lines = (
+            non_met_lines[:insert_index]
+            + met_bc_lines
+            + non_met_lines[insert_index:]
+        )
+
+        # Moving a record that carried the terminal-newline state must not
+        # transfer that state into the middle of the file. Rebuild only record
+        # separators, preserving every record's content verbatim.
+        records = [line.rstrip("\r\n") for line in ordered_lines]
+        return (
+            [
+                record + newline
+                if index < len(records) - 1 or had_terminal_newline
+                else record
+                for index, record in enumerate(records)
+            ],
+            tuple(completed),
+        )
 
     @staticmethod
     def _replace_met_precipitation_keys(
@@ -3409,12 +3548,35 @@ class RasUnsteady:
         before inserting the requested state so transitions cannot leave stale
         Constant, Point, DSS, GDAL Group, or legacy GDAL Datasetname values.
         """
-        lines, newline = RasUtils._read_text_lines_preserving_newline(
-            unsteady_path
+        with open(
+            unsteady_path,
+            "r",
+            encoding="utf-8",
+            errors="replace",
+            newline="",
+        ) as file:
+            lines = file.readlines()
+
+        updated_lines, completed_modes = RasUnsteady._updated_met_precipitation_lines(
+            lines, desired_entries
         )
-        desired_lines = [
-            f"{key}={value}{newline}" for key, value in desired_entries
-        ]
+        RasUnsteady._atomic_write_lines(unsteady_path, updated_lines)
+        if completed_modes:
+            logger.info(
+                "Completed required gridded meteorology modes in %s: %s",
+                unsteady_path.name,
+                ", ".join(completed_modes),
+            )
+
+    @staticmethod
+    def _updated_met_precipitation_lines(
+        lines: list[str],
+        desired_entries: list[tuple[str, str]],
+    ) -> tuple[list[str], tuple[str, ...]]:
+        """Build the precipitation replacement without writing an input file."""
+        newline = RasUnsteady._detect_line_ending(lines)
+        had_terminal_newline = bool(lines and lines[-1].endswith(("\r\n", "\n", "\r")))
+        desired_lines = [f"{key}={value}{newline}" for key, value in desired_entries]
 
         insert_index: Optional[int] = None
         for i, line in enumerate(lines):
@@ -3426,8 +3588,11 @@ class RasUnsteady:
 
         filtered_lines: List[str] = []
         removed_before_insert = 0
+        managed_prefixes = RasUnsteady._MET_PRECIP_MANAGED_PREFIXES + tuple(
+            f"{key}=" for key, _value in desired_entries
+        )
         for i, line in enumerate(lines):
-            if line.startswith(RasUnsteady._MET_PRECIP_MANAGED_PREFIXES):
+            if line.startswith(managed_prefixes):
                 if i < insert_index:
                     removed_before_insert += 1
                 continue
@@ -3440,13 +3605,24 @@ class RasUnsteady:
             and not filtered_lines[-1].endswith(("\n", "\r"))
         ):
             filtered_lines[-1] = f"{filtered_lines[-1]}{newline}"
+        if insert_index == len(filtered_lines) and not had_terminal_newline:
+            desired_lines[-1] = desired_lines[-1][: -len(newline)]
 
         updated_lines = (
             filtered_lines[:insert_index]
             + desired_lines
             + filtered_lines[insert_index:]
         )
-        RasUnsteady._atomic_write_lines(unsteady_path, updated_lines)
+        completed_modes: Tuple[str, ...] = ()
+        if any(
+            key == "Met BC=Precipitation|Mode"
+            and str(value).strip().casefold() == "gridded"
+            for key, value in desired_entries
+        ):
+            updated_lines, completed_modes = (
+                RasUnsteady._complete_gridded_meteorology_block(updated_lines)
+            )
+        return updated_lines, completed_modes
 
     @staticmethod
     def _normalize_met_precipitation_mode(mode: Optional[str]) -> str:
@@ -3532,7 +3708,9 @@ class RasUnsteady:
         ``Met BC=Precipitation|...`` state as a single block, removing stale
         mode/source keys from prior Constant, Point, DSS, GDAL, or legacy GDAL
         Datasetname states. Unrecognized precipitation keys such as
-        ``Expanded View`` are preserved.
+        ``Expanded View`` are preserved. Gridded mode also completes the
+        required evapotranspiration, air-density, and air-pressure mode
+        records without replacing explicit nonblank choices.
 
         Parameters
         ----------
@@ -3701,6 +3879,574 @@ class RasUnsteady:
 
     @staticmethod
     @log_call
+    def disable_meteorology(
+        unsteady_file: Union[str, Path],
+        *,
+        compiled_plan_hdf: Optional[Union[str, Path]] = None,
+        remove_source_references: bool = False,
+        ras_object: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Disable inherited meteorological forcing in an unsteady-flow clone.
+
+        HEC-RAS can retain meteorology state in the ``.u##.hdf`` sidecar even
+        when the corresponding ``.u##`` text contains no active precipitation,
+        wind, or evapotranspiration record.  A cloned breakout plan can then
+        fail in-band while reading an enabled HDF variable whose ``Values``
+        dataset is absent.  This method makes the disabled state explicit in
+        the text file and unsteady sidecar, retaining inactive sidecar data by
+        default. With ``remove_source_references=True``, it resets the owned
+        sidecar meteorology group and removes text source/station records.  For
+        an owned compiled ``*.tmp.hdf``, it removes the meteorology group to
+        match HEC-RAS's canonical no-meteorology execution state.
+
+        The optional ``compiled_plan_hdf`` is limited to a results-free
+        ``*.tmp.hdf`` execution artifact.  Supplying it is useful when Phase-1
+        Windows/Wine preprocessing has already assembled the plan and the
+        caller must align that owned task-local artifact before native Linux
+        execution.  Result ``*.hdf`` files are rejected.
+
+        Text and HDF changes are validated in sibling staging directories
+        before applying any edits. Application uses the original file objects
+        to retain identity, ACLs, ownership, permissions and hard links. A
+        failed application restores original bytes. Use exclusive access;
+        exception rollback does not provide atomicity across a process crash.
+        A crash or failed restoration leaves recovery bytes in the ``original``
+        file under each sibling ``.<filename>.meteorology-*`` directory.
+        A valid empty unsteady sidecar is initialized with disabled groups;
+        a compiled target still requires an existing Event Conditions group.
+
+        Parameters
+        ----------
+        unsteady_file : str or Path
+            Unsteady-flow number or owned ``.u##`` path.
+        compiled_plan_hdf : str or Path, optional
+            Owned ``*.tmp.hdf`` whose ``/Event Conditions/Meteorology`` groups
+            should also be disabled.  The file must already exist and contain
+            ``/Event Conditions``.
+        remove_source_references : bool, default False
+            Remove meteorological source records and station metadata from the
+            owned text and reset its sidecar meteorology to disabled groups.
+            Boundary hydrographs, their DSS links, and infiltration are retained.
+            Text uses the existing CRLF serialization. Legacy non-UTF-8 bytes
+            are preserved with a reversible UTF-8 surrogateescape policy.
+            Records split only on CRLF, CR or LF; Unicode separators, form
+            feeds and vertical tabs remain part of the record content.
+        ras_object : optional
+            Project object used to resolve an unsteady-flow number.
+
+        Returns
+        -------
+        dict
+            Mutation evidence including the updated text keys, sidecar groups
+            whose ``Enabled`` attribute was set to zero, and any compiled-plan
+            meteorology groups removed. ``boundary_conditions_unchanged``
+            compares boundary bytes with only CR/LF separators normalized;
+            ``boundary_conditions_byte_identical`` also compares separators.
+            ``removed_source_keys`` includes managed precipitation source
+            keys removed from the original text in both modes.
+
+        Raises
+        ------
+        ValueError
+            The text is not an unsteady-flow file, contains unexpected NUL bytes, or an
+            HDF target has an invalid event or meteorology structure.
+        OSError
+            Reading, staging or application fails. Applied changes are restored.
+        RuntimeError
+            Boundary content changes, an input changes during staging, or
+            restoration fails. A restoration error identifies retained backups.
+        """
+        import hashlib
+
+        unsteady_path = RasUnsteady._resolve_unsteady_file_path(
+            unsteady_file,
+            ras_object=ras_object,
+        )
+        sidecar_hdf = Path(str(unsteady_path) + ".hdf")
+        if not isinstance(remove_source_references, bool):
+            raise TypeError("remove_source_references must be a bool")
+        text_before = unsteady_path.read_bytes()
+        # Official legacy examples pad the fourth Boundary Location field with NULs.
+        invalid_nul = any(
+            b"\x00" in line
+            and not (
+                line.startswith(b"Boundary Location=")
+                and len(line.split(b",")) >= 4
+                and line.split(b",")[3] == b"\x00" * 8
+                and b"\x00"
+                not in b",".join(line.split(b",")[:3] + line.split(b",")[4:])
+            )
+            for line in _split_ras_records(text_before, keepends=False)
+        )
+        if invalid_nul or not text_before.startswith(b"Flow Title="):
+            raise ValueError(
+                "Invalid unsteady-flow text: expected Flow Title and no unexpected NUL bytes"
+            )
+        # surrogateescape round-trips legacy filename bytes without guessing an encoding.
+        lines = _split_ras_records(
+            text_before.decode("utf-8", errors="surrogateescape")
+        )
+        boundary_blocks_before = RasUnsteady._meteorology_boundary_bytes(text_before)
+        removed_source_keys = []
+        for line in lines:
+            if line.startswith(RasUnsteady._MET_PRECIP_MANAGED_PREFIXES):
+                parts = line.rstrip("\r\n").split("=", 2)
+                key = "=".join(parts[:2]) if line.startswith("Met BC=") else parts[0]
+                if key not in {"Precipitation Mode", "Met BC=Precipitation|Mode"}:
+                    removed_source_keys.append(key)
+        compiled_path: Optional[Path] = None
+        if compiled_plan_hdf is not None:
+            compiled_path = Path(compiled_plan_hdf)
+            if not compiled_path.name.casefold().endswith(".tmp.hdf"):
+                raise ValueError(
+                    "compiled_plan_hdf must be an owned results-free '*.tmp.hdf' file"
+                )
+            if not compiled_path.is_file():
+                raise FileNotFoundError(f"Compiled plan HDF not found: {compiled_path}")
+
+        hdf_targets = [
+            path
+            for path in (sidecar_hdf, compiled_path)
+            if path is not None and path.exists()
+        ]
+        lines, _ = RasUnsteady._updated_met_precipitation_lines(
+            lines,
+            [
+                ("Precipitation Mode", "Disable"),
+                ("Met BC=Precipitation|Mode", "None"),
+            ],
+        )
+        # Keep the existing two-pass CRLF serialization and insertion order.
+        lines = _split_ras_records(_normalize_ras_newlines("".join(lines)))
+        newline = RasUnsteady._detect_line_ending(lines)
+        had_terminal_newline = bool(lines and lines[-1].endswith(("\r\n", "\n", "\r")))
+        if remove_source_references:
+            retained = []
+            for line in lines:
+                key = line.rstrip("\r\n").split("=", 1)[0]
+                is_met_source = line.startswith(
+                    (
+                        "Met Station",
+                        "Meteorological Station=",
+                        "Met Point Raster Parameters=",
+                    )
+                )
+                if line.startswith("Met BC="):
+                    key = "=".join(line.rstrip("\r\n").split("=", 2)[:2])
+                    is_met_source = not key.endswith(("|Mode", "|Expanded View"))
+                if is_met_source:
+                    removed_source_keys.append(key)
+                else:
+                    retained.append(line)
+            lines = retained
+        managed_prefixes = (
+            "Wind Mode=",
+            "Met BC=Evapotranspiration|Mode=",
+        )
+        insert_index = next(
+            (
+                index
+                for index, line in enumerate(lines)
+                if line.startswith(managed_prefixes)
+            ),
+            None,
+        )
+        if insert_index is None:
+            precip_indexes = [
+                index
+                for index, line in enumerate(lines)
+                if line.startswith(("Precipitation Mode=", "Met BC=Precipitation|"))
+            ]
+            insert_index = (
+                max(precip_indexes) + 1
+                if precip_indexes
+                else RasUnsteady._get_default_met_insert_index(lines)
+            )
+
+        filtered_lines: List[str] = []
+        removed_before_insert = 0
+        for index, line in enumerate(lines):
+            if line.startswith(managed_prefixes):
+                if index < insert_index:
+                    removed_before_insert += 1
+                continue
+            filtered_lines.append(line)
+        insert_index = max(0, insert_index - removed_before_insert)
+        desired_lines = [
+            f"Wind Mode=Disable{newline}",
+            f"Met BC=Evapotranspiration|Mode=None{newline}",
+        ]
+        if (
+            insert_index == len(filtered_lines)
+            and filtered_lines
+            and not filtered_lines[-1].endswith(("\n", "\r"))
+        ):
+            filtered_lines[-1] = f"{filtered_lines[-1]}{newline}"
+        if insert_index == len(filtered_lines) and not had_terminal_newline:
+            desired_lines[-1] = desired_lines[-1][: -len(newline)]
+        text_after = _normalize_ras_newlines(
+            "".join(
+                filtered_lines[:insert_index]
+                + desired_lines
+                + filtered_lines[insert_index:]
+            )
+        ).encode("utf-8", errors="surrogateescape")
+        boundary_blocks_after = RasUnsteady._meteorology_boundary_bytes(text_after)
+        boundary_conditions_unchanged = (
+            boundary_blocks_before == boundary_blocks_after
+        )
+        if not boundary_conditions_unchanged:
+            raise RuntimeError(
+                "Disabling meteorology changed boundary condition records"
+            )
+        hdf_evidence = RasUnsteady._apply_disabled_meteorology(
+            unsteady_path,
+            text_before,
+            text_after,
+            hdf_targets,
+            compiled_path,
+            remove_source_references,
+        )
+
+        ras_obj = ras_object or ras
+        if ras_obj is not None and hasattr(ras_obj, "get_unsteady_entries"):
+            try:
+                ras_obj.unsteady_df = ras_obj.get_unsteady_entries()
+            except Exception as exc:
+                logger.debug("unsteady_df refresh skipped: %s", exc)
+
+        logger.info(
+            "Disabled meteorology in %s and %d HDF artifact(s)",
+            unsteady_path.name,
+            len(hdf_evidence),
+        )
+        return {
+            "unsteady_file": str(unsteady_path),
+            "unsteady_sha256_before": hashlib.sha256(text_before).hexdigest(),
+            "unsteady_sha256_after": hashlib.sha256(text_after).hexdigest(),
+            "boundary_conditions_unchanged": boundary_conditions_unchanged,
+            "boundary_comparison": "bytes_normalized_crlf",
+            "boundary_conditions_byte_identical": (
+                RasUnsteady._meteorology_boundary_bytes(text_before, normalize=False)
+                == RasUnsteady._meteorology_boundary_bytes(text_after, normalize=False)
+            ),
+            "source_references_removed": remove_source_references,
+            "removed_source_keys": sorted(set(removed_source_keys)),
+            "text_state": {
+                "precipitation_mode": "Disable",
+                "precipitation_met_mode": "None",
+                "wind_mode": "Disable",
+                "evapotranspiration_mode": "None",
+            },
+            "hdf_targets": hdf_evidence,
+        }
+
+    @staticmethod
+    def _meteorology_boundary_bytes(
+        raw: bytes, *, normalize: bool = True
+    ) -> list[bytes]:
+        """Compare boundary bytes with only CR/LF record separators normalized."""
+        records = _split_ras_records(raw)
+        lines = [
+            record.decode("utf-8", errors="surrogateescape") for record in records
+        ]
+        blocks = [
+            b"".join(records[b["start_idx"] : b["end_idx"]])
+            for b in RasUnsteady._find_boundary_blocks(lines)
+        ]
+        return (
+            [_normalize_ras_newlines(block) for block in blocks]
+            if normalize
+            else blocks
+        )
+
+    @staticmethod
+    def _apply_disabled_meteorology(
+        unsteady_path: Path,
+        text_before: bytes,
+        text_after: bytes,
+        hdf_targets: list[Path],
+        compiled_path: Path | None,
+        remove_source_references: bool,
+    ) -> list[dict[str, Any]]:
+        """Stage changes, then copy into the same file objects with exception rollback."""
+        import shutil
+        from contextlib import ExitStack
+
+        import h5py
+
+        from ._geometry_association import _protect_windows_backup_acl
+
+        with ExitStack() as stack:
+            staged = {}
+            backups = {}
+            identities = {}
+            targets = [unsteady_path] + hdf_targets
+            for path in targets:
+                directory = Path(
+                    tempfile.mkdtemp(
+                        dir=path.parent,
+                        prefix=f".{path.name}.meteorology-",
+                    )
+                )
+                stack.callback(RasUnsteady._cleanup_meteorology_staging, directory)
+                identities[path] = path.stat()
+                backups[path] = directory / "original"
+                staged[path] = directory / path.name
+                for temporary in [backups[path], staged[path]]:
+                    temporary.touch(mode=0o600)
+                    if os.name == "nt":
+                        _protect_windows_backup_acl(path, temporary)
+                    shutil.copy2(path, temporary)
+                    with temporary.open("r+b") as flushed_copy:
+                        os.fsync(flushed_copy.fileno())
+            if backups[unsteady_path].read_bytes() != text_before:
+                raise RuntimeError("Unsteady-flow text changed before staging")
+            with staged[unsteady_path].open("wb") as output:
+                output.write(text_after)
+                output.flush()
+                os.fsync(output.fileno())
+            hdf_evidence = []
+            for hdf_path in hdf_targets:
+                staged_path = staged[hdf_path]
+                with h5py.File(staged_path, "r") as hdf_file:
+                    if hdf_path == compiled_path and "Results" in hdf_file:
+                        raise ValueError("compiled_plan_hdf must be results-free")
+                    if "Event Conditions" not in hdf_file:
+                        if hdf_path == compiled_path or len(hdf_file):
+                            raise ValueError(
+                                f"Meteorology target lacks /Event Conditions: {hdf_path.name}"
+                            )
+                    else:
+                        if not isinstance(
+                            hdf_file.get("Event Conditions", getlink=True),
+                            h5py.HardLink,
+                        ):
+                            raise ValueError(
+                                "/Event Conditions must be owned by the HDF target"
+                            )
+                        event = hdf_file["Event Conditions"]
+                        if not isinstance(event, h5py.Group):
+                            raise ValueError("/Event Conditions must be an HDF group")
+                        if "Meteorology" in event:
+                            if not isinstance(
+                                event.get("Meteorology", getlink=True), h5py.HardLink
+                            ):
+                                raise ValueError(
+                                    "Meteorology must be owned by the HDF target"
+                                )
+                            met = event["Meteorology"]
+                            if not isinstance(met, h5py.Group):
+                                raise ValueError(
+                                    "/Event Conditions/Meteorology must be an HDF group"
+                                )
+                            if any(
+                                name not in {"Attributes", "Meteorology Stations"}
+                                and not isinstance(item, h5py.Group)
+                                for name, item in met.items()
+                            ):
+                                raise ValueError(
+                                    "Meteorology variables must be HDF groups"
+                                )
+                            if any(
+                                not isinstance(
+                                    met.get(name, getlink=True), h5py.HardLink
+                                )
+                                for name in met
+                            ):
+                                raise ValueError(
+                                    "Meteorology variables must be owned by the HDF target"
+                                )
+                            for item in met.values():
+                                if not isinstance(item, h5py.Group):
+                                    continue
+                                enabled = item.attrs.get("Enabled")
+                                if enabled is not None:
+                                    if np.asarray(enabled).ndim != 0:
+                                        raise ValueError(
+                                            "Meteorology Enabled must be scalar"
+                                        )
+                                    int(enabled)
+                if compiled_path is not None and hdf_path == compiled_path:
+                    with h5py.File(staged_path, "r+") as hdf_file:
+                        met_path = "Event Conditions/Meteorology"
+                        removed_groups = []
+                        if met_path in hdf_file:
+                            removed_groups = list(hdf_file[met_path].keys())
+                            del hdf_file[met_path]
+                        hdf_file.flush()
+                    hdf_evidence.append(
+                        {
+                            "path": str(hdf_path),
+                            "representation": "compiled_plan",
+                            "meteorology_group_removed": bool(removed_groups),
+                            "removed_groups": removed_groups,
+                        }
+                    )
+                    continue
+
+                disabled_groups = []
+                with h5py.File(staged_path, "r+") as hdf_file:
+                    if (
+                        remove_source_references
+                        and "Event Conditions/Meteorology" in hdf_file
+                    ):
+                        del hdf_file["Event Conditions/Meteorology"]
+                    meteorology = hdf_file.require_group("Event Conditions/Meteorology")
+                    meteorology.require_group("Precipitation")
+                    meteorology.require_group("Evapotranspiration")
+                    if remove_source_references:
+                        meteorology.require_group("Wind Speed")
+                    for variable_name, item in meteorology.items():
+                        if not isinstance(item, h5py.Group):
+                            continue
+                        prior_value = item.attrs.get("Enabled")
+                        item.attrs["Enabled"] = np.uint8(0)
+                        disabled_groups.append(
+                            {
+                                "variable": variable_name,
+                                "enabled_before": (
+                                    int(prior_value)
+                                    if prior_value is not None
+                                    else None
+                                ),
+                                "enabled_after": int(item.attrs["Enabled"]),
+                            }
+                        )
+                    hdf_file.flush()
+                hdf_evidence.append(
+                    {
+                        "path": str(hdf_path),
+                        "representation": "unsteady_sidecar",
+                        "disabled_groups": disabled_groups,
+                    }
+                )
+
+            # Detect replacement or concurrent edits before applying any staged file.
+            for path in targets:
+                before, current = identities[path], path.stat()
+                if (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                    before.st_mode,
+                ) != (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_size,
+                    current.st_mtime_ns,
+                    current.st_mode,
+                ):
+                    raise RuntimeError(
+                        f"Meteorology target changed during staging: {path.name}"
+                    )
+            # Keep identity, ACLs, owner and hard links, as in PR 500's HDF rollback.
+            with ExitStack() as handle_stack:
+                handles = {
+                    path: handle_stack.enter_context(path.open("r+b"))
+                    for path in targets
+                }
+                for path, handle in handles.items():
+                    current = os.fstat(handle.fileno())
+                    before = identities[path]
+                    if (current.st_dev, current.st_ino) != (
+                        before.st_dev,
+                        before.st_ino,
+                    ):
+                        raise RuntimeError(
+                            f"Meteorology target identity changed: {path.name}"
+                        )
+                applied = []
+                try:
+                    for path in targets:
+                        applied.append(path)
+                        RasUnsteady._copy_meteorology_file(staged[path], handles[path])
+                        RasUnsteady._flush_meteorology_file(
+                            handles[path], identities[path]
+                        )
+                    for path in targets:
+                        if not RasUnsteady._meteorology_file_matches(
+                            staged[path], handles[path]
+                        ):
+                            raise RuntimeError(
+                                f"Meteorology output differs from staging: {path.name}"
+                            )
+                except BaseException:
+                    restore_errors = []
+                    for path in reversed(applied):
+                        try:
+                            RasUnsteady._copy_meteorology_file(
+                                backups[path], handles[path]
+                            )
+                            RasUnsteady._flush_meteorology_file(
+                                handles[path], identities[path]
+                            )
+                            os.utime(
+                                path,
+                                ns=(
+                                    identities[path].st_atime_ns,
+                                    identities[path].st_mtime_ns,
+                                ),
+                            )
+                        except BaseException as exc:  # noqa: BLE001 - attempt every restoration
+                            restore_errors.append(exc)
+                    if restore_errors:
+                        # Retain every original if the filesystem also refuses recovery.
+                        stack.pop_all()
+                        raise RuntimeError(
+                            "Meteorology byte restoration failed; recovery backups: "
+                            + ", ".join(str(path) for path in backups.values())
+                        ) from restore_errors[0]
+                    raise
+        return hdf_evidence
+
+    @staticmethod
+    def _cleanup_meteorology_staging(directory: Path) -> None:
+        """Report retained staging without turning cleanup into a mutation failure."""
+        import shutil
+
+        try:
+            shutil.rmtree(directory)
+        except OSError as exc:
+            logger.warning("Meteorology staging retained at %s: %s", directory, exc)
+
+    @staticmethod
+    def _meteorology_file_matches(source: Path, destination: Any) -> bool:
+        """Verify applied bytes before accepting the complete operation."""
+        destination.seek(0)
+        with source.open("rb") as input_file:
+            while True:
+                expected = input_file.read(1024 * 1024)
+                if destination.read(len(expected) or 1) != expected:
+                    return False
+                if not expected:
+                    return True
+
+    @staticmethod
+    def _copy_meteorology_file(source: Path, destination: Any) -> None:
+        """Copy staged or recovery bytes through an already-open original handle."""
+        import shutil
+
+        destination.seek(0)
+        with source.open("rb") as input_file:
+            shutil.copyfileobj(input_file, destination)
+        destination.truncate()
+
+    @staticmethod
+    def _flush_meteorology_file(handle: Any, original_stat: os.stat_result) -> None:
+        """Flush bytes and retain POSIX set-ID permissions after an in-place write."""
+        import stat
+
+        handle.flush()
+        if os.name != "nt" and stat.S_IMODE(
+            os.fstat(handle.fileno()).st_mode
+        ) != stat.S_IMODE(original_stat.st_mode):
+            os.fchmod(handle.fileno(), stat.S_IMODE(original_stat.st_mode))
+        os.fsync(handle.fileno())
+
+    @staticmethod
+    @log_call
     def set_hydrograph_fixed_start_time(
         unsteady_number_or_path: Union[str, Path],
         use_fixed_start_time: bool,
@@ -3802,8 +4548,7 @@ class RasUnsteady:
             )
 
         if updated_lines != original_lines:
-            with open(unsteady_path, "w", encoding="utf-8") as file:
-                file.writelines(updated_lines)
+            _write_ras_text(unsteady_path, "".join(updated_lines), encoding="utf-8")
 
             if hasattr(ras_obj, "get_boundary_conditions"):
                 try:
@@ -4074,14 +4819,6 @@ class RasUnsteady:
 
 
     @staticmethod
-    def _clean_boundary_selector(value: Optional[Any]) -> Optional[str]:
-        """Normalize optional boundary selector values."""
-        if value is None:
-            return None
-        cleaned = str(value).strip()
-        return cleaned or None
-
-    @staticmethod
     def _detect_boundary_type(lines: List[str], start_idx: int, end_idx: int) -> str:
         """Return the first recognized boundary condition type in a block."""
         for line in lines[start_idx + 1:end_idx]:
@@ -4136,312 +4873,105 @@ class RasUnsteady:
         return blocks
 
     @staticmethod
-    def _boundary_block_name(block: Dict[str, Any]) -> str:
-        """Return a readable display name for a boundary block."""
-        parts = block["parts"]
-        if len(parts) >= 8 and parts[7]:
-            if len(parts) >= 6 and parts[5]:
-                return f"{parts[5]}/{parts[7]}"
-            return parts[7]
-
-        river = parts[0] if len(parts) > 0 else ""
-        reach = parts[1] if len(parts) > 1 else ""
-        station = parts[2] if len(parts) > 2 else ""
-        if river or reach or station:
-            return "/".join(part for part in (river, reach, station) if part)
-
-        return block["location"].strip()
+    def _clean_boundary_selector(value: Optional[Any]) -> Optional[str]:
+        """Normalize an optional exact boundary selector."""
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
 
     @staticmethod
     def _boundary_block_matches(
         block: Dict[str, Any],
         river: Optional[str],
         reach: Optional[str],
-        river_station: Optional[str],
-        sa_2d_name: Optional[str],
-        bc_line: Optional[str],
+        station: Optional[str],
+        area_2d: Optional[str],
+        bc_line_name: Optional[str],
     ) -> bool:
-        """Return True when a boundary block matches the provided selector group."""
-        parts = block["parts"]
-        if any(selector is not None for selector in (river, reach, river_station)):
-            if river is not None and (len(parts) < 1 or parts[0] != river):
-                return False
-            if reach is not None and (len(parts) < 2 or parts[1] != reach):
-                return False
-            if river_station is not None and (len(parts) < 3 or parts[2] != river_station):
-                return False
-            return True
+        """Return whether one parsed block exactly matches supplied fields."""
+        parts = list(block.get("parts", ()))
+        if len(parts) < 8:
+            parts.extend([""] * (8 - len(parts)))
 
-        if any(selector is not None for selector in (sa_2d_name, bc_line)):
-            if sa_2d_name is not None and (len(parts) < 6 or parts[5] != sa_2d_name):
-                return False
-            if bc_line is not None and (len(parts) < 8 or parts[7] != bc_line):
-                return False
-            return True
+        selectors = (
+            (river, parts[0]),
+            (reach, parts[1]),
+            (station, parts[2]),
+            (area_2d, parts[5]),
+            (bc_line_name, parts[7]),
+        )
+        return all(
+            selector is None or candidate == selector
+            for selector, candidate in selectors
+        )
 
-        return False
+    @staticmethod
+    def _boundary_block_name(block: Dict[str, Any]) -> str:
+        """Return a concise semantic identity for logs and errors."""
+        parts = list(block.get("parts", ()))
+        if len(parts) < 8:
+            parts.extend([""] * (8 - len(parts)))
+
+        if parts[5] or parts[7]:
+            identity = f"2D {parts[5]!r}/{parts[7]!r}"
+        elif any(parts[:3]):
+            identity = f"1D {parts[0]!r}/{parts[1]!r}/{parts[2]!r}"
+        else:
+            identity = repr(block.get("location", ""))
+        return f"index {block.get('boundary_index', '?')} ({identity})"
+
+    @staticmethod
+    @log_call
+    def inspect_boundary_blocks(
+        staged_project: "StageProjectResult",
+        *,
+        unsteady_number: str,
+    ) -> pd.DataFrame:
+        """Inventory exact boundary block identities in an owned staged project.
+
+        The returned identities bind the staged file content and physical file
+        identity. They are invalid after any change to the staged population.
+        """
+        from .RasBoundary import inspect_boundary_blocks
+
+        return inspect_boundary_blocks(
+            staged_project,
+            unsteady_number=unsteady_number,
+        )
 
     @staticmethod
     @log_call
     def delete_boundary(
-        unsteady_file: Union[str, Path],
-        river: Optional[str] = None,
-        reach: Optional[str] = None,
-        river_station: Optional[str] = None,
-        sa_2d_name: Optional[str] = None,
-        bc_line: Optional[str] = None,
-        boundary_index: Optional[int] = None,
-        force: bool = False,
-        ras_object: Optional[Any] = None,
-    ) -> Dict[str, Any]:
+        staged_project: "StageProjectResult",
+        *,
+        unsteady_number: str,
+        boundary_id: str,
+        expected_source_sha256: str,
+        expected_block_sha256: str,
+        expected_bc_type: str,
+        expected_location_raw: str,
+        dry_run: bool = True,
+    ) -> "BoundaryMutationResult":
+        """Preview or remove one exact boundary block from an owned stage.
+
+        Selection evidence comes from :meth:`inspect_boundary_blocks`. Preview
+        is the default and performs no write. Apply uses a verified splice with
+        CRLF serialization and atomic replacement; direct paths, partial selectors, positional
+        selectors, ``force``, and global-project fallback are not accepted.
         """
-        Remove one ``Boundary Location=`` block from a HEC-RAS unsteady flow file.
+        from .RasBoundary import delete_boundary
 
-        The method deletes from the matched ``Boundary Location=`` header through
-        the line before the next boundary header. For the final boundary in files
-        that carry project-level meteorology or non-Newtonian settings after the
-        boundaries, deletion stops before those global trailers.
-
-        Required external boundary guard
-        --------------------------------
-        ``Flow Hydrograph``, ``Stage Hydrograph``, ``Normal Depth``, and
-        ``Rating Curve`` blocks are commonly required upstream/downstream model
-        boundaries. To avoid silently producing an uncomputable model, these
-        boundary types raise ``ValueError`` unless ``force=True`` is passed.
-        Optional/internal boundary types such as ``Lateral Inflow Hydrograph``,
-        ``Uniform Lateral Inflow Hydrograph``, observed stage/flow, gate,
-        groundwater, navigation dam, rule operation, and precipitation blocks
-        may be deleted without ``force``.
-
-        Parameters
-        ----------
-        unsteady_file : str or Path
-            Path to the unsteady flow file (.u##), or a 1-2 character unsteady
-            number when a project-bound ``ras_object`` is available.
-        river, reach, river_station : str, optional
-            1D selector fields. Provided values are matched against the first
-            three comma-separated fields of ``Boundary Location=``. Partial
-            selectors are allowed but must resolve to exactly one block unless
-            ``boundary_index`` disambiguates.
-        sa_2d_name, bc_line : str, optional
-            2D selector fields. ``sa_2d_name`` matches field index 5 and
-            ``bc_line`` matches field index 7 in HEC-RAS 2D boundary location
-            records. Partial selectors are allowed with the same ambiguity
-            rules as 1D selectors.
-        boundary_index : int, optional
-            Zero-based positional index among ``Boundary Location=`` blocks.
-            Can be used alone as a fallback selector or with selectors to
-            disambiguate an otherwise ambiguous match.
-        force : bool, default False
-            Required to delete likely external upstream/downstream boundary
-            types (Flow Hydrograph, Stage Hydrograph, Normal Depth, Rating
-            Curve).
-        ras_object : optional
-            Custom RAS object. When initialized, ``boundaries_df`` is refreshed
-            after deletion.
-
-        Returns
-        -------
-        Dict[str, Any]
-            Metadata with keys:
-
-            - ``unsteady_file`` (str): path written
-            - ``deleted`` (bool): always True on success
-            - ``name`` (str): readable boundary name/location
-            - ``matched_location`` (str): raw ``Boundary Location=`` value
-            - ``bc_type`` (str): detected boundary condition type
-            - ``boundary_index`` (int): zero-based matched block index
-            - ``backup_path`` (str): path to the ``.bak`` backup
-            - ``lines_removed`` (int): number of lines deleted
-            - ``boundaries_df_refreshed`` (bool): True if refresh succeeded
-            - ``required_boundary`` (bool): True when the guard classified the
-              block as a likely required external boundary
-
-        Raises
-        ------
-        ValueError
-            If selectors are inconsistent, no boundary matches, multiple
-            boundaries match without ``boundary_index`` disambiguation, or a
-            protected external boundary is selected without ``force=True``.
-        FileNotFoundError
-            If the resolved unsteady file does not exist.
-        """
-        river = RasUnsteady._clean_boundary_selector(river)
-        reach = RasUnsteady._clean_boundary_selector(reach)
-        river_station = RasUnsteady._clean_boundary_selector(river_station)
-        sa_2d_name = RasUnsteady._clean_boundary_selector(sa_2d_name)
-        bc_line = RasUnsteady._clean_boundary_selector(bc_line)
-
-        has_1d_selector = any(
-            selector is not None for selector in (river, reach, river_station)
+        return delete_boundary(
+            staged_project,
+            unsteady_number=unsteady_number,
+            boundary_id=boundary_id,
+            expected_source_sha256=expected_source_sha256,
+            expected_block_sha256=expected_block_sha256,
+            expected_bc_type=expected_bc_type,
+            expected_location_raw=expected_location_raw,
+            dry_run=dry_run,
         )
-        has_2d_selector = any(
-            selector is not None for selector in (sa_2d_name, bc_line)
-        )
-        if has_1d_selector and has_2d_selector:
-            raise ValueError(
-                "Provide either 1D selectors (river, reach, river_station) "
-                "or 2D selectors (sa_2d_name, bc_line), not both"
-            )
-
-        if boundary_index is not None:
-            if isinstance(boundary_index, bool) or not isinstance(boundary_index, int):
-                raise ValueError("boundary_index must be a zero-based integer")
-            if boundary_index < 0:
-                raise ValueError("boundary_index must be >= 0")
-
-        if boundary_index is None and not (has_1d_selector or has_2d_selector):
-            raise ValueError(
-                "Provide a boundary selector or boundary_index to delete a boundary"
-            )
-
-        ras_obj = ras_object or ras
-        if ras_obj is not None:
-            try:
-                ras_obj.check_initialized()
-            except Exception:
-                pass
-
-        unsteady_path = RasUnsteady._resolve_unsteady_file_path(
-            unsteady_file,
-            ras_object=ras_obj,
-        )
-        if not unsteady_path.exists():
-            raise FileNotFoundError(f"Unsteady flow file not found: {unsteady_path}")
-
-        with open(unsteady_path, "r", encoding="utf-8", errors="ignore", newline="") as f:
-            lines = f.readlines()
-
-        blocks = RasUnsteady._find_boundary_blocks(lines)
-        if not blocks:
-            raise ValueError(f"No Boundary Location blocks found in {unsteady_path.name}")
-
-        target_block: Optional[Dict[str, Any]] = None
-
-        if has_1d_selector or has_2d_selector:
-            matches = [
-                block for block in blocks
-                if RasUnsteady._boundary_block_matches(
-                    block,
-                    river,
-                    reach,
-                    river_station,
-                    sa_2d_name,
-                    bc_line,
-                )
-            ]
-            if boundary_index is not None:
-                selected = next(
-                    (block for block in blocks if block["boundary_index"] == boundary_index),
-                    None,
-                )
-                if selected is None:
-                    raise ValueError(
-                        f"boundary_index {boundary_index} is out of range; "
-                        f"{len(blocks)} boundary blocks found"
-                    )
-                if selected not in matches:
-                    raise ValueError(
-                        f"boundary_index {boundary_index} does not match the "
-                        "provided boundary selectors"
-                    )
-                target_block = selected
-            else:
-                if not matches:
-                    selector = (
-                        f"river={river!r}, reach={reach!r}, river_station={river_station!r}"
-                        if has_1d_selector
-                        else f"sa_2d_name={sa_2d_name!r}, bc_line={bc_line!r}"
-                    )
-                    raise ValueError(
-                        f"No boundary matched in {unsteady_path.name} for {selector}"
-                    )
-                if len(matches) > 1:
-                    choices = ", ".join(
-                        f"{block['boundary_index']}:{RasUnsteady._boundary_block_name(block)}"
-                        for block in matches
-                    )
-                    raise ValueError(
-                        "Boundary selector is ambiguous. Provide boundary_index "
-                        f"to disambiguate one of: {choices}"
-                    )
-                target_block = matches[0]
-        else:
-            selected = next(
-                (block for block in blocks if block["boundary_index"] == boundary_index),
-                None,
-            )
-            if selected is None:
-                raise ValueError(
-                    f"boundary_index {boundary_index} is out of range; "
-                    f"{len(blocks)} boundary blocks found"
-                )
-            target_block = selected
-
-        if target_block is None:
-            raise ValueError("No boundary selected for deletion")
-
-        bc_type = target_block["bc_type"]
-        required_boundary = bc_type in RasUnsteady._PROTECTED_BOUNDARY_TYPES
-        if required_boundary and not force:
-            raise ValueError(
-                f"Refusing to delete {bc_type} boundary "
-                f"{RasUnsteady._boundary_block_name(target_block)!r} without "
-                "force=True because it may be a required upstream/downstream "
-                "external boundary"
-            )
-        if required_boundary and force:
-            logger.warning(
-                "Deleting likely required external %s boundary %s from %s because force=True",
-                bc_type,
-                RasUnsteady._boundary_block_name(target_block),
-                unsteady_path.name,
-            )
-
-        start_idx = target_block["start_idx"]
-        end_idx = target_block["end_idx"]
-        if end_idx <= start_idx:
-            raise ValueError(
-                f"Invalid boundary block extent for index {target_block['boundary_index']}"
-            )
-
-        backup_path = Path(str(unsteady_path) + ".bak")
-        shutil.copy2(unsteady_path, backup_path)
-        lines_removed = end_idx - start_idx
-        del lines[start_idx:end_idx]
-
-        with open(unsteady_path, "w", encoding="utf-8", newline="") as f:
-            f.writelines(lines)
-
-        boundaries_df_refreshed = False
-        if ras_obj is not None:
-            try:
-                ras_obj.boundaries_df = ras_obj.get_boundary_conditions()
-                boundaries_df_refreshed = True
-            except Exception as exc:
-                logger.debug(f"boundaries_df refresh skipped: {exc}")
-
-        boundary_name = RasUnsteady._boundary_block_name(target_block)
-        logger.info(
-            "Deleted boundary %s (%s) from %s: %d lines removed",
-            boundary_name,
-            bc_type,
-            unsteady_path.name,
-            lines_removed,
-        )
-
-        return {
-            "unsteady_file": str(unsteady_path),
-            "deleted": True,
-            "name": boundary_name,
-            "matched_location": target_block["location"],
-            "bc_type": bc_type,
-            "boundary_index": target_block["boundary_index"],
-            "backup_path": str(backup_path),
-            "lines_removed": lines_removed,
-            "boundaries_df_refreshed": boundaries_df_refreshed,
-            "required_boundary": required_boundary,
-        }
 
 
 # Additional functions from the AWS webinar where the code was developed
@@ -4680,15 +5210,18 @@ class RasUnsteady:
         formatted_values = []
         for i in range(0, len(df), 10):
             row = df['Value'].iloc[i:i+10]
-            formatted_row = ''.join(f'{value:8.2f}' for value in row)
+            formatted_row = ''.join(
+                RasUnsteady._format_fixed_width_value(value) for value in row
+            )
             formatted_values.append(formatted_row + '\n')
         
         # Replace old table with new formatted values
         lines[start_line:start_line+len(formatted_values)] = formatted_values
         
         try:
-            with open(unsteady_path, 'w', encoding='utf-8', errors='replace') as file:
-                file.writelines(lines)
+            _write_ras_text(
+                unsteady_path, "".join(lines), encoding="utf-8", errors="replace"
+            )
             logger.info(f"Successfully updated table '{table_name}' in {unsteady_path}")
         except PermissionError:
             logger.error(f"Permission denied when writing to unsteady flow file: {unsteady_path}")
@@ -4696,6 +5229,157 @@ class RasUnsteady:
         except IOError as e:
             logger.error(f"Error writing to unsteady flow file: {unsteady_path}. {str(e)}")
             raise
+
+    @staticmethod
+    @log_call
+    def ensure_2d_precipitation_boundary(
+        unsteady_file: Union[str, Path],
+        geometry_file: Union[str, Path],
+        *,
+        area_2d: str,
+        ras_object: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Ensure an inline area-wide precipitation boundary for a real 2D area.
+
+        Creates a zero-depth, simulation-start boundary when absent. Follow
+        with :meth:`set_precipitation_hyetograph` to author interval depths.
+        Existing inline precipitation is preserved byte-for-byte. Traditional
+        Storage Areas, DSS precipitation and conflicting area-wide boundaries
+        are refused; perimeter BC lines remain separate.
+
+        Args:
+            unsteady_file: Unsteady-flow path or project-bound number.
+            geometry_file: Geometry text path containing the exact 2D area.
+            area_2d: Exact 2D Flow Area name, at most 16 characters.
+            ras_object: Optional project used for path resolution and refresh.
+
+        Returns:
+            dict: Resolved paths, area name, whether a block was created, and
+            whether the project's boundary inventory was refreshed.
+
+        Raises:
+            FileNotFoundError: The geometry file is unavailable.
+            ValueError: The area, file header, encoding, or existing boundary
+                is ambiguous or unsupported, or the unsteady file is unavailable.
+                Validation precedes replacement.
+        """
+        from .geom import GeomStorage
+
+        if not isinstance(area_2d, str) or not area_2d.strip():
+            raise ValueError("area_2d must be a non-empty 2D Flow Area name")
+        area_name = area_2d.strip()
+        if len(area_name) > 16 or any(character in area_name for character in ",\r\n\x00"):
+            raise ValueError("area_2d must fit the 16-character native field without delimiters")
+        geometry_path = Path(geometry_file)
+        areas = GeomStorage.get_storage_areas(geometry_path, exclude_2d=False)
+        matches = areas.loc[areas["Name"] == area_name] if "Name" in areas else areas
+        if len(matches) != 1 or not bool(matches.iloc[0]["Is2D"]):
+            raise ValueError(f"Geometry must contain exactly one 2D Flow Area {area_name!r}")
+        unsteady_path = RasUnsteady._resolve_unsteady_file_path(unsteady_file, ras_object=ras_object)
+        original = unsteady_path.read_bytes()
+        if b"\x00" in original:
+            raise ValueError("NUL-containing unsteady text is unsupported")
+        for encoding in ("utf-8", "cp1252", "latin-1"):
+            try:
+                text = original.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        lines = text.splitlines(keepends=True)
+        newline = RasUnsteady._detect_line_ending(lines)
+        titles = [index for index, line in enumerate(lines) if line.startswith("Flow Title=")]
+        nonempty = [index for index, line in enumerate(lines) if line.strip()]
+        if len(titles) != 1 or not nonempty or titles[0] != nonempty[0]:
+            raise ValueError("Unsteady-flow header must begin with exactly one Flow Title record")
+        blocks = RasUnsteady._find_boundary_blocks(lines)
+        header_indexes = [index for index, line in enumerate(lines)
+                          if line.startswith(("Flow Title=", "Program Version=", "Use Restart="))]
+        if blocks and max(header_indexes) >= blocks[0]["start_idx"]:
+            raise ValueError("Unsteady-flow header records appear inside boundary data")
+        candidates = []
+        for block in blocks:
+            parts = list(block["parts"]) + [""] * max(0, 9 - len(block["parts"]))
+            if parts[5] == area_name and not parts[7]:
+                if any(parts[index] for index in range(len(parts)) if index != 5):
+                    raise ValueError(f"Conflicting area-wide location fields for {area_name!r}")
+                candidates.append(block)
+        result = {
+            "unsteady_file": str(unsteady_path.resolve()),
+            "geometry_file": str(geometry_path.resolve()),
+            "area_2d": area_name, "created": False,
+            "boundaries_df_refreshed": False,
+        }
+        if candidates:
+            if len(candidates) != 1:
+                raise ValueError(f"Duplicate area-wide boundaries for {area_name!r}")
+            block = candidates[0]
+            body = lines[block["start_idx"]:block["end_idx"]]
+            headers = [kind for line in body for prefix, kind in RasUnsteady._BOUNDARY_TYPE_KEYWORDS
+                       if line.startswith(prefix)]
+            dss_flags = [line.partition("=")[2].strip().casefold() for line in body
+                         if line.partition("=")[0].strip().casefold() == "use dss"]
+            if headers != ["Precipitation Hydrograph"] or dss_flags != ["false"]:
+                raise ValueError(f"Existing area-wide boundary for {area_name!r} is not supported inline precipitation")
+            intervals = [line.split("=", 1)[1].strip() for line in body if line.startswith("Interval=")]
+            if len(intervals) != 1 or re.fullmatch(r"[1-9]\d*(?:MIN|HOUR)", intervals[0], re.IGNORECASE) is None:
+                raise ValueError(f"Existing precipitation interval for {area_name!r} is unsupported")
+            table_index = next(index for index in range(block["start_idx"], block["end_idx"])
+                               if lines[index].startswith("Precipitation Hydrograph="))
+            try:
+                if not any(line.startswith("Interval=") for line in lines[block["start_idx"]:table_index]):
+                    raise ValueError("Precipitation interval must precede its table")
+                count = int(lines[table_index].split("=", 1)[1].strip())
+                if not 1 <= count <= 10 * (block["end_idx"] - table_index - 1):
+                    raise ValueError("Invalid precipitation table count")
+                # The general legacy reader rescues numeric substrings. Here
+                # malformed existing state must fail before authoring proceeds.
+                values = []
+                for line in lines[table_index + 1:block["end_idx"]]:
+                    record = line.rstrip("\r\n")
+                    if "=" in record:
+                        break
+                    if not record.strip():
+                        continue
+                    if len(record) > 80 or len(record) % 8:
+                        raise ValueError("Precipitation rows require up to ten 8-character fields")
+                    for start in range(0, len(record), 8):
+                        field = record[start:start + 8].strip()
+                        if len(values) >= count:
+                            if field:
+                                raise ValueError("Precipitation table has extra ordinates")
+                        elif not field:
+                            raise ValueError("Precipitation table has a blank value slot")
+                        else:
+                            values.append(float(field))
+                values = np.asarray(values, dtype=float)
+                if len(values) != count or not np.all(np.isfinite(values)) or np.any(values < 0):
+                    raise ValueError("Invalid precipitation table values")
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Existing precipitation table for {area_name!r} is malformed") from exc
+            return result
+        insert_at = blocks[0]["start_idx"] if blocks else max(header_indexes) + 1
+        fields = ["" for _ in range(9)]
+        widths = [16, 16, 8, 8, 16, 16, 16, 32, 32]
+        fields[5] = area_name
+        location = ",".join(f"{value:<{width}}" for value, width in zip(fields, widths))
+        content = [f"Boundary Location={location}", "Interval=1HOUR",
+                   "Precipitation Hydrograph= 2", "    0.00    0.00",
+                   "DSS Path=", "Use DSS=False", "Use Fixed Start Time=False",
+                   "Fixed Start Date/Time=,", "Is Critical Boundary=False", "Critical Boundary Flow="]
+        if insert_at and not lines[insert_at - 1].endswith(("\r", "\n")):
+            lines[insert_at - 1] += newline
+        lines[insert_at:insert_at] = [line + newline for line in content]
+        RasUnsteady._atomic_write_lines(unsteady_path, lines, encoding=encoding)
+        result["created"] = True
+        ras_obj = ras_object or ras
+        if ras_obj is not None and hasattr(ras_obj, "get_boundary_conditions"):
+            try:
+                ras_obj.boundaries_df = ras_obj.get_boundary_conditions()
+                result["boundaries_df_refreshed"] = True
+            except Exception as exc:
+                logger.debug("Boundary inventory refresh skipped: %s", exc)
+        logger.info("Created zero-depth precipitation boundary for %s in %s", area_name, unsteady_path.name)
+        return result
 
     @staticmethod
     @log_call
@@ -4718,11 +5402,16 @@ class RasUnsteady:
             Path to the unsteady flow file (.u##) or unsteady number (e.g., "01")
         hyetograph_df : pd.DataFrame
             DataFrame with columns:
-            - 'hour': Time in hours from storm start (end of interval)
-            - 'incremental_depth': Precipitation depth for this interval (inches)
-            - 'cumulative_depth': Cumulative precipitation depth (inches)
+            - 'hour': Regular interval-end hours from the existing boundary start.
+              Start at one interval, or include a zero-depth row at hour zero.
+            - 'incremental_depth': Depth over the preceding interval (inches for
+              a US-customary model, mm for an SI model; no unit conversion).
+            - 'cumulative_depth': Cumulative sum of incremental depths in the same units.
         boundary_name : str, optional
-            Name of the 2D Flow Area or Storage Area to update.
+            Exact, case-insensitive area name in Boundary Location field 5.
+            Named selection is verified for 2D Flow Areas; Storage Area layouts
+            require separate native verification.
+            A supplied name must identify exactly one precipitation boundary.
             If None, updates the first Precipitation Hydrograph found.
         ras_object : optional
             Custom RAS object to use instead of the global one
@@ -4735,7 +5424,8 @@ class RasUnsteady:
         Raises
         ------
         ValueError
-            If DataFrame is missing required columns
+            If data, timing, fixed-width range or the target inline boundary is invalid,
+            or the source file mixes newline conventions
         FileNotFoundError
             If unsteady flow file not found
 
@@ -4745,8 +5435,9 @@ class RasUnsteady:
         >>> from ras_commander.precip import StormGenerator
         >>>
         >>> # Generate hyetograph
-        >>> gen = StormGenerator.download_from_coordinates(29.76, -95.37)
-        >>> hyeto = gen.generate_hyetograph(
+        >>> ddf = StormGenerator.download_from_coordinates(29.76, -95.37)
+        >>> hyeto = StormGenerator.generate_hyetograph(
+        ...     ddf_data=ddf,
         ...     total_depth_inches=17.0,
         ...     duration_hours=24,
         ...     position_percent=50
@@ -4763,16 +5454,25 @@ class RasUnsteady:
 
         **Interval Detection**:
         - Interval is calculated from `hour` column spacing (e.g., 1.0 → "1HOUR", 0.5 → "30MIN")
-        - The Interval= line immediately preceding the Precipitation Hydrograph section is updated
+        - The unique Interval= line inside the selected boundary block is updated
 
         **Fixed-Width Format**:
-        - Values formatted as 8-character fixed-width fields (8.2f)
+        - Values formatted as 8-character fixed-width fields (two decimals,
+          ``ValueError`` if a value cannot fit)
         - 10 incremental-depth values per line
-        - Count = number of depth values; timing comes from the Interval= line
+        - Count includes a zero-depth ordinate at the existing boundary start.
+        - A value at time t is the depth over the preceding interval.
+        - Existing fixed-start/simulation-start selection is preserved; cover the
+          required simulation window and append explicit dry intervals as needed.
 
         **Depth Conservation**:
-        - Total depth is logged for verification
-        - Should match the total_depth_inches used in generation
+        - Cumulative depths are rounded to 0.01, then differenced for serialization.
+        - Total and interval-end cumulative depths differ by at most 0.005 depth
+          units (floating-point tolerance aside); individual increments can differ
+          by up to 0.01. This avoids accumulated independent-rounding error.
+        - Native interval timing was checked on the HEC-RAS 7.0 Davis example;
+          other versions, units and boundary-start configurations need their own
+          solver-level check. This method does not establish hydraulic acceptance.
 
         See Also
         --------
@@ -4808,140 +5508,124 @@ class RasUnsteady:
                 f"Required columns: {required_columns}"
             )
 
-        # Calculate interval from hour column
-        hours = hyetograph_df['hour'].values
-        if len(hours) < 2:
+        # Native table index zero is the boundary start, not the first interval end.
+        # A value at t represents depth over (t - interval, t].  See the HEC-RAS
+        # User's Manual, Boundary Conditions / Precipitation, and notebook 721.
+        try:
+            data = hyetograph_df[required_columns].to_numpy(dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Hyetograph columns must contain finite numeric values") from exc
+        if len(data) < 2:
             raise ValueError("DataFrame must have at least 2 rows to determine interval")
-
-        interval_hours = hours[1] - hours[0]
-
-        # Convert interval to HEC-RAS format string
-        if interval_hours >= 1.0:
-            if interval_hours == int(interval_hours):
-                interval_str = f"{int(interval_hours)}HOUR"
-            else:
-                # Convert to minutes if fractional hour
-                interval_min = int(interval_hours * 60)
-                interval_str = f"{interval_min}MIN"
+        if not np.isfinite(data).all():
+            raise ValueError("Hyetograph columns must contain finite numeric values")
+        hours, depths, cumulative = data.T
+        if (depths < 0).any() or (cumulative < 0).any():
+            raise ValueError("Precipitation depths must be non-negative")
+        interval_hours = float(hours[1] - hours[0])
+        if interval_hours <= 0 or not np.allclose(
+            np.diff(hours), interval_hours, rtol=0, atol=1e-9
+        ):
+            raise ValueError("hour must be a strictly increasing regular interval grid")
+        interval_minutes = round(interval_hours * 60)
+        if interval_minutes < 1 or not np.isclose(
+            interval_hours * 60, interval_minutes, rtol=0, atol=1e-7
+        ):
+            raise ValueError("Interval must be a positive whole number of minutes")
+        canonical_cumulative = np.cumsum(depths)
+        if not np.allclose(cumulative, canonical_cumulative, rtol=1e-9, atol=1e-8):
+            raise ValueError("cumulative_depth must equal the cumulative sum of incremental_depth")
+        # Use one canonical mass curve: tolerated noise in the redundant supplied
+        # cumulative column must not cross a rounding tie and create negative rain.
+        cumulative = canonical_cumulative
+        if np.isclose(hours[0], 0, rtol=0, atol=1e-9):
+            if depths[0] != 0 or cumulative[0] != 0:
+                raise ValueError("A time-zero row must have zero incremental and cumulative depth")
+        elif np.isclose(hours[0], interval_hours, rtol=0, atol=1e-9):
+            cumulative = np.r_[0.0, cumulative]
         else:
-            interval_min = int(interval_hours * 60)
-            interval_str = f"{interval_min}MIN"
+            raise ValueError("hour must start at zero or the first interval end; pad delayed storms with zeros")
 
-        # Read the file
-        with open(unsteady_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
-
-        # Get precipitation values (incremental depths)
-        precip_values = hyetograph_df['incremental_depth'].values
-
-        # Calculate total depth for logging
-        total_depth = hyetograph_df['cumulative_depth'].iloc[-1]
-
-        # Precipitation Hydrograph stores one incremental depth per interval.
+        # Quantize the mass curve before differencing: total and every interval-end
+        # cumulative depth stay within 0.005 input depth units. Independent rounding
+        # of increments can accumulate an arbitrarily larger total-depth error.
+        try:
+            with np.errstate(over="raise", invalid="raise"):
+                rounded_cumulative = np.rint(cumulative * 100.0) / 100.0
+        except FloatingPointError as exc:
+            raise ValueError("Precipitation depth exceeds the fixed-width numeric range") from exc
+        precip_values = np.diff(rounded_cumulative, prepend=0.0)
+        fields = [
+            RasUnsteady._format_fixed_width_value(value, min_decimals=2)
+            for value in precip_values
+        ]
+        interval_str = (
+            f"{interval_minutes // 60}HOUR"
+            if interval_minutes % 60 == 0 else f"{interval_minutes}MIN"
+        )
+        total_depth = float(cumulative[-1])
         num_values = len(precip_values)
 
-        # Format into fixed-width lines (8 chars each, 10 depth values per line)
-        formatted_lines = []
-        for i in range(0, len(precip_values), 10):
-            row_values = precip_values[i:i+10]
-            formatted_row = ''.join(f'{value:8.2f}' for value in row_values)
-            formatted_lines.append(formatted_row + '\n')
-
-        # Find the Precipitation Hydrograph section(s)
-        precip_sections = []
-        for i, line in enumerate(lines):
-            if line.startswith('Precipitation Hydrograph='):
-                precip_sections.append(i)
-
-        if not precip_sections:
+        # Decode losslessly and retain the native encoding and newline convention.
+        original_bytes = unsteady_path.read_bytes()
+        for encoding in ("utf-8", "cp1252", "latin-1"):
+            try:
+                text = original_bytes.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        lines = text.splitlines(keepends=True)
+        newline = RasUnsteady._detect_line_ending(lines)
+        blocks = RasUnsteady._find_boundary_blocks(lines)
+        candidates = []
+        for block in blocks:
+            for idx in range(block["start_idx"] + 1, block["end_idx"]):
+                if lines[idx].startswith("Precipitation Hydrograph="):
+                    candidates.append((block, idx))
+        if not candidates:
             raise ValueError(
                 f"No 'Precipitation Hydrograph=' section found in {unsteady_path}. "
                 "Ensure the unsteady file has a precipitation boundary condition defined."
             )
-
-        # Determine which section to update
         if boundary_name is not None:
-            # Find the section associated with the specified boundary
-            target_section = None
-            for precip_idx in precip_sections:
-                # Search backwards for Boundary Location
-                for j in range(precip_idx - 1, max(0, precip_idx - 50), -1):
-                    if lines[j].startswith('Boundary Location='):
-                        # Check if boundary name matches (usually in position 6 for storage area)
-                        loc_parts = lines[j].replace('Boundary Location=', '').split(',')
-                        for part in loc_parts:
-                            if boundary_name.strip().lower() in part.strip().lower():
-                                target_section = precip_idx
-                                break
-                        break
-                if target_section is not None:
-                    break
+            if not isinstance(boundary_name, str) or not boundary_name.strip():
+                raise ValueError("boundary_name must be a non-empty area name")
+            name = boundary_name.strip().casefold()
+            candidates = [
+                (block, idx) for block, idx in candidates
+                if len(block["parts"]) > 5 and block["parts"][5].casefold() == name
+            ]
+            if len(candidates) != 1:
+                raise ValueError(f"Expected exactly one precipitation boundary for area {boundary_name!r}; found {len(candidates)}")
+        block, precip_line_idx = candidates[0]
+        interval_indices = [
+            idx for idx in range(block["start_idx"] + 1, precip_line_idx)
+            if lines[idx].startswith("Interval=")
+        ]
+        if len(interval_indices) != 1:
+            raise ValueError("Precipitation boundary must have exactly one Interval= before its table")
+        # This writer targets an existing inline boundary, without changing DSS or
+        # fixed-start-time selection behind the caller's back.
+        if any(line.strip() == "Use DSS=True" for line in lines[block["start_idx"]:block["end_idx"]]):
+            raise ValueError("Precipitation boundary uses DSS; select an inline boundary before writing")
 
-            if target_section is None:
-                logger.warning(
-                    f"Boundary '{boundary_name}' not found. "
-                    f"Updating first Precipitation Hydrograph section."
-                )
-                target_section = precip_sections[0]
-        else:
-            target_section = precip_sections[0]
-
-        precip_line_idx = target_section
-
-        # Find the end of the old data section by scanning for next keyword line
-        # Data starts right after the Precipitation Hydrograph= line
         old_data_start = precip_line_idx + 1
-        old_data_end = old_data_start
-
-        # Scan forward to find where data ends (next line with '=' keyword)
-        for k in range(old_data_start, len(lines)):
-            line = lines[k]
-            # Data lines are numeric only; keyword lines contain '='
-            if '=' in line:
-                old_data_end = k
-                break
-            # Also check for empty lines that might mark end of section
-            if not line.strip():
-                # Empty line might be end of section, but continue checking
-                pass
-        else:
-            # Reached end of file
-            old_data_end = len(lines)
-
-        # Update the Precipitation Hydrograph header line with new count
-        new_precip_line = f"Precipitation Hydrograph= {num_values} \n"
-
-        # Search backwards from Precipitation Hydrograph line for Interval line
-        interval_updated = False
-        for j in range(precip_line_idx - 1, max(0, precip_line_idx - 20), -1):
-            if lines[j].startswith('Interval='):
-                old_interval = lines[j].strip()
-                lines[j] = f"Interval={interval_str}\n"
-                interval_updated = True
-                logger.debug(f"Updated {old_interval} to Interval={interval_str}")
-                break
-
-        if not interval_updated:
-            logger.warning(
-                f"Could not find Interval= line before Precipitation Hydrograph at line {precip_line_idx + 1}. "
-                "Interval not updated."
-            )
-
-        # Replace the old data section with new formatted data
-        # 1. Update header line
-        lines[precip_line_idx] = new_precip_line
-
-        # 2. Replace data lines
+        old_data_end = next(
+            (idx for idx in range(old_data_start, block["end_idx"]) if "=" in lines[idx]),
+            block["end_idx"],
+        )
+        formatted_lines = [
+            "".join(fields[idx:idx + 10]) + newline
+            for idx in range(0, num_values, 10)
+        ]
+        lines[interval_indices[0]] = f"Interval={interval_str}{newline}"
+        lines[precip_line_idx] = f"Precipitation Hydrograph= {num_values} {newline}"
         new_lines = lines[:old_data_start] + formatted_lines + lines[old_data_end:]
-
-        # Write updated content back to file
-        with open(unsteady_path, 'w', encoding='utf-8') as f:
-            f.writelines(new_lines)
-
+        _write_ras_text(unsteady_path, "".join(new_lines), encoding=encoding)
         logger.info(
             f"Updated Precipitation Hydrograph in {unsteady_path.name}: "
-            f"{num_values} time steps, interval={interval_str}, "
-            f"total depth={total_depth:.4f} inches"
+            f"{num_values} ordinates including time-zero anchor, interval={interval_str}, "
+            f"input depth={total_depth:.6f}, serialized depth={rounded_cumulative[-1]:.2f}"
         )
 
     @staticmethod
@@ -4951,6 +5635,8 @@ class RasUnsteady:
         value: float = 1.0,
         units: str = "in/hr",
         ras_object: Optional[Any] = None,
+        *,
+        ratio: Optional[float] = None,
     ) -> None:
         """
         Configure constant (spatially and temporally uniform) precipitation.
@@ -4981,6 +5667,13 @@ class RasUnsteady:
             Constant precipitation rate units.
         ras_object : optional
             Custom RAS object used to resolve an unsteady number.
+        ratio : float, optional
+            Positive finite dimensionless multiplier written to both text and
+            the existing HDF sidecar. Pass 1.0 to replace an inherited rainfall
+            reduction factor and retain the supplied rate unscaled. Omission
+            preserves existing ratio records for backward compatibility. Explicit
+            values are rounded once to native Single precision; overflow and
+            underflow to zero are rejected before either file is modified.
 
         Returns
         -------
@@ -4992,7 +5685,8 @@ class RasUnsteady:
         ------
         ValueError
             If ``value`` is not a finite, non-negative real number, or ``units``
-            is not ``"in/hr"`` or ``"mm/hr"``.
+            is not ``"in/hr"`` or ``"mm/hr"``, or an explicit ``ratio`` does
+            not round to a positive finite native Single.
 
         Examples
         --------
@@ -5014,6 +5708,17 @@ class RasUnsteady:
             raise ValueError(f"value must be >= 0, got {constant_value!r}")
         if units not in {"in/hr", "mm/hr"}:
             raise ValueError("units must be either 'in/hr' or 'mm/hr'")
+        native_ratio = None
+        if ratio is not None:
+            if isinstance(ratio, bool) or not isinstance(ratio, numbers.Real):
+                raise ValueError("ratio must be a positive finite real number")
+            try:
+                with np.errstate(over="ignore", under="ignore"):
+                    native_ratio = np.float32(float(ratio))
+            except (OverflowError, ValueError) as exc:
+                raise ValueError("ratio must fit a positive finite native Single") from exc
+            if not np.isfinite(native_ratio) or native_ratio <= 0:
+                raise ValueError("ratio must fit a positive finite native Single")
 
         unsteady_path = RasUnsteady._resolve_unsteady_file_path(
             unsteady_file,
@@ -5024,24 +5729,29 @@ class RasUnsteady:
 
         logger.info(
             "Configuring constant precipitation in %s: value=%s, units=%s",
-            unsteady_path, formatted_value, units,
+            unsteady_path.name, formatted_value, units,
         )
 
-        RasUnsteady._replace_met_precipitation_keys(
-            unsteady_path,
-            [
-                ("Precipitation Mode", "Enable"),
-                ("Met BC=Precipitation|Mode", "Constant"),
-                ("Met BC=Precipitation|Constant Value", formatted_value),
-                ("Met BC=Precipitation|Constant Units", units),
-            ],
-        )
+        precipitation_keys = [
+            ("Precipitation Mode", "Enable"),
+            ("Met BC=Precipitation|Mode", "Constant"),
+            ("Met BC=Precipitation|Constant Value", formatted_value),
+            ("Met BC=Precipitation|Constant Units", units),
+        ]
+        if ratio is not None:
+            precipitation_keys.append(
+                ("Met BC=Precipitation|Ratio", format(float(native_ratio), ".9g"))
+            )
+        RasUnsteady._replace_met_precipitation_keys(unsteady_path, precipitation_keys)
 
         hdf_path = Path(str(unsteady_path) + ".hdf")
         if hdf_path.exists():
-            RasUnsteady._update_constant_precipitation_hdf(
-                hdf_path, constant_value, units
-            )
+            if ratio is None:
+                RasUnsteady._update_constant_precipitation_hdf(hdf_path, constant_value, units)
+            else:
+                RasUnsteady._update_constant_precipitation_hdf(
+                    hdf_path, constant_value, units, ratio=float(native_ratio)
+                )
         else:
             logger.warning(
                 f"HDF file not found: {hdf_path} - constant precipitation "
@@ -5060,13 +5770,15 @@ class RasUnsteady:
         hdf_path: Path,
         value: float,
         units: str,
+        *,
+        ratio: Optional[float] = None,
     ) -> None:
         """Write constant-mode precipitation attributes to an unsteady .u##.hdf."""
         import h5py
 
         met_path = "Event Conditions/Meteorology"
         precip_grp_path = f"{met_path}/Precipitation"
-        logger.info(f"Updating constant precipitation HDF attributes: {hdf_path}")
+        logger.info("Updating constant precipitation HDF attributes: %s", hdf_path.name)
         try:
             with h5py.File(hdf_path, "a") as hdf_file:
                 hdf_file.require_group("Event Conditions")
@@ -5077,11 +5789,231 @@ class RasUnsteady:
                 precip_grp.attrs["Mode"] = np.bytes_("Constant")
                 precip_grp.attrs["Constant Value"] = np.float64(value)
                 precip_grp.attrs["Constant Units"] = np.bytes_(units)
+                RasUnsteady._write_precipitation_ratio_attribute(
+                    precip_grp, ratio, hdf_path, historic=False,
+                )
 
                 RasUnsteady._ensure_meteorology_attributes_dataset(hdf_file, met_path)
         except Exception as e:
             logger.error(f"Error updating constant precipitation HDF attributes: {e}")
             raise
+
+    @staticmethod
+    def _read_netcdf_precipitation(
+        netcdf_path: Union[str, Path],
+        dataset_name: Optional[str] = None,
+        value_type: str = "rate",
+        first_timestep_hours: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Read a NetCDF precipitation field and build the HEC-RAS cumulative payload.
+
+        Every failure raises. A model whose unsteady file points at gridded
+        precipitation without a payload runs with zero rain and no error, so a
+        missing file, variable, or dependency must not degrade to a warning.
+
+        The field is reoriented north-up / west-first before flattening, because
+        HEC-RAS stores row 0 at ``Raster Top``; a south-first source would otherwise
+        be written mirrored.
+
+        Parameters
+        ----------
+        netcdf_path : str or Path
+            NetCDF file with ``time``, ``y``, ``x`` coordinates.
+        dataset_name : str, optional
+            Data variable to read. Must exist when given; detected when omitted.
+        value_type : {"rate", "amount", "cumulative"}, default "rate"
+            How to interpret the variable; see ``RasPrecipHdf.convert_to_cumulative``.
+        first_timestep_hours : float, optional
+            Duration of the first band's interval. When omitted the first band is
+            not delivered, matching the HEC-RAS import dialog's default.
+
+        Returns
+        -------
+        dict
+            ``cumulative`` (n_times, rows, cols), ``times``, ``raster_left``,
+            ``raster_top``, ``cell_size``, ``n_rows``, ``n_cols``, ``srs_wkt``,
+            ``precip_var``, ``declared_units`` (the ``units`` attribute, or None).
+        """
+        from .RasPrecipHdf import RasPrecipHdf
+
+        try:
+            import xarray as xr
+        except ImportError as e:
+            raise ImportError(
+                "xarray is required to import gridded precipitation; "
+                "install with: pip install ras-commander[precip]"
+            ) from e
+
+        netcdf_path = Path(netcdf_path)
+        if not netcdf_path.exists():
+            raise FileNotFoundError(f"NetCDF precipitation file not found: {netcdf_path}")
+
+        try:
+            ds = RasUnsteady._open_netcdf_dataset(netcdf_path, xr)
+            try:
+                if dataset_name is not None and dataset_name not in ds.data_vars:
+                    raise ValueError(
+                        f"Variable {dataset_name!r} not found in {netcdf_path.name}; "
+                        f"available: {sorted(ds.data_vars)}"
+                    )
+                precip_var = RasUnsteady._find_precipitation_variable(ds, dataset_name)
+                if precip_var is None:
+                    raise ValueError(
+                        f"Could not find a precipitation variable in {netcdf_path}"
+                    )
+                precip_data = ds[precip_var].values
+                times = ds["time"].values
+                x_coords = ds["x"].values
+                y_coords = ds["y"].values
+                srs_wkt = RasUnsteady._get_netcdf_crs_wkt(ds, precip_var)
+                variable_attrs = getattr(ds[precip_var], "attrs", None) or {}
+                dataset_attrs = getattr(ds, "attrs", None) or {}
+                declared_units = variable_attrs.get("units") or dataset_attrs.get("units")
+            finally:
+                close = getattr(ds, "close", None)
+                if callable(close):
+                    close()
+        except Exception as e:
+            logger.error(f"Error reading NetCDF precipitation file {netcdf_path}: {e}")
+            raise
+
+        if precip_data.ndim != 3:
+            raise ValueError(
+                f"Precipitation variable {precip_var!r} must be (time, y, x); "
+                f"got shape {precip_data.shape}"
+            )
+
+        n_source_times = precip_data.shape[0]
+        precip_data, x_coords, y_coords = RasPrecipHdf.orient_north_up(
+            precip_data, x_coords, y_coords
+        )
+        raster_left, raster_top, cell_size, n_rows, n_cols = RasPrecipHdf.get_grid_from_coords(
+            x_coords, y_coords, default_cell_size=2000.0
+        )
+        logger.debug(
+            f"NetCDF precipitation grid: {n_source_times} timesteps, {n_rows}x{n_cols} grid"
+        )
+        cumulative, times_out = RasPrecipHdf.convert_to_cumulative(
+            precip_data, times, value_type, first_timestep_hours
+        )
+        return {
+            "cumulative": cumulative,
+            "times": times_out,
+            "raster_left": raster_left,
+            "raster_top": raster_top,
+            "cell_size": cell_size,
+            "n_rows": n_rows,
+            "n_cols": n_cols,
+            "srs_wkt": srs_wkt,
+            "precip_var": precip_var,
+            "declared_units": declared_units,
+        }
+
+    @staticmethod
+    def _write_precipitation_hdf(
+        hdf_path: Union[str, Path],
+        payload: Dict[str, Any],
+        netcdf_rel_path: str,
+        interpolation: str,
+        units: str = "mm",
+        ratio: Optional[float] = None,
+        historic: bool = False,
+        text_ratio_prepared: bool = False,
+    ) -> "PrecipRasterImportResult":
+        """
+        Write a precipitation payload built by ``_read_netcdf_precipitation``.
+
+        The ``Imported Raster Data`` payload is written first, by
+        ``RasPrecipHdf.write_gridded_precip_raster``, which validates everything
+        before opening the file - so an invalid payload leaves the HDF untouched.
+        The ``Precipitation`` group attributes follow; they mirror the ``.u##`` text,
+        which HEC-RAS regenerates them from on every save, and only keep the file
+        self-consistent until then. The HDF file is created when absent - it is
+        exactly what HEC-RAS copies forward on its next rebuild.
+        """
+        import h5py
+        from .RasPrecipHdf import RasPrecipHdf
+
+        hdf_path = Path(hdf_path)
+        met_path = "Event Conditions/Meteorology"
+        logger.debug(f"Updating precipitation in HDF: {hdf_path}")
+        try:
+            result = RasPrecipHdf.write_gridded_precip_raster(
+                hdf_path,
+                payload["cumulative"],
+                payload["times"],
+                payload["raster_left"],
+                payload["raster_top"],
+                payload["cell_size"],
+                payload["srs_wkt"],
+                units,
+                nodata=-9999.0,
+                require_met_bc_block=False,
+                overwrite=True,
+                ratio=ratio,
+                historic=historic,
+                # The caller has already validated and prepared the replacement
+                # .u## text in memory; it is committed only after this HDF write
+                # succeeds so a failed payload write cannot advertise empty rain.
+                _text_ratio_prepared=text_ratio_prepared,
+            )
+            with h5py.File(hdf_path, "a") as f:
+                precip_grp = f.require_group(f"{met_path}/Precipitation")
+                precip_grp.attrs["Enabled"] = np.uint8(1)
+                precip_grp.attrs["Mode"] = np.bytes_("Gridded")
+                precip_grp.attrs["Source"] = np.bytes_("GDAL Raster File(s)")
+                precip_grp.attrs["GDAL Filename"] = np.bytes_(netcdf_rel_path)
+                precip_grp.attrs["GDAL Datasetname"] = np.bytes_(payload["precip_var"])
+                precip_grp.attrs["GDAL Filter"] = np.bytes_("")
+                precip_grp.attrs["GDAL Folder"] = np.bytes_("")
+                precip_grp.attrs["Interpolation Method"] = np.bytes_(interpolation)
+                RasUnsteady._write_precipitation_ratio_attribute(
+                    precip_grp, ratio, hdf_path, historic=historic
+                )
+                RasUnsteady._ensure_meteorology_attributes_dataset(f, met_path)
+        except Exception as e:
+            logger.error(f"Error updating HDF file {hdf_path}: {e}")
+            raise
+
+        cumulative = payload["cumulative"]
+        logger.info(
+            f"Imported gridded precipitation into {RasUnsteady._path_name(hdf_path)}: "
+            f"{cumulative.shape[0]} timesteps, {payload['n_rows'] * payload['n_cols']} cells, "
+            f"range={float(np.nanmin(cumulative)):.1f}-{float(np.nanmax(cumulative)):.1f} "
+            f"{result.units}"
+        )
+        return result
+
+    @staticmethod
+    def _check_declared_units(
+        payload: Dict[str, Any], units: str, netcdf_path: Union[str, Path]
+    ) -> None:
+        """
+        Reject a ``units`` argument that contradicts the NetCDF's own units metadata.
+
+        HEC-RAS converts from the Units attribute to project units, so labelling
+        inch data as mm (or the reverse) scales every value by 25.4 without error.
+        An unrecognized or missing label is not checked.
+        """
+        from .RasPrecipHdf import RasPrecipHdf
+
+        label = payload.get("declared_units")
+        declared = RasPrecipHdf.infer_depth_units(label)
+        if declared is None:
+            if label:
+                logger.debug(
+                    f"Units label {label!r} in {Path(netcdf_path).name} not recognized; "
+                    f"using units={units!r}"
+                )
+            return
+        if declared != units:
+            raise ValueError(
+                f"{Path(netcdf_path).name} declares units {label!r} ({declared}) but "
+                f"units={units!r} was requested. HEC-RAS converts from the Units "
+                f"attribute to project units, so this mismatch would scale all "
+                f"precipitation by 25.4. Pass units={declared!r}."
+            )
 
     @staticmethod
     def _update_precipitation_hdf(
@@ -5090,240 +6022,76 @@ class RasUnsteady:
         netcdf_rel_path: str,
         interpolation: str = "Nearest",
         dataset_name: Optional[str] = None,
+        units: str = "mm",
+        value_type: str = "rate",
+        first_timestep_hours: Optional[float] = None,
+        ratio: Optional[float] = None,
+        historic: bool = False,
     ) -> None:
         """
-        Import precipitation raster data into HDF in HEC-RAS 6.6 format.
+        Import gridded precipitation from NetCDF into an unsteady flow HDF.
 
-        This function imports gridded precipitation from NetCDF into the HDF file
-        in the exact format HEC-RAS 6.6 creates when using "Import Raster Data" in the GUI.
-
-        The data is transformed from instantaneous rates to cumulative totals and
-        flattened from (time, y, x) to (time, rows*cols) shape.
-
-        HEC-RAS 6.6 Format Requirements (verified against GUI import):
-        - Timestamps in ISO 8601 format: 'YYYY-MM-DD HH:MM:SS' (|S19)
-        - No separate Timestamp dataset (timestamps only in Times attribute)
-        - Values dataset: chunked, gzip compressed, fillvalue=nan
-        - NoData attribute as float32(-9999.0)
-        - Grid extent attributes on Values dataset (not on Imported Raster Data group)
-        - Meteorology/Attributes dataset preserved for proper indexing
+        Reads the NetCDF (``_read_netcdf_precipitation``) and writes the payload in
+        HEC-RAS's native layout (``_write_precipitation_hdf``). Kept for callers
+        that operate on an HDF directly; ``set_gridded_precipitation`` also
+        configures the ``.u##`` text, which the payload needs to survive a save.
 
         Parameters
         ----------
         hdf_path : Path
-            Path to the unsteady HDF file (.u##.hdf)
+            Unsteady flow HDF (.u##.hdf). Created if absent.
         netcdf_path : Path
-            Absolute path to the NetCDF precipitation file
+            Absolute path to the NetCDF precipitation file.
         netcdf_rel_path : str
-            Relative path string for HDF attributes (e.g., ".\\Precipitation\\file.nc")
+            Relative path string for HDF attributes (e.g. ".\\Precipitation\\file.nc").
         interpolation : str
-            Interpolation method ("Bilinear" or "Nearest"). Default is "Nearest"
-            which matches HEC-RAS 6.6 GUI default.
+            "Bilinear" or "Nearest".
         dataset_name : str, optional
-            NetCDF data variable name to import. If omitted, a common
-            precipitation variable name is detected from the file.
+            NetCDF data variable. Detected when omitted.
+        units : str, default "mm"
+            Units of the NetCDF values ("mm" or "in"; "kg/m^2" is written as "mm").
+            HEC-RAS converts from these to the project's units.
+        value_type : {"rate", "amount", "cumulative"}, default "rate"
+            Interpretation of the NetCDF values.
+        first_timestep_hours : float, optional
+            First band interval duration; omit to match the import dialog default.
+        ratio : float, optional
+            Precipitation ratio attribute to write. Omit to leave it unchanged.
+        historic : bool, default False
+            Set true for observed or analysis precipitation. With no explicit
+            ``ratio``, callers of the public setter write 1.0.
         """
-        import h5py
-        import numpy as np
-        import uuid
+        from .RasPrecipHdf import RasPrecipHdf
 
-        try:
-            import xarray as xr
-        except ImportError:
-            logger.warning("xarray not available - cannot import precipitation into HDF")
-            return
-
-        logger.debug(f"Updating precipitation in HDF: {hdf_path}")
-
-        # Read the NetCDF file
-        if not netcdf_path.exists():
-            logger.warning(f"NetCDF file not found: {netcdf_path}")
-            return
-
-        try:
-            ds = RasUnsteady._open_netcdf_dataset(netcdf_path, xr)
-            try:
-                precip_var = RasUnsteady._find_precipitation_variable(ds, dataset_name)
-                if precip_var is None:
-                    logger.warning(f"Could not find precipitation variable in {netcdf_path}")
-                    return
-
-                precip_data = ds[precip_var].values  # Shape: (time, y, x)
-                times = ds['time'].values
-                x_coords = ds['x'].values
-                y_coords = ds['y'].values
-                srs_wkt = RasUnsteady._get_netcdf_crs_wkt(ds, precip_var)
-            finally:
-                close = getattr(ds, "close", None)
-                if callable(close):
-                    close()
-
-            n_times, n_rows, n_cols = precip_data.shape
-            logger.debug(f"NetCDF precipitation grid: {n_times} timesteps, {n_rows}x{n_cols} grid")
-
-        except ValueError as e:
-            logger.error(f"Invalid NetCDF precipitation metadata: {e}")
-            raise
-        except Exception as e:
-            logger.warning(f"Error reading NetCDF file: {e}")
-            return
-
-        # Calculate raster extent parameters
-        cellsize = abs(x_coords[1] - x_coords[0]) if len(x_coords) > 1 else 2000.0
-        x_min = float(x_coords.min())
-        y_min = float(y_coords.min())
-        y_max = float(y_coords.max())
-
-        # Raster bounds (cell edges, not centers)
-        raster_left = x_min - cellsize / 2
-        raster_top = y_max + cellsize / 2
-
-        # Transform data: flatten spatial dims and convert to cumulative
-        # Shape: (time, y, x) -> (time, rows*cols)
-        precip_flat = precip_data.reshape(n_times, n_rows * n_cols)
-
-        # Replace NaN with 0 for cumsum calculation
-        precip_flat = np.nan_to_num(precip_flat, nan=0.0).astype(np.float32)
-
-        # HEC-RAS 6.6 writes the first cumulative row as zero, then integrates
-        # instantaneous rates by each raster interval.
-        interval_hours = RasUnsteady._netcdf_interval_hours(times)
-        precip_amounts = precip_flat * interval_hours[:, np.newaxis]
-        precip_cumulative = np.cumsum(precip_amounts, axis=0).astype(np.float32)
-
-        # Create timestamp strings in HEC-RAS 6.6 format (ISO 8601)
-        # Format: 'YYYY-MM-DD HH:MM:SS' stored as |S19 fixed-length bytes
-        import pandas as pd
-        timestamps = pd.to_datetime(times)
-        timestamp_strs = [t.strftime('%Y-%m-%d %H:%M:%S') for t in timestamps]
-
-        # Generate GUID for dataset
-        guid = str(uuid.uuid4())
-
-        # Update the HDF file
-        try:
-            with h5py.File(hdf_path, 'r+') as f:
-                met_path = 'Event Conditions/Meteorology'
-                precip_grp_path = f'{met_path}/Precipitation'
-
-                # Create parent groups if they don't exist
-                if precip_grp_path not in f:
-                    logger.debug("Creating precipitation group hierarchy in HDF")
-                    if 'Event Conditions' not in f:
-                        f.create_group('Event Conditions')
-                    if met_path not in f:
-                        f.create_group(met_path)
-                    f.create_group(precip_grp_path)
-
-                precip_grp = f[precip_grp_path]
-
-                # Update Precipitation group attributes
-                # HEC-RAS 6.6 uses uint8 for Enabled
-                precip_grp.attrs['Enabled'] = np.uint8(1)
-                precip_grp.attrs['Mode'] = np.bytes_('Gridded')
-                precip_grp.attrs['Source'] = np.bytes_('GDAL Raster File(s)')
-                precip_grp.attrs['GDAL Filename'] = np.bytes_(netcdf_rel_path)
-                precip_grp.attrs['GDAL Datasetname'] = np.bytes_(precip_var)
-                precip_grp.attrs['GDAL Filter'] = np.bytes_('')
-                precip_grp.attrs['GDAL Folder'] = np.bytes_('')
-                precip_grp.attrs['Interpolation Method'] = np.bytes_(interpolation)
-
-                # HEC-RAS 6.6 requires Meteorology/Attributes dataset for indexing
-                RasUnsteady._ensure_meteorology_attributes_dataset(f, met_path)
-
-                # Create/recreate Imported Raster Data group
-                # HEC-RAS 6.6: NO attributes on this group (grid attrs go on Values dataset)
-                raster_grp_path = f'{precip_grp_path}/Imported Raster Data'
-                if raster_grp_path in f:
-                    del f[raster_grp_path]
-                raster_grp = f.create_group(raster_grp_path)
-
-                # HEC-RAS 6.6: NO separate Timestamp dataset (timestamps only in Times attribute)
-
-                # Number of cells for dataset shape
-                n_cells = n_rows * n_cols
-
-                # Common attributes for Values datasets (HEC-RAS 6.6 format)
-                values_attrs = {
-                    'Data Type': np.bytes_('cumulative'),
-                    'GUID': np.bytes_(guid),
-                    'NoData': np.float32(-9999.0),  # HEC-RAS 6.6 uses float32
-                    'Projection': np.bytes_(srs_wkt),
-                    'Raster Cellsize': np.float64(cellsize),
-                    'Raster Cols': np.int32(n_cols),
-                    'Raster Left': np.float64(raster_left),
-                    'Raster Rows': np.int32(n_rows),
-                    'Raster Top': np.float64(raster_top),
-                    'Rate Time Units': np.bytes_('Hour'),
-                    'Storage Configuration': np.bytes_('Sequential'),
-                    'Time Series Data Type': np.bytes_('Amount'),
-                    'Times': np.array(timestamp_strs, dtype='S19'),  # HEC-RAS 6.6: ISO format |S19
-                    'Units': np.bytes_('mm'),
-                    'Version': np.bytes_('1.0'),
-                }
-
-                # Create Values dataset - HEC-RAS 6.6 format:
-                # - Chunked as single chunk (n_times, n_cells)
-                # - gzip compression level 1
-                # - fillvalue = nan
-                values_ds = raster_grp.create_dataset(
-                    'Values',
-                    data=precip_cumulative,
-                    dtype=np.float32,
-                    chunks=(n_times, n_cells),
-                    compression='gzip',
-                    compression_opts=1,
-                    fillvalue=np.nan
-                )
-                for attr_name, attr_val in values_attrs.items():
-                    values_ds.attrs[attr_name] = attr_val
-
-                # Create Values (Vertical) dataset - same format
-                values_vert_ds = raster_grp.create_dataset(
-                    'Values (Vertical)',
-                    data=precip_cumulative,
-                    dtype=np.float32,
-                    chunks=(n_times, n_cells),
-                    compression='gzip',
-                    compression_opts=1,
-                    fillvalue=np.nan
-                )
-                for attr_name, attr_val in values_attrs.items():
-                    values_vert_ds.attrs[attr_name] = attr_val
-
-                logger.info(
-                    f"Imported gridded precipitation into "
-                    f"{RasUnsteady._path_name(hdf_path)}: "
-                    f"{n_times} timesteps, {n_cells} cells, "
-                    f"range={precip_cumulative.min():.1f}-"
-                    f"{precip_cumulative.max():.1f} mm"
-                )
-
-        except Exception as e:
-            logger.error(f"Error updating HDF file: {e}")
-            raise
+        units_out = RasPrecipHdf.normalize_units(units)
+        payload = RasUnsteady._read_netcdf_precipitation(
+            netcdf_path, dataset_name, value_type, first_timestep_hours
+        )
+        RasUnsteady._check_declared_units(payload, units_out, netcdf_path)
+        effective_ratio = RasUnsteady._effective_precipitation_ratio(
+            ratio, historic=historic
+        )
+        RasUnsteady._write_precipitation_hdf(
+            hdf_path,
+            payload,
+            netcdf_rel_path,
+            interpolation,
+            units_out,
+            effective_ratio,
+            historic,
+        )
 
     @staticmethod
-    def _format_met_dss_filename(dss_filename: Union[str, Path], unsteady_path: Path) -> str:
+    def _format_ras_dss_filename(
+        dss_filename: Union[str, Path],
+        ras_text_path: Path,
+    ) -> str:
         """
-        Normalize a DSS filename for RAS meteorology text/HDF attributes.
+        Normalize a DSS filename for a RAS text-file reference.
 
         Relative paths are written with RAS' conventional ``.\\`` prefix. Absolute
-        paths under the unsteady file folder are converted to project-relative
+        paths under the RAS text-file folder are converted to project-relative
         paths; absolute paths elsewhere are preserved.
-        """
-        return RasUnsteady._format_dss_filename(dss_filename, unsteady_path)
-
-    @staticmethod
-    def _format_dss_filename(
-        dss_filename: Union[str, Path],
-        unsteady_path: Path,
-    ) -> str:
-        """Normalize a DSS filename for an HEC-RAS unsteady-flow file.
-
-        HEC-RAS requires project-relative DSS references to begin with ``.\\``
-        or ``..\\``. A bare relative directory such as ``hydrology\\input.dss``
-        is resolved as only ``input.dss`` in the project folder by HEC-RAS 6.6.
         """
         raw_filename = str(dss_filename).strip()
         if not raw_filename:
@@ -5332,7 +6100,7 @@ class RasUnsteady:
         dss_path = Path(raw_filename)
         if dss_path.is_absolute():
             try:
-                relative_path = dss_path.relative_to(unsteady_path.parent)
+                relative_path = dss_path.relative_to(ras_text_path.parent)
                 return f".\\{relative_path}".replace("/", "\\")
             except ValueError:
                 return str(dss_path)
@@ -5341,6 +6109,14 @@ class RasUnsteady:
         if normalized.startswith((".\\", "..\\", "\\")):
             return normalized
         return f".\\{normalized}"
+
+    @staticmethod
+    def _format_met_dss_filename(
+        dss_filename: Union[str, Path],
+        unsteady_path: Path,
+    ) -> str:
+        """Retain the meteorology-specific wrapper for DSS filename formatting."""
+        return RasUnsteady._format_ras_dss_filename(dss_filename, unsteady_path)
 
     @staticmethod
     def _normalize_gridded_interpolation(interpolation: str) -> str:
@@ -5359,6 +6135,267 @@ class RasUnsteady:
                 "interpolation must be '', 'Nearest', or 'Bilinear'"
             )
         return normalized
+
+    @staticmethod
+    def _gridded_precipitation_capabilities(
+        unsteady_path: Path,
+        ras_object: Optional[Any] = None,
+    ) -> Optional["GriddedPrecipitationCapabilities"]:
+        """Resolve precipitation capabilities from the runtime or file header."""
+        from .precip import PrecipCapabilities
+
+        try:
+            capabilities = PrecipCapabilities.resolve(ras_object=ras_object)
+        except ValueError:
+            capabilities = None
+        if capabilities is None:
+            with open(unsteady_path, "r", encoding="utf-8", errors="replace") as source:
+                for line in source:
+                    if line.startswith("Program Version="):
+                        version = line.split("=", 1)[1].strip()
+                        try:
+                            capabilities = PrecipCapabilities.for_version(version)
+                        except ValueError:
+                            pass
+                        break
+        if capabilities is None:
+            logger.warning(
+                "Could not resolve HEC-RAS version for %s; gridded-precipitation "
+                "version safeguards were not applied",
+                unsteady_path.name,
+            )
+            return None
+        capabilities.require_global_gridded()
+        return capabilities
+
+    @staticmethod
+    def _preflight_legacy_precipitation_boundaries(unsteady_path: Path) -> None:
+        """Reject conflicting legacy area rainfall before enabling global grids."""
+        lines = unsteady_path.read_text(encoding="utf-8", errors="replace").splitlines(True)
+        conflicts = [
+            block for block in RasUnsteady._find_boundary_blocks(lines)
+            if block["bc_type"] == "Precipitation Hydrograph"
+        ]
+        if conflicts:
+            locations = "; ".join(
+                f"boundary {block['boundary_index'] + 1} ({block['location'].strip()})"
+                for block in conflicts
+            )
+            raise ValueError(
+                f"Cannot enable global gridded precipitation in {unsteady_path.name}: "
+                f"legacy Precipitation Hydrograph remains at {locations}. "
+                "HEC-RAS 6.6 rejects these simultaneous rainfall sources before compute. "
+                "Review the intended forcing, stage the project with stage_project(), "
+                "then use RasUnsteady.inspect_boundary_blocks() and delete_boundary() "
+                "to explicitly remove the superseded legacy boundary. No files were changed."
+            )
+
+    @staticmethod
+    def _preflight_gridded_precipitation_request(
+        unsteady_path: Path,
+        ras_object: Optional[Any],
+        *,
+        ratio: Optional[float],
+        value_type: str,
+    ) -> Optional["GriddedPrecipitationCapabilities"]:
+        """Reject unsupported version semantics before creating derived files."""
+        RasUnsteady._preflight_legacy_precipitation_boundaries(unsteady_path)
+        capabilities = RasUnsteady._gridded_precipitation_capabilities(
+            unsteady_path, ras_object
+        )
+        RasUnsteady._preflight_precipitation_ratio(
+            unsteady_path, capabilities, ratio
+        )
+        if (
+            capabilities
+            and capabilities.period_average_timing == "shifted"
+            and value_type == "rate"
+        ):
+            logger.warning(
+                "HEC-RAS %s has a native period-average timing defect. "
+                "ras-commander is materializing cumulative precipitation for this "
+                "run; retain and validate the HDF payload if the source is later "
+                "re-imported through the HEC-RAS GUI.",
+                capabilities.version,
+            )
+        return capabilities
+
+    @staticmethod
+    def _effective_precipitation_ratio(
+        ratio: Optional[float], *, historic: bool
+    ) -> Optional[float]:
+        """Return the ratio to write, enforcing observed-rainfall provenance."""
+        # Observed and analysis precipitation is already the event rainfall. A
+        # cloned design-storm plan can carry an areal-reduction factor, so never
+        # retain it merely because the historic caller omitted ``ratio``.
+        if not historic:
+            return ratio
+        if ratio is not None:
+            try:
+                numeric_ratio = float(ratio)
+            except (TypeError, ValueError):
+                # Preserve the established positive/finite validation and its
+                # diagnostic in the common preflight below.
+                return ratio
+            if not np.isclose(numeric_ratio, 1.0):
+                raise ValueError(
+                    "historic=True requires ratio=1.0 because observed precipitation "
+                    "must not be scaled by a design-storm ARF. Pass historic=False and "
+                    "ratio=<value> only for a deliberate design-storm workflow."
+                )
+        return 1.0
+
+    @staticmethod
+    def _write_precipitation_ratio_attribute(
+        precip_grp: Any,
+        ratio: Optional[float],
+        hdf_path: Path,
+        *,
+        historic: bool,
+    ) -> None:
+        """Write a precipitation HDF ratio and report a historic-source reset."""
+        if ratio is None:
+            return
+        existing = precip_grp.attrs.get("Ratio")
+        if historic and existing is not None:
+            try:
+                existing_value = float(existing)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "%s has an unparseable precipitation HDF Ratio=%r; resetting "
+                    "historic precipitation to Ratio=%s",
+                    hdf_path.name,
+                    existing,
+                    RasUnsteady._format_met_float(float(ratio)),
+                )
+            else:
+                if not np.isclose(existing_value, float(ratio)):
+                    logger.warning(
+                        "%s has precipitation HDF Ratio=%s; resetting historic "
+                        "precipitation to Ratio=%s",
+                        hdf_path.name,
+                        RasUnsteady._format_met_float(existing_value),
+                        RasUnsteady._format_met_float(float(ratio)),
+                    )
+        precip_grp.attrs["Ratio"] = np.float32(ratio)
+
+    @staticmethod
+    @h5py_until_qualified
+    def _preflight_precipitation_ratio(
+        unsteady_path: Path,
+        capabilities: Optional["GriddedPrecipitationCapabilities"],
+        ratio: Optional[float],
+    ) -> None:
+        """Validate explicit and retained ratios before mutating a model.
+
+        An omitted ratio is safe only when both retained representations are
+        unit (or absent).  HEC-RAS can rebuild one representation from the
+        other, so inspect the unsteady text and its sidecar HDF rather than
+        treating either as authoritative on its own.
+        """
+        numeric_ratio: Optional[float] = None
+        if ratio is not None:
+            try:
+                numeric_ratio = float(ratio)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"ratio must be a positive number, got {ratio!r}"
+                ) from exc
+            if not np.isfinite(numeric_ratio) or numeric_ratio <= 0:
+                raise ValueError(f"ratio must be a positive number, got {ratio!r}")
+
+        if (
+            capabilities
+            and not capabilities.ratio_applied
+            and numeric_ratio is not None
+            and not np.isclose(numeric_ratio, 1.0)
+        ):
+            raise ValueError(
+                f"HEC-RAS {capabilities.version} does not apply the optional "
+                "precipitation ratio. Pre-scale the source values intentionally "
+                "and pass ratio=1.0, or use HEC-RAS 6.2+."
+            )
+
+        if numeric_ratio is not None and not np.isclose(numeric_ratio, 1.0):
+            logger.info(
+                "%s will use explicit precipitation Ratio=%s for a deliberate "
+                "design-storm workflow",
+                unsteady_path.name,
+                RasUnsteady._format_met_float(numeric_ratio),
+            )
+
+        if ratio is None:
+            retained_ratios: List[Tuple[Path, str, float]] = []
+            ratio_prefix = "Met BC=Precipitation|Ratio="
+            if unsteady_path.exists():
+                with open(
+                    unsteady_path, "r", encoding="utf-8", errors="replace"
+                ) as source:
+                    existing_line = next(
+                        (line for line in source if line.startswith(ratio_prefix)),
+                        None,
+                    )
+                if existing_line is not None:
+                    raw_ratio = existing_line[len(ratio_prefix):].strip()
+                    try:
+                        existing_ratio = float(raw_ratio) if raw_ratio else 1.0
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Unparseable precipitation ratio {raw_ratio!r} in "
+                            f"{unsteady_path.name}"
+                        ) from exc
+                    if not np.isclose(existing_ratio, 1.0):
+                        retained_ratios.append((unsteady_path, raw_ratio, existing_ratio))
+
+            hdf_path = Path(f"{unsteady_path}.hdf")
+            if hdf_path.exists():
+                import h5py
+
+                precip_path = "Event Conditions/Meteorology/Precipitation"
+                with h5py.File(hdf_path, "r") as hdf_file:
+                    if precip_path in hdf_file:
+                        existing = read_attr(hdf_file[precip_path], "Ratio", None)
+                        if existing is not None:
+                            try:
+                                existing_ratio = float(existing)
+                            except (TypeError, ValueError) as exc:
+                                raise ValueError(
+                                    "Unparseable precipitation HDF Ratio "
+                                    f"{existing!r} in {hdf_path.name}"
+                                ) from exc
+                            if not np.isclose(existing_ratio, 1.0):
+                                retained_ratios.append(
+                                    (
+                                        hdf_path,
+                                        RasUnsteady._format_met_float(existing_ratio),
+                                        existing_ratio,
+                                    )
+                                )
+
+            if retained_ratios:
+                source_path, raw_ratio, _ = retained_ratios[0]
+                legacy_note = ""
+                if capabilities and not capabilities.ratio_applied:
+                    legacy_note = (
+                        f" HEC-RAS {capabilities.version} does not apply that ratio."
+                    )
+                raise ValueError(
+                    f"{source_path.name} retains precipitation Ratio={raw_ratio}.{legacy_note} "
+                    "Pass historic=True (or ratio=1.0) for observed data, or "
+                    f"ratio={raw_ratio} to keep the design-storm ARF deliberately."
+                )
+
+    @staticmethod
+    @log_call
+    def get_gridded_precipitation_capabilities(
+        version: Optional[object] = None,
+        ras_object: Optional[Any] = None,
+    ) -> "GriddedPrecipitationCapabilities":
+        """Return version-specific gridded-precipitation support and limitations."""
+        from .precip import PrecipCapabilities
+
+        ras_obj = ras_object or ras
+        return PrecipCapabilities.resolve(version=version, ras_object=ras_obj)
 
     @staticmethod
     def _get_default_met_insert_index(lines: List[str]) -> int:
@@ -5431,6 +6468,8 @@ class RasUnsteady:
         dss_filename: str,
         dss_pathname: str,
         interpolation: str = "",
+        ratio: Optional[float] = None,
+        historic: bool = False,
     ) -> Path:
         """
         Write gridded DSS precipitation metadata to the unsteady sidecar HDF.
@@ -5458,6 +6497,9 @@ class RasUnsteady:
             precip_grp.attrs["Source"] = np.bytes_("DSS")
             precip_grp.attrs["DSS Filename"] = np.bytes_(dss_filename)
             precip_grp.attrs["DSS Pathname"] = np.bytes_(dss_pathname)
+            RasUnsteady._write_precipitation_ratio_attribute(
+                precip_grp, ratio, hdf_path, historic=historic
+            )
             if interpolation:
                 precip_grp.attrs["Interpolation Method"] = np.bytes_(interpolation)
             elif "Interpolation Method" in precip_grp.attrs:
@@ -5479,20 +6521,25 @@ class RasUnsteady:
     @staticmethod
     @log_call
     def configure_gridded_dss_precipitation(
-        unsteady_file: Path,
-        dss_filename: str,
+        unsteady_file: Union[str, Path],
+        dss_filename: Union[str, Path],
         dss_pathname: str,
         interpolation: str = "",
+        ras_object: Optional[Any] = None,
+        ratio: Optional[float] = None,
+        historic: bool = False,
     ) -> None:
         """
         Configure a .u## file to reference gridded DSS precipitation.
 
         This helper wires an existing DSS grid file into the HEC-RAS unsteady
-        flow configuration. It does not write DSS data.
+        flow configuration. It does not write DSS data. The required
+        evapotranspiration, air-density, and air-pressure mode records are
+        completed without replacing explicit nonblank choices.
 
         Parameters
         ----------
-        unsteady_file : Path
+        unsteady_file : str or Path
             Path to the unsteady flow file (.u##).
         dss_filename : str
             DSS filename for the gridded precipitation source. Relative values
@@ -5505,16 +6552,70 @@ class RasUnsteady:
         interpolation : str, optional
             Spatial interpolation method. Use ``"Nearest"`` or ``"Bilinear"``.
             The default empty string leaves the RAS default unset in the .u##.
+        ras_object : optional
+            Custom initialized RAS project. Required when ``unsteady_file`` is
+            supplied as a two-digit unsteady-flow number.
+        ratio : float, optional
+            Set ``Met BC=Precipitation|Ratio``. HEC-RAS 6.0-6.1 do not apply
+            this multiplier, so those releases require 1.0. When omitted, a
+            retained non-unit text or HDF ratio raises rather than silently
+            scaling the new source; pass 1.0 or a deliberate design value.
+        historic : bool, default False
+            Set true for observed or analysis precipitation. With ``ratio=None``
+            the text and HDF ratios are reset to 1.0. A non-unit ``ratio`` is
+            contradictory and raises.
 
         Returns
         -------
         None
             The .u## file and its .u##.hdf sidecar metadata are updated in place.
+
+        Raises
+        ------
+        ValueError
+            A legacy area ``Precipitation Hydrograph`` boundary remains. HEC-RAS
+            6.6 rejected that boundary together with global gridded rainfall in
+            consumer testing; the API conservatively rejects the conflict for
+            all versions before modifying text or HDF. Review the intended
+            forcing and explicitly remove a superseded boundary with
+            ``stage_project()``, ``inspect_boundary_blocks()``, and
+            ``delete_boundary()`` before retrying. No boundary is auto-deleted.
         """
-        unsteady_path = Path(unsteady_file)
+        ras_obj = ras_object or ras
+        is_unsteady_number = isinstance(unsteady_file, str) and len(unsteady_file) <= 2
+        if is_unsteady_number:
+            ras_obj.check_initialized()
+            unsteady_num = unsteady_file.zfill(2)
+            unsteady_path = (
+                Path(ras_obj.project_folder) / f"{ras_obj.project_name}.u{unsteady_num}"
+            )
+        else:
+            unsteady_path = Path(unsteady_file)
         if not unsteady_path.exists():
             raise FileNotFoundError(f"Unsteady flow file not found: {unsteady_path}")
-        unsteady_path = unsteady_path.resolve()
+        # Path.resolve() can turn mapped drives into UNC paths that HEC-RAS cannot
+        # read. This path also anchors the relative DSS filename written to .u##.
+        from .RasUtils import RasUtils
+
+        unsteady_path = RasUtils.safe_resolve(unsteady_path)
+        RasUnsteady._preflight_legacy_precipitation_boundaries(unsteady_path)
+        capabilities = RasUnsteady._gridded_precipitation_capabilities(
+            unsteady_path,
+            ras_obj if ras_object is not None or is_unsteady_number else None,
+        )
+        effective_ratio = RasUnsteady._effective_precipitation_ratio(
+            ratio, historic=historic
+        )
+        RasUnsteady._preflight_precipitation_ratio(
+            unsteady_path, capabilities, effective_ratio
+        )
+        if capabilities and capabilities.period_average_timing == "shifted":
+            logger.warning(
+                "HEC-RAS %s can shift native period-average gridded precipitation "
+                "by one interval. Inspect the preprocessed temporary HDF timestamps "
+                "and rainfall before compute.",
+                capabilities.version,
+            )
 
         dss_pathname = str(dss_pathname).strip()
         if not dss_pathname:
@@ -5543,17 +6644,33 @@ class RasUnsteady:
             ("Met BC=Precipitation|Gridded DSS Pathname", dss_pathname),
         ])
 
-        RasUnsteady._replace_met_precipitation_keys(
-            unsteady_path,
-            desired_entries,
-        )
-
+        # Match the raster route: a locked/invalid HDF must fail before text
+        # advertises a new forcing configuration.
         hdf_path = RasUnsteady._update_gridded_dss_precipitation_hdf(
             unsteady_path=unsteady_path,
             dss_filename=dss_filename_str,
             dss_pathname=dss_pathname,
             interpolation=interpolation_value,
+            ratio=effective_ratio,
+            historic=historic,
         )
+        RasUnsteady._replace_met_precipitation_keys(
+            unsteady_path,
+            desired_entries,
+        )
+        if effective_ratio is not None:
+            with open(
+                unsteady_path,
+                "r",
+                encoding="utf-8",
+                errors="replace",
+                newline="",
+            ) as source:
+                lines = source.readlines()
+            RasUnsteady._apply_precipitation_ratio_line(
+                lines, effective_ratio, unsteady_path, historic=historic
+            )
+            RasUnsteady._atomic_write_lines(unsteady_path, lines)
 
         logger.info(
             f"Configured gridded DSS precipitation in {unsteady_path.name}: "
@@ -5575,19 +6692,300 @@ class RasUnsteady:
 
     @staticmethod
     @log_call
+    def import_gridded_gdal_precipitation(
+        unsteady_file: Union[str, Path],
+        *,
+        units: str,
+        data_type: str = "cumulative",
+        hecras_dir: Optional[Union[str, Path]] = None,
+        timeout: float = 300,
+        ras_object: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Import configured NetCDF through HEC's GDAL and accumulated HDF writer.
+
+        Call configure_gridded_gdal_precipitation() first on a clean staged copy.
+        The installed vendor reader decodes values, timestamps and CRS. Python
+        validates the output and atomically replaces the sidecar after success.
+        Existing imported values are rejected. Requires the .NET Framework
+        compiler and installed runtime, or a configured private Wine prefix.
+
+        Args:
+            unsteady_file: Configured unsteady-flow path or project number.
+            units: Explicit depth units for cumulative input or per-hour units
+                for rates, as accepted by RasPrecipHdf.validate_data_type_units().
+            data_type: "cumulative" or "per-avg" (alias "per-aver"). Rates are
+                interval-ending hourly averages with a zero first baseline.
+                Interval amounts, instantaneous rates, GRIB and a nonzero first
+                rate duration are rejected. Use Python/HDF for those inputs.
+            hecras_dir: Runtime directory. Defaults to the project's executable
+                parent or RasProcess's configured Wine installation on Linux.
+            timeout: Total compiler/import limit in seconds.
+            ras_object: Optional project for number and executable resolution.
+
+        Returns:
+            Import receipt with parsed times, shape, vendor assembly identity,
+            source/helper hashes and destination. This verifies import only;
+            use RasPreprocess and RasCmdr to verify forcing and hydraulics.
+
+        Raises:
+            ValueError: Invalid source, metadata, semantics or existing payload.
+            FileNotFoundError: Source, runtime or compiler is unavailable.
+            RuntimeError: Native import or output validation fails.
+            TimeoutError: The total execution deadline is exhausted.
+            subprocess.TimeoutExpired: A compiler/import process exceeds its limit.
+
+        CF time units must be seconds/minutes/hours/days since a Gregorian epoch,
+        with at least two strictly increasing whole-second timestamps.
+        """
+        from ._native_precip import import_native_gdal
+        import sys
+        import platform
+
+        path = RasUnsteady._resolve_unsteady_file_path(unsteady_file, ras_object).absolute()
+        if hecras_dir is None:
+            if platform.system() == "Linux":
+                facade = sys.modules.get("ras_commander.RasProcess")
+                wine = facade.RasProcess._get_wine_config() if facade else None
+                hecras_dir = wine.ras_install_dir if wine else None
+            else:
+                obj = ras_object or ras
+                executable = getattr(obj, "ras_exe_path", None)
+                hecras_dir = Path(executable).parent if executable else None
+        if hecras_dir is None:
+            raise ValueError("Supply hecras_dir or configure the native runtime")
+        return import_native_gdal(path, Path(hecras_dir), units=units,
+                                  data_type=data_type, timeout=timeout)
+
+    @staticmethod
+    @log_call
+    def configure_gridded_gdal_precipitation(
+        unsteady_file: Union[str, Path],
+        raster_filename: Union[str, Path],
+        dataset_name: str,
+        interpolation: str = "Bilinear",
+        ras_object: Optional[Any] = None,
+        ratio: Optional[float] = None,
+        historic: bool = False,
+    ) -> None:
+        """Configure vendor GDAL input without importing precipitation values.
+
+        Writes .u## source records and matching .u##.hdf attributes. Call
+        import_gridded_gdal_precipitation() next; source configuration alone
+        does not materialize the imported raster payload. This method performs
+        no raster decoding, unit conversion or HEC-RAS execution.
+
+        Args:
+            unsteady_file: Existing unsteady-flow path or project number.
+            raster_filename: Existing NetCDF (.nc, .nc4, .netcdf) or GRIB
+                (.grb, .grib, .grb2, .grib2). Relative paths use the unsteady
+                folder. Stage the source there for portable Windows/Wine paths.
+                Configuration accepts GRIB, but native import is NetCDF only.
+            dataset_name: Explicit vendor GDAL dataset/group selector.
+            interpolation: "Bilinear", "Nearest", or empty for vendor default.
+            ras_object: Optional project for unsteady-flow number resolution.
+            ratio: Explicit positive multiplier. Conflicting retained non-unit
+                ratios are rejected.
+            historic: Write ratio=1.0 for observed/analysis rainfall.
+
+        Returns:
+            None. Updates source configuration in place. Source metadata must
+            supply vendor-readable units, timestamps, CRS and temporal semantics.
+
+        Raises:
+            ValueError: Unsupported suffix/release, blank selector, conflicting
+                legacy rainfall or cached precipitation in the sidecar. Use a
+                clean staged copy so cached values cannot mask a failed import.
+            FileNotFoundError: The source raster does not exist.
+
+        After import, preprocess a fresh stage, inspect materialized forcing and
+        verify final cell rainfall and hydraulics. Do not reuse old plan outputs
+        as native-ingestion evidence.
+        """
+        import h5py
+
+        from .RasUtils import RasUtils
+
+        unsteady_path = RasUtils.safe_resolve(
+            RasUnsteady._resolve_unsteady_file_path(unsteady_file, ras_object)
+        )
+        source = Path(str(raster_filename).replace("\\", "/"))
+        if source.suffix.lower() not in {
+            ".nc", ".nc4", ".netcdf", ".grb", ".grib", ".grb2", ".grib2"
+        }:
+            raise ValueError("Vendor GDAL precipitation requires NetCDF or GRIB input")
+        source_path = source if source.is_absolute() else unsteady_path.parent / source
+        if not source_path.is_file():
+            raise FileNotFoundError(f"Precipitation raster not found: {source_path}")
+        dataset_name = str(dataset_name).strip() if dataset_name is not None else ""
+        if not dataset_name:
+            raise ValueError("dataset_name must be an explicit nonempty GDAL selector")
+        for value in (str(raster_filename), dataset_name):
+            if any(char in value for char in ("\r", "\n", "\x00")):
+                raise ValueError("GDAL source fields must be single-line values")
+        source_text = RasUnsteady._format_met_dss_filename(source_path, unsteady_path)
+        interpolation = RasUnsteady._normalize_gridded_interpolation(interpolation)
+        effective_ratio = RasUnsteady._effective_precipitation_ratio(ratio, historic=historic)
+        RasUnsteady._preflight_legacy_precipitation_boundaries(unsteady_path)
+        capabilities = RasUnsteady._gridded_precipitation_capabilities(
+            unsteady_path, ras_object
+        )
+        RasUnsteady._preflight_precipitation_ratio(
+            unsteady_path, capabilities, effective_ratio
+        )
+
+        entries = [
+            ("Precipitation Mode", "Enable"),
+            ("Met BC=Precipitation|Mode", "Gridded"),
+            ("Met BC=Precipitation|Gridded Source", "GDAL Raster File(s)"),
+            ("Met BC=Precipitation|Gridded GDAL Filename", source_text),
+            ("Met BC=Precipitation|Gridded GDAL Group", dataset_name),
+        ]
+        if interpolation:
+            entries.append(("Met BC=Precipitation|Gridded Interpolation", interpolation))
+        with unsteady_path.open(encoding="utf-8", errors="replace", newline="") as source_file:
+            lines, _ = RasUnsteady._updated_met_precipitation_lines(
+                source_file.readlines(), entries
+            )
+        RasUnsteady._apply_precipitation_ratio_line(
+            lines, effective_ratio, unsteady_path, historic=historic
+        )
+
+        hdf_path = Path(str(unsteady_path) + ".hdf")
+        met_path = "Event Conditions/Meteorology"
+        precip_path = f"{met_path}/Precipitation"
+        # Never silently reuse or delete precipitation from an earlier import.
+        # Check before any write, including metadata changes.
+        if hdf_path.exists():
+            with h5py.File(hdf_path, "r") as hdf:
+                if precip_path in hdf and len(hdf[precip_path]):
+                    raise ValueError(
+                        "Existing precipitation datasets could mask native GDAL ingestion; "
+                        "use a separately staged clean unsteady sidecar"
+                    )
+        with h5py.File(hdf_path, "a") as hdf:
+            precip = hdf.require_group(precip_path)
+            # Retain unrelated metadata, remove stale source selectors.
+            for key in ("DSS Filename", "DSS Pathname", "GDAL Group"):
+                if key in precip.attrs:
+                    del precip.attrs[key]
+            for key, value in {
+                "Mode": "Gridded", "Source": "GDAL Raster File(s)",
+                "GDAL Filename": source_text, "GDAL Datasetname": dataset_name,
+                "GDAL Folder": "", "GDAL Filter": "",
+            }.items():
+                precip.attrs[key] = np.bytes_(value)
+            precip.attrs["Enabled"] = np.uint8(1)
+            if interpolation:
+                precip.attrs["Interpolation Method"] = np.bytes_(interpolation)
+            elif "Interpolation Method" in precip.attrs:
+                del precip.attrs["Interpolation Method"]
+            RasUnsteady._write_precipitation_ratio_attribute(
+                precip, effective_ratio, hdf_path, historic=historic
+            )
+            RasUnsteady._ensure_meteorology_attributes_dataset(hdf, met_path)
+        RasUnsteady._atomic_write_lines(unsteady_path, lines)
+        logger.info(
+            "Configured native GDAL precipitation in %s: %s, dataset=%s; "
+            "no raster values imported; call import_gridded_gdal_precipitation before preprocessing",
+            unsteady_path.name, source_text, dataset_name,
+        )
+
+    @staticmethod
+    @log_call
     def set_gridded_precipitation(
         unsteady_file: Union[str, Path],
         netcdf_path: Union[str, Path],
         interpolation: str = "Bilinear",
         ras_object: Optional[Any] = None,
         dataset_name: Optional[str] = None,
+        units: str = "mm",
+        value_type: str = "rate",
+        first_timestep_hours: Optional[float] = None,
+        ratio: Optional[float] = None,
+        historic: bool = False,
     ) -> None:
-        """
-        Configure gridded precipitation from a NetCDF file in an unsteady flow file.
+        """Configure NetCDF gridded precipitation and update its native HDF.
 
-        This function modifies the meteorologic boundary conditions in an HEC-RAS
-        unsteady flow file to use GDAL Raster (NetCDF) gridded precipitation instead
-        of DSS or constant values.
+        The required evapotranspiration, air-density, and air-pressure mode
+        records are completed without replacing explicit nonblank choices.
+
+        Parameters
+        ----------
+        unsteady_file : str or Path
+            Unsteady-flow number or path.
+        netcdf_path : str or Path
+            Project-relative or absolute precipitation NetCDF path.
+        interpolation : {"Bilinear", "Nearest"}, default "Bilinear"
+            Spatial interpolation used by HEC-RAS.
+        ras_object : optional
+            Initialized project object; defaults to the global project.
+        dataset_name : str, optional
+            Precipitation variable. A common name is detected when omitted.
+        units : str, default "mm"
+            Source depth units, normally ``"mm"`` or ``"in"``.
+        value_type : {"rate", "amount", "cumulative"}, default "rate"
+            Temporal meaning of the input values.
+        first_timestep_hours : float, optional
+            Duration represented by a nonzero first rate/amount frame.
+        ratio : float, optional
+            Positive HEC-RAS precipitation multiplier. Non-unit values for
+            design storms are allowed only when explicit. Omitting it rejects
+            a retained non-unit text or HDF value.
+        historic : bool, default False
+            Set true for observed or analysis precipitation (MRMS, AORC, Stage
+            IV, gauge-adjusted grids, or QPF analysis). With ``ratio=None`` this
+            writes 1.0 to both the unsteady file and its HDF sidecar; a non-unit
+            ``ratio`` raises.
+
+        Returns
+        -------
+        None
+            The established API intentionally retains its historical return
+            contract. Use :meth:`set_gridded_precipitation_geotiff` or
+            :meth:`set_gridded_precipitation_grib` when a structured ingestion
+            result is required for those source formats.
+
+        Raises
+        ------
+        ValueError
+            A legacy area ``Precipitation Hydrograph`` boundary remains. HEC-RAS
+            6.6 rejected that boundary together with global gridded rainfall in
+            consumer testing; the API conservatively rejects the conflict for
+            all versions before modifying text or HDF. Review the intended
+            forcing and explicitly remove a superseded boundary with
+            ``stage_project()``, ``inspect_boundary_blocks()``, and
+            ``delete_boundary()`` before retrying. No boundary is auto-deleted.
+        """
+        RasUnsteady._set_gridded_precipitation_with_result(
+            unsteady_file=unsteady_file,
+            netcdf_path=netcdf_path,
+            interpolation=interpolation,
+            ras_object=ras_object,
+            dataset_name=dataset_name,
+            units=units,
+            value_type=value_type,
+            first_timestep_hours=first_timestep_hours,
+            ratio=ratio,
+            historic=historic,
+        )
+
+    @staticmethod
+    def _set_gridded_precipitation_with_result(
+        unsteady_file: Union[str, Path],
+        netcdf_path: Union[str, Path],
+        interpolation: str = "Bilinear",
+        ras_object: Optional[Any] = None,
+        dataset_name: Optional[str] = None,
+        units: str = "mm",
+        value_type: str = "rate",
+        first_timestep_hours: Optional[float] = None,
+        ratio: Optional[float] = None,
+        historic: bool = False,
+    ) -> "PrecipRasterImportResult":
+        """
+        Configure NetCDF precipitation and return its verified HDF import result.
+
+        Internal result-bearing core for the public source-specific wrappers.
 
         Parameters
         ----------
@@ -5605,11 +7003,43 @@ class RasUnsteady:
             NetCDF data variable name. If omitted and the NetCDF exists, a
             common precipitation variable name is detected and written to the
             HEC-RAS ``Gridded GDAL Group`` field.
+        units : str, default "mm"
+            Units of the NetCDF values: ``"mm"`` or ``"in"`` (``"kg/m^2"`` is
+            accepted and written as ``"mm"``). HEC-RAS converts from these units to
+            the project's, so this must describe the data, not the project - a
+            mislabelled source is silently scaled by 25.4.
+        value_type : {"rate", "amount", "cumulative"}, default "rate"
+            How the NetCDF values are expressed. ``"rate"`` (per hour) is weighted
+            by each interval's duration; ``"amount"`` is a depth per interval;
+            ``"cumulative"`` is already a running total. For hourly data ``"rate"``
+            and ``"amount"`` agree; for any other interval they differ by the
+            interval length.
+        first_timestep_hours : float, optional
+            Duration of the first band's interval, in hours - the import dialog's
+            "First Timestep Duration". When omitted the first band is not delivered
+            (the dialog default) and a warning reports any non-zero data dropped.
+        ratio : float, optional
+            Set ``Met BC=Precipitation|Ratio``. HEC-RAS multiplies all
+            precipitation by this factor. When omitted, a retained non-unit
+            value in either the text or HDF raises before mutation. Pass
+            ``historic=True`` (or ``ratio=1.0``) for observed data, or an
+            explicit design-storm value to retain an ARF deliberately.
+        historic : bool, default False
+            Set true for observed or analysis precipitation. This writes 1.0;
+            a non-unit ``ratio`` is contradictory and raises.
 
         Returns
         -------
-        None
-            The function modifies the file in-place.
+        PrecipRasterImportResult
+            Verified HDF precipitation import details. The function also modifies
+            the unsteady text and sidecar HDF in place.
+
+        Raises
+        ------
+        FileNotFoundError
+            The unsteady file or the NetCDF file does not exist.
+        ValueError
+            Invalid units, value_type, first_timestep_hours, ratio, or NetCDF grid.
 
         Examples
         --------
@@ -5619,7 +7049,8 @@ class RasUnsteady:
         >>> # Set gridded precipitation from AORC NetCDF
         >>> RasUnsteady.set_gridded_precipitation(
         ...     unsteady_file="04",
-        ...     netcdf_path="Precipitation/aorc_april2020_shg.nc"
+        ...     netcdf_path="Precipitation/aorc_april2020_shg.nc",
+        ...     historic=True,
         ... )
 
         Notes
@@ -5652,6 +7083,16 @@ class RasUnsteady:
         if not unsteady_path.exists():
             raise FileNotFoundError(f"Unsteady flow file not found: {unsteady_path}")
 
+        effective_ratio = RasUnsteady._effective_precipitation_ratio(
+            ratio, historic=historic
+        )
+        RasUnsteady._preflight_gridded_precipitation_request(
+            unsteady_path,
+            ras_obj,
+            ratio=effective_ratio,
+            value_type=value_type,
+        )
+
         interpolation = RasUnsteady._normalize_gridded_interpolation(interpolation)
 
         # Convert netcdf_path to relative path if within project folder
@@ -5667,14 +7108,26 @@ class RasUnsteady:
             netcdf_full_path = ras_obj.project_folder / netcdf_path
             netcdf_str = f".\\{netcdf_path}".replace("/", "\\")
 
-        if dataset_name is None and netcdf_full_path.exists():
-            try:
-                import xarray as xr
+        from .RasPrecipHdf import RasPrecipHdf
 
-                with RasUnsteady._open_netcdf_dataset(netcdf_full_path, xr) as ds:
-                    dataset_name = RasUnsteady._find_precipitation_variable(ds)
-            except Exception as e:
-                logger.warning(f"Could not detect NetCDF precipitation variable: {e}")
+        # Validate every input and build the whole payload before the .u## text is
+        # touched, so a bad NetCDF cannot leave the model pointing at gridded
+        # precipitation with no data behind it.
+        units_out = RasPrecipHdf.normalize_units(units)
+        RasPrecipHdf.validate_data_type_units("cumulative", units_out)
+        if effective_ratio is not None and (
+            not np.isfinite(float(effective_ratio)) or float(effective_ratio) <= 0
+        ):
+            raise ValueError(
+                f"ratio must be a positive number, got {effective_ratio!r}"
+            )
+
+        payload = RasUnsteady._read_netcdf_precipitation(
+            netcdf_full_path, dataset_name, value_type, first_timestep_hours
+        )
+        RasUnsteady._check_declared_units(payload, units_out, netcdf_full_path)
+        if dataset_name is None:
+            dataset_name = payload["precip_var"]
 
         logger.debug(f"Configuring gridded precipitation in {unsteady_path}")
         logger.debug(f"  NetCDF file: {netcdf_str}")
@@ -5868,9 +7321,43 @@ class RasUnsteady:
             )
             gdal_group_updated = True
 
+        RasUnsteady._apply_precipitation_ratio_line(
+            lines, effective_ratio, unsteady_path, historic=historic
+        )
+        lines, completed_modes = RasUnsteady._complete_gridded_meteorology_block(
+            lines
+        )
+
+        # Write the payload before the text. HEC-RAS rebuilds the rest of the
+        # .u##.hdf from the text on its next save and copies this payload forward,
+        # so a missing file is created. If the HDF cannot be written (held open by
+        # RAS Mapper, corrupt, permissions) this raises with the .u## untouched,
+        # rather than leaving the model configured for gridded rain with no data.
+        hdf_path = Path(str(unsteady_path) + '.hdf')
+        if not hdf_path.exists():
+            logger.info(f"Creating {hdf_path.name} to hold the imported precipitation payload")
+        import_result = RasUnsteady._write_precipitation_hdf(
+            hdf_path=hdf_path,
+            payload=payload,
+            netcdf_rel_path=netcdf_str,
+            interpolation=interpolation,
+            units=units_out,
+            ratio=effective_ratio,
+            historic=historic,
+            text_ratio_prepared=True,
+        )
+
         # Write the updated file
-        with open(unsteady_path, 'w', encoding='utf-8', errors='replace', newline='\r\n') as f:
-            f.writelines(lines)
+        _write_ras_text(
+            unsteady_path, "".join(lines), encoding="utf-8", errors="replace"
+        )
+
+        if completed_modes:
+            logger.info(
+                "Completed required gridded meteorology modes in %s: %s",
+                unsteady_path.name,
+                ", ".join(completed_modes),
+            )
 
         dataset_suffix = f", dataset={dataset_name}" if dataset_name else ""
         logger.info(
@@ -5878,19 +7365,391 @@ class RasUnsteady:
             f"source={netcdf_str}, interpolation={interpolation}{dataset_suffix}"
         )
         logger.debug(f"Gridded precipitation configuration path: {unsteady_path}")
+        return import_result
 
-        # Import precipitation data into the HDF file
-        hdf_path = Path(str(unsteady_path) + '.hdf')
-        if hdf_path.exists():
-            RasUnsteady._update_precipitation_hdf(
-                hdf_path=hdf_path,
-                netcdf_path=netcdf_full_path,
-                netcdf_rel_path=netcdf_str,
-                interpolation=interpolation,
-                dataset_name=dataset_name,
+    @staticmethod
+    @log_call
+    def set_gridded_precipitation_geotiff(
+        unsteady_file: Union[str, Path],
+        geotiff_paths: Union[str, Path, Sequence[Union[str, Path]]],
+        *,
+        timestamps: Sequence[Any],
+        units: str,
+        value_type: str,
+        first_timestep_hours: Optional[float] = None,
+        bands: Optional[Union[Sequence[int], Sequence[Sequence[int]]]] = None,
+        source_timezone: Optional[str] = None,
+        model_timezone: Optional[str] = None,
+        interpolation: str = "Bilinear",
+        ratio: Optional[float] = None,
+        historic: bool = False,
+        nodata_policy: str = "error",
+        cache_path: Optional[Union[str, Path]] = None,
+        cache_policy: str = "reuse",
+        ras_object: Optional[Any] = None,
+    ) -> "GriddedPrecipitationImportResult":
+        """Configure gridded precipitation directly from GeoTIFF input.
+
+        GeoTIFF is a ras-commander ingestion format, not a native HEC-RAS
+        precipitation source. The input is validated and normalized into a
+        content-addressed project-local NetCDF, then that durable NetCDF and the
+        equivalent native HDF payload are configured together. Later HEC-RAS
+        saves and preprocessing therefore retain a vendor-supported GDAL source.
+        The required evapotranspiration, air-density, and air-pressure mode
+        records are completed without replacing explicit nonblank choices.
+
+        A single GeoTIFF may contain one or more selected bands. A sequence uses
+        one band per file by default; pass one common band list or one band list
+        per file for multiband sequences. Timestamps and units are always
+        explicit; filenames and non-standard TIFF tags are never used to guess
+        time. Amount and rate timestamps are interval-ending; the selected
+        first-timestep duration places the start of the first interval.
+
+        Parameters
+        ----------
+        unsteady_file : str or Path
+            Unsteady-flow number or path.
+        geotiff_paths : path or sequence of paths
+            One multiband GeoTIFF, or a sequence of single-band GeoTIFFs.
+        timestamps : sequence
+            One explicit timestamp per selected band, strictly increasing.
+        units : str
+            Source depth units, normally ``"mm"`` or ``"in"``.
+        value_type : {"rate", "amount", "cumulative"}
+            Temporal meaning of each input band.
+        first_timestep_hours : float, optional
+            Required for a nonzero first rate/amount frame so it is not dropped.
+        bands : sequence of int or sequence of sequences, optional
+            Selected bands applied to every file, or one selection per file.
+        source_timezone, model_timezone : str, optional
+            Explicit timezone localization/conversion before writing the
+            timezone-naive timestamps HEC-RAS uses.
+        interpolation : {"Nearest", "Bilinear"}
+            HEC-RAS spatial interpolation method.
+        ratio : float, optional
+            HEC-RAS precipitation multiplier. Non-unit values for observed
+            precipitation are rejected when ``historic=True``. Omitting this
+            value rejects a retained non-unit text or HDF ratio.
+        historic : bool, default False
+            Reset the text and HDF ratio to 1.0 for observed or analysis
+            precipitation.
+        nodata_policy : {"error", "zero"}, default "error"
+            Fail on NoData by default; ``"zero"`` explicitly treats it as dry.
+        cache_path : str or Path, optional
+            Persistent NetCDF destination. The default is a semantic-hash path
+            below ``Precipitation/_ras_commander_cache`` in the project.
+        cache_policy : {"reuse", "refresh", "error"}, default "reuse"
+            Existing-cache behavior.
+        ras_object : optional
+            Custom initialized RAS project.
+
+        Returns
+        -------
+        GriddedPrecipitationImportResult
+            Source hashes, persistent cache identity, HDF import result, grid,
+            timestamps, units, and NoData audit information.
+        """
+        from .precip.RasPrecipGrid import (
+            GriddedPrecipitationImportResult,
+            RasPrecipGrid,
+        )
+
+        ras_obj = ras_object or ras
+        ras_obj.check_initialized()
+        if isinstance(unsteady_file, str) and len(unsteady_file) <= 2:
+            unsteady_num = unsteady_file.zfill(2)
+            unsteady_path = (
+                Path(ras_obj.project_folder)
+                / f"{ras_obj.project_name}.u{unsteady_num}"
             )
         else:
-            logger.warning(f"HDF file not found: {hdf_path} - precipitation data not imported")
+            unsteady_path = Path(unsteady_file)
+        if not unsteady_path.exists():
+            raise FileNotFoundError(f"Unsteady flow file not found: {unsteady_path}")
+        effective_ratio = RasUnsteady._effective_precipitation_ratio(
+            ratio, historic=historic
+        )
+        capabilities = RasUnsteady._preflight_gridded_precipitation_request(
+            unsteady_path,
+            ras_obj,
+            ratio=effective_ratio,
+            value_type=value_type,
+        )
+        interpolation = RasUnsteady._normalize_gridded_interpolation(interpolation)
+        cube = RasPrecipGrid.from_geotiff(
+            geotiff_paths,
+            timestamps=timestamps,
+            units=units,
+            value_type=value_type,
+            first_timestep_hours=first_timestep_hours,
+            bands=bands,
+            source_timezone=source_timezone,
+            model_timezone=model_timezone,
+            nodata_policy=nodata_policy,
+        )
+
+        if cache_path is None:
+            resolved_cache = RasPrecipGrid.default_cache_path(
+                cube, Path(ras_obj.project_folder)
+            )
+        else:
+            resolved_cache = Path(cache_path)
+            if not resolved_cache.is_absolute():
+                resolved_cache = Path(ras_obj.project_folder) / resolved_cache
+        cache_result = RasPrecipGrid.to_ras_netcdf(
+            cube,
+            resolved_cache,
+            cache_policy=cache_policy,
+        )
+
+        hdf_result = RasUnsteady._set_gridded_precipitation_with_result(
+            unsteady_file=unsteady_file,
+            netcdf_path=cache_result.path,
+            interpolation=interpolation,
+            ras_object=ras_obj,
+            dataset_name="precipitation",
+            units=cube.units,
+            value_type="cumulative",
+            first_timestep_hours=None,
+            ratio=effective_ratio,
+            historic=historic,
+        )
+        return GriddedPrecipitationImportResult(
+            source_format="geotiff",
+            source_paths=cube.source_paths,
+            source_hashes=cube.source_hashes,
+            selected_bands=cube.selected_bands,
+            cache_path=cache_result.path,
+            cache_hash=cache_result.content_hash,
+            cache_reused=cache_result.reused,
+            hdf_result=hdf_result,
+            hec_ras_version=(capabilities.version if capabilities else None),
+            selected_route="translated_netcdf_with_native_hdf",
+            route_qualification=(
+                capabilities.qualification_for(
+                    "geotiff", route="translated_netcdf_with_native_hdf"
+                )
+                if capabilities
+                else "inconclusive"
+            ),
+            shape=tuple(cube.values.shape),
+            timestamps=cube.timestamps,
+            crs_wkt=cube.crs_wkt,
+            transform=cube.transform,
+            units=cube.units,
+            value_type=cube.source_value_type,
+            nodata_policy=cube.nodata_policy,
+            nodata_count=cube.nodata_count,
+        )
+
+    @staticmethod
+    @log_call
+    def set_gridded_precipitation_grib(
+        unsteady_file: Union[str, Path],
+        grib_paths: Union[str, Path, Sequence[Union[str, Path]]],
+        *,
+        timestamps: Sequence[Any],
+        units: str,
+        value_type: str,
+        first_timestep_hours: Optional[float] = None,
+        bands: Optional[Union[Sequence[int], Sequence[Sequence[int]]]] = None,
+        source_timezone: Optional[str] = None,
+        model_timezone: Optional[str] = None,
+        interpolation: str = "Bilinear",
+        ratio: Optional[float] = None,
+        historic: bool = False,
+        nodata_policy: str = "error",
+        cache_path: Optional[Union[str, Path]] = None,
+        cache_policy: str = "reuse",
+        ras_object: Optional[Any] = None,
+    ) -> "GriddedPrecipitationImportResult":
+        """Configure projected GRIB/GRIB2 precipitation through a durable NetCDF.
+
+        Raster bands are read through GDAL/rasterio with caller-supplied
+        interval-ending timestamps (for amounts/rates), depth units, and
+        temporal semantics. The normalized cumulative
+        cube is cached as HEC-RAS-compatible NetCDF and materialized into the
+        unsteady HDF. This is also the safe route for GRIB encodings that GDAL
+        can read but HEC-RAS cannot import directly.
+
+        WPC QPF GRIB2 remains a vendor-known special case through HEC-RAS 7.0.1.
+        If the local GDAL stack cannot decode it, convert it to DSS with
+        HEC-Vortex or HEC-MetVue and use
+        :meth:`configure_gridded_dss_precipitation`.
+
+        Set ``historic=True`` for observed or analysis precipitation to write a
+        unit ratio. A retained non-unit text or HDF ratio requires an explicit
+        design choice, and a non-unit ratio with ``historic=True`` raises.
+        """
+        from .precip.RasPrecipGrid import (
+            GriddedPrecipitationImportResult,
+            RasPrecipGrid,
+        )
+
+        ras_obj = ras_object or ras
+        ras_obj.check_initialized()
+        if isinstance(unsteady_file, str) and len(unsteady_file) <= 2:
+            unsteady_num = unsteady_file.zfill(2)
+            unsteady_path = (
+                Path(ras_obj.project_folder)
+                / f"{ras_obj.project_name}.u{unsteady_num}"
+            )
+        else:
+            unsteady_path = Path(unsteady_file)
+        if not unsteady_path.exists():
+            raise FileNotFoundError(f"Unsteady flow file not found: {unsteady_path}")
+        effective_ratio = RasUnsteady._effective_precipitation_ratio(
+            ratio, historic=historic
+        )
+        capabilities = RasUnsteady._preflight_gridded_precipitation_request(
+            unsteady_path,
+            ras_obj,
+            ratio=effective_ratio,
+            value_type=value_type,
+        )
+        interpolation = RasUnsteady._normalize_gridded_interpolation(interpolation)
+        cube = RasPrecipGrid.from_grib(
+            grib_paths,
+            timestamps=timestamps,
+            units=units,
+            value_type=value_type,
+            first_timestep_hours=first_timestep_hours,
+            bands=bands,
+            source_timezone=source_timezone,
+            model_timezone=model_timezone,
+            nodata_policy=nodata_policy,
+        )
+        if cache_path is None:
+            resolved_cache = RasPrecipGrid.default_cache_path(
+                cube, Path(ras_obj.project_folder)
+            )
+        else:
+            resolved_cache = Path(cache_path)
+            if not resolved_cache.is_absolute():
+                resolved_cache = Path(ras_obj.project_folder) / resolved_cache
+        cache_result = RasPrecipGrid.to_ras_netcdf(
+            cube,
+            resolved_cache,
+            cache_policy=cache_policy,
+        )
+        hdf_result = RasUnsteady._set_gridded_precipitation_with_result(
+            unsteady_file=unsteady_file,
+            netcdf_path=cache_result.path,
+            interpolation=interpolation,
+            ras_object=ras_obj,
+            dataset_name="precipitation",
+            units=cube.units,
+            value_type="cumulative",
+            ratio=effective_ratio,
+            historic=historic,
+        )
+        return GriddedPrecipitationImportResult(
+            source_format="grib",
+            source_paths=cube.source_paths,
+            source_hashes=cube.source_hashes,
+            selected_bands=cube.selected_bands,
+            cache_path=cache_result.path,
+            cache_hash=cache_result.content_hash,
+            cache_reused=cache_result.reused,
+            hdf_result=hdf_result,
+            hec_ras_version=(capabilities.version if capabilities else None),
+            selected_route="translated_netcdf_with_native_hdf",
+            route_qualification=(
+                capabilities.qualification_for(
+                    "grib", route="translated_netcdf_with_native_hdf"
+                )
+                if capabilities
+                else "inconclusive"
+            ),
+            shape=tuple(cube.values.shape),
+            timestamps=cube.timestamps,
+            crs_wkt=cube.crs_wkt,
+            transform=cube.transform,
+            units=cube.units,
+            value_type=cube.source_value_type,
+            nodata_policy=cube.nodata_policy,
+            nodata_count=cube.nodata_count,
+        )
+
+    @staticmethod
+    def _apply_precipitation_ratio_line(
+        lines: List[str],
+        ratio: Optional[float],
+        unsteady_path: Path,
+        *,
+        historic: bool = False,
+    ) -> None:
+        """
+        Set, or check, ``Met BC=Precipitation|Ratio=`` in unsteady file lines.
+
+        Supported HEC-RAS releases multiply precipitation by this ratio and
+        regenerates the HDF attribute from this line on save. When ``ratio`` is
+        None the line is left alone, but a value other than 1 is reported, because
+        it silently scales whatever precipitation is imported. Historic callers
+        pass 1.0, and a retained non-unit value is reported before replacement.
+        """
+        prefix = "Met BC=Precipitation|Ratio="
+        ratio_idx = next(
+            (i for i, line in enumerate(lines) if line.startswith(prefix)), -1
+        )
+
+        if ratio is None:
+            if ratio_idx >= 0:
+                raw_value = lines[ratio_idx][len(prefix):].strip()
+                try:
+                    existing = float(raw_value) if raw_value else 1.0
+                except ValueError:
+                    logger.warning(
+                        f"Unparseable precipitation ratio {raw_value!r} in {unsteady_path.name}"
+                    )
+                    return
+                if not np.isclose(existing, 1.0):
+                    logger.warning(
+                        f"{unsteady_path.name} has precipitation Ratio={raw_value}; HEC-RAS "
+                        f"scales imported precipitation by this factor. Pass ratio=1.0 to "
+                        f"deliver the data unscaled."
+                    )
+            return
+
+        newline = RasUnsteady._detect_line_ending(lines)
+        new_line = (
+            f"{prefix}{RasUnsteady._format_met_float(float(ratio))}{newline}"
+        )
+        if ratio_idx >= 0:
+            if historic:
+                raw_value = lines[ratio_idx][len(prefix):].strip()
+                try:
+                    existing = float(raw_value) if raw_value else 1.0
+                except ValueError:
+                    logger.warning(
+                        "%s has an unparseable precipitation Ratio=%r; resetting "
+                        "historic precipitation to Ratio=%s",
+                        unsteady_path.name,
+                        raw_value,
+                        RasUnsteady._format_met_float(float(ratio)),
+                    )
+                else:
+                    if not np.isclose(existing, float(ratio)):
+                        logger.warning(
+                            "%s has precipitation Ratio=%s; resetting historic "
+                            "precipitation to Ratio=%s",
+                            unsteady_path.name,
+                            raw_value,
+                            RasUnsteady._format_met_float(float(ratio)),
+                        )
+            lines[ratio_idx] = new_line
+            return
+        anchor = next(
+            (i for i, line in enumerate(lines)
+             if line.startswith("Met BC=Precipitation|Expanded View=")),
+            next(
+                (i for i, line in enumerate(lines)
+                 if line.startswith("Met BC=Precipitation|Mode=")),
+                -1,
+            ),
+        )
+        insert_at = anchor + 1 if anchor >= 0 else RasUnsteady._get_default_met_insert_index(lines)
+        lines.insert(insert_at, new_line)
 
     @staticmethod
     def _format_met_float(value: Optional[float]) -> str:
@@ -6371,8 +8230,7 @@ class RasUnsteady:
         insert_idx = RasUnsteady._find_station_insert_index(lines)
         lines[insert_idx:insert_idx] = station_lines
 
-        with open(unsteady_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
+        _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
 
         logger.info(f"Updated meteorological station '{station_name}' in {unsteady_path.name}")
         logger.debug(f"Meteorological station update path: {unsteady_path}")
@@ -6502,8 +8360,7 @@ class RasUnsteady:
         lines = RasUnsteady._remove_point_et_block(lines, station_name)
         RasUnsteady._insert_point_et_block(lines, block_lines)
 
-        with open(unsteady_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
+        _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
 
         logger.info(
             f"Configured point ET for station '{station_name}' in {unsteady_path.name} "
@@ -6659,15 +8516,24 @@ class RasUnsteady:
             - bc_type: Boundary condition type (Flow Hydrograph, Lateral Inflow, etc.)
             - interval: Time interval (e.g., 5MIN)
             - dss_file: DSS file path
-            - dss_path: Full DSS path (//A/B/C/D/E/F/)
+            - dss_path: Full DSS path (/A/B/C/D/E/F/; A may be empty)
             - dss_part_a: DSS Part A (project)
             - dss_part_b: DSS Part B (location/subbasin)
             - dss_part_c: DSS Part C (parameter)
             - dss_part_d: DSS Part D (date)
             - dss_part_e: DSS Part E (interval)
             - dss_part_f: DSS Part F (run identifier)
-            - use_dss: Boolean True/False
+            - use_dss: HEC-RAS text value, returned as ``"True"``
+            - data_count: Number of inline values declared by the boundary
             - line_number: Line number of Boundary Location in file
+            - downstream_station: Downstream river station (location field 3)
+            - area_2d: 2D Flow Area name (location field 5)
+            - bc_line_name: 2D boundary-condition line name (location field 7)
+            - sa_2d_name: Deprecated compatibility alias for ``area_2d``
+            - bc_line: Deprecated compatibility alias for ``bc_line_name``
+            - boundary_name: Value from the block's Boundary Name record
+            - boundary_index: Zero-based position among all Boundary Location
+              blocks, including blocks that are not DSS-linked
 
         Example
         -------
@@ -6680,7 +8546,9 @@ class RasUnsteady:
 
         Notes
         -----
-        DSS Path Format: //A/B/C/D/E/F/
+        DSS Path Format: /A/B/C/D/E/F/
+        - An empty Part A with five B-F fields is represented as
+          //B/C/D/E/F/. The legacy //A/B/C/D/E/F/ form remains accepted.
         - Part A: Project identifier (often empty)
         - Part B: Location/Subbasin name (key for HMS matching)
         - Part C: Parameter (FLOW, STAGE, etc.)
@@ -6702,22 +8570,50 @@ class RasUnsteady:
         with open(unsteady_path, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()
 
+        output_columns = [
+            'river',
+            'reach',
+            'station',
+            'bc_type',
+            'interval',
+            'dss_file',
+            'dss_path',
+            'dss_part_a',
+            'dss_part_b',
+            'dss_part_c',
+            'dss_part_d',
+            'dss_part_e',
+            'dss_part_f',
+            'use_dss',
+            'data_count',
+            'line_number',
+            'downstream_station',
+            'area_2d',
+            'bc_line_name',
+            'sa_2d_name',
+            'bc_line',
+            'boundary_name',
+            'boundary_index',
+        ]
         boundaries = []
+        boundary_index = 0
         i = 0
-        boundary_index = -1
         while i < len(lines):
             line = lines[i]
 
             if line.startswith('Boundary Location='):
-                boundary_index += 1
                 bc = RasUnsteady._parse_boundary_block_dss(lines, i)
                 if bc.get('use_dss') == 'True':
-                    bc['boundary_index'] = boundary_index
                     bc['line_number'] = i + 1  # 1-indexed for user reference
+                    bc['boundary_index'] = boundary_index
                     boundaries.append(bc)
+                boundary_index += 1
             i += 1
 
-        df = pd.DataFrame(boundaries)
+        df = pd.DataFrame(boundaries, columns=output_columns)
+        df.attrs['deprecated_columns'] = dict(
+            RasUnsteady._DSS_BOUNDARY_DEPRECATED_COLUMNS
+        )
         logger.debug(f"Found {len(df)} DSS-linked boundaries in {unsteady_path.name}")
         return df
 
@@ -6729,6 +8625,8 @@ class RasUnsteady:
             'reach': '',
             'station': '',
             'downstream_station': '',
+            'area_2d': '',
+            'bc_line_name': '',
             'sa_2d_name': '',
             'bc_line': '',
             'boundary_name': '',
@@ -6747,7 +8645,7 @@ class RasUnsteady:
         }
 
         # Parse location line
-        loc_line = lines[start_idx].replace('Boundary Location=', '')
+        loc_line = lines[start_idx][len('Boundary Location='):].rstrip('\r\n')
         parts = [p.strip() for p in loc_line.split(',')]
         if len(parts) >= 1:
             bc['river'] = parts[0]
@@ -6758,9 +8656,14 @@ class RasUnsteady:
         if len(parts) >= 4:
             bc['downstream_station'] = parts[3]
         if len(parts) >= 6:
-            bc['sa_2d_name'] = parts[5]
+            bc['area_2d'] = parts[5]
         if len(parts) >= 8:
-            bc['bc_line'] = parts[7]
+            bc['bc_line_name'] = parts[7]
+
+        # Compatibility aliases are derived from the canonical columns so the
+        # two naming surfaces cannot diverge during the deprecation window.
+        bc['sa_2d_name'] = bc['area_2d']
+        bc['bc_line'] = bc['bc_line_name']
 
         # Scan following lines for DSS info
         i = start_idx + 1
@@ -6770,9 +8673,7 @@ class RasUnsteady:
             if line.startswith('Boundary Location='):
                 break
             elif line.startswith('Boundary Name='):
-                bc['boundary_name'] = line.replace(
-                    'Boundary Name=', ''
-                ).strip()
+                bc['boundary_name'] = line.replace('Boundary Name=', '', 1).strip()
             elif line.startswith('Interval='):
                 bc['interval'] = line.replace('Interval=', '').strip()
             elif line.startswith('Flow Hydrograph='):
@@ -6791,11 +8692,9 @@ class RasUnsteady:
                 bc['bc_type'] = 'Uniform Lateral Inflow Hydrograph'
                 try:
                     bc['data_count'] = int(
-                        line.replace(
-                            'Uniform Lateral Inflow Hydrograph=', ''
-                        ).strip()
+                        line.replace('Uniform Lateral Inflow Hydrograph=', '').strip()
                     )
-                except ValueError:
+                except:
                     pass
             elif line.startswith('Uniform Lateral Inflow='):
                 bc['bc_type'] = 'Uniform Lateral Inflow'
@@ -6830,8 +8729,13 @@ class RasUnsteady:
         """
         Parse a DSS path into its component parts.
 
-        DSS Path Format: //A/B/C/D/E/F/
-        Example: //P100A/FLOW/31MAY2007/5MIN/RUN:1%_24HR/
+        DSS Path Format: /A/B/C/D/E/F/
+        Empty-A Example: //P100A/FLOW/31MAY2007/5MIN/RUN:1%_24HR/
+
+        The legacy ``//A/B/C/D/E/F/`` form remains accepted as six populated
+        parts. A double-leading pathname represents an empty A-part only when
+        the remainder contains exactly five B-F fields. Those fields may be
+        empty, such as a blank D-part.
         """
         parts = {
             'dss_part_a': '',
@@ -6842,18 +8746,40 @@ class RasUnsteady:
             'dss_part_f': ''
         }
 
-        # Preserve an empty A-part when only B-F are present.  Some RAS files
-        # serialize all six populated parts with a double leading slash, while
-        # HMS output commonly uses ``//LOCATION/FLOW/D/E/F/`` (five populated
-        # parts, intentionally empty A).  The populated-part count resolves
-        # those two conventions without shifting B-F.
-        segments = dss_path.strip('/').split('/') if dss_path else []
-        if dss_path.startswith('//') and len(segments) == 5:
-            segments.insert(0, '')
-        segments = (segments + [''] * 6)[:6]
+        clean_path = dss_path.strip()
+        has_double_leading_slash = clean_path.startswith('//')
 
-        for key, value in zip(parts, segments):
-            parts[key] = value
+        # Remove exactly one outer delimiter from each end so empty A/F parts
+        # and empty internal parts remain represented in the split fields.
+        if clean_path.startswith('/'):
+            clean_path = clean_path[1:]
+        if clean_path.endswith('/'):
+            clean_path = clean_path[:-1]
+        segments = clean_path.split('/') if clean_path else []
+
+        # RAS Commander historically accepted ``//A/B/C/D/E/F/`` as six
+        # populated parts. Exact delimiter handling exposes a seventh leading
+        # empty field for that legacy form, so discard only that compatibility
+        # sentinel. A valid empty-A path has six fields at this point.
+        if (
+            has_double_leading_slash
+            and len(segments) == 7
+            and segments[0] == ''
+        ):
+            segments = segments[1:]
+
+        if len(segments) >= 1:
+            parts['dss_part_a'] = segments[0]
+        if len(segments) >= 2:
+            parts['dss_part_b'] = segments[1]
+        if len(segments) >= 3:
+            parts['dss_part_c'] = segments[2]
+        if len(segments) >= 4:
+            parts['dss_part_d'] = segments[3]
+        if len(segments) >= 5:
+            parts['dss_part_e'] = segments[4]
+        if len(segments) >= 6:
+            parts['dss_part_f'] = segments[5]
 
         return parts
 
@@ -7160,202 +9086,12 @@ class RasUnsteady:
                     logger.debug(f"Updated DSS Path at line {i+1}: {dss_path} -> {new_dss_path}")
 
         if update_count > 0:
-            with open(unsteady_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
+            _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
             logger.info(f"Updated {update_count} DSS paths in {unsteady_path.name}")
         else:
             logger.warning(f"No DSS paths found with run identifier '{old_run_id}'")
 
         return update_count
-
-    @staticmethod
-    def _select_boundary_block(
-        lines: List[str], *, river=None, reach=None, station=None,
-        sa_2d_name=None, bc_line=None, boundary_index=None, expected_bc_type=None,
-    ) -> Optional[Dict[str, Any]]:
-        """Share exact selector semantics between DSS mutation and readback."""
-        river = RasUnsteady._clean_boundary_selector(river)
-        reach = RasUnsteady._clean_boundary_selector(reach)
-        station = RasUnsteady._clean_boundary_selector(station)
-        sa_2d_name = RasUnsteady._clean_boundary_selector(sa_2d_name)
-        bc_line = RasUnsteady._clean_boundary_selector(bc_line)
-
-        has_1d_selector = any(
-            selector is not None for selector in (river, reach, station)
-        )
-        has_2d_selector = any(
-            selector is not None for selector in (sa_2d_name, bc_line)
-        )
-        if has_1d_selector and has_2d_selector:
-            raise ValueError(
-                "Provide either 1D selectors (river, reach, station) "
-                "or 2D selectors (sa_2d_name, bc_line), not both"
-            )
-        if boundary_index is not None:
-            if isinstance(boundary_index, bool) or not isinstance(boundary_index, int):
-                raise ValueError("boundary_index must be a zero-based integer")
-            if boundary_index < 0:
-                raise ValueError("boundary_index must be >= 0")
-        if boundary_index is None and not (has_1d_selector or has_2d_selector):
-            raise ValueError(
-                "Provide a boundary selector or boundary_index"
-            )
-
-        blocks = RasUnsteady._find_boundary_blocks(lines)
-        matches = [
-            block
-            for block in blocks
-            if RasUnsteady._boundary_block_matches(
-                block,
-                river,
-                reach,
-                station,
-                sa_2d_name,
-                bc_line,
-            )
-        ] if (has_1d_selector or has_2d_selector) else blocks
-
-        if boundary_index is not None:
-            selected = next(
-                (
-                    block
-                    for block in blocks
-                    if block["boundary_index"] == boundary_index
-                ),
-                None,
-            )
-            if selected is None:
-                raise ValueError(
-                    f"boundary_index {boundary_index} is out of range; "
-                    f"{len(blocks)} boundary blocks found"
-                )
-            if (has_1d_selector or has_2d_selector) and selected not in matches:
-                raise ValueError(
-                    f"boundary_index {boundary_index} does not match the "
-                    "provided boundary selectors"
-                )
-            target_block = selected
-        else:
-            if not matches:
-                logger.warning(
-                    "Boundary not found for selectors: "
-                    "river=%r, reach=%r, station=%r, sa_2d_name=%r, bc_line=%r",
-                    river,
-                    reach,
-                    station,
-                    sa_2d_name,
-                    bc_line,
-                )
-                return None
-            if len(matches) > 1:
-                choices = ", ".join(
-                    f"{block['boundary_index']}:"
-                    f"{RasUnsteady._boundary_block_name(block)}"
-                    for block in matches
-                )
-                raise ValueError(
-                    "Boundary selector is ambiguous. Provide boundary_index "
-                    f"to disambiguate one of: {choices}"
-                )
-            target_block = matches[0]
-
-        if expected_bc_type is not None and target_block["bc_type"] != expected_bc_type:
-            raise ValueError(
-                f"Selected boundary type is {target_block['bc_type']!r}, "
-                f"expected {expected_bc_type!r}"
-            )
-        return target_block
-
-    @staticmethod
-    def _flow_multiplier_state(lines: List[str], block: Dict[str, Any]) -> Dict[str, Any]:
-        """Inspect supported flow modifiers without changing scientific controls."""
-        flow_types = {
-            "Flow Hydrograph", "Lateral Inflow Hydrograph",
-            "Uniform Lateral Inflow", "Uniform Lateral Inflow Hydrograph",
-        }
-        if block["bc_type"] not in flow_types:
-            raise ValueError("Materialized flow requires a flow hydrograph boundary")
-        values = {}
-        for line in lines[block["start_idx"] + 1:block["end_idx"]]:
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            if key in values:
-                raise ValueError(f"Duplicate boundary setting: {key}")
-            values[key] = value.strip()
-        raw = values.get("Flow Hydrograph QMult")
-        try:
-            multiplier = float(raw) if raw is not None else 1.0
-        except ValueError as exc:
-            raise ValueError("Invalid Flow Hydrograph QMult") from exc
-        if not math.isfinite(multiplier) or multiplier < 0:
-            raise ValueError("Flow Hydrograph QMult must be finite and nonnegative")
-        # Slope is an energy-grade control, not an ordinate transformation.
-        allowed = {
-            *flow_types, "Boundary Name", "Interval", "Flow Hydrograph QMult",
-            "Flow Hydrograph Slope", "Stage Hydrograph TW Check", "DSS File",
-            "DSS Path", "Use DSS", "Use Fixed Start Time", "Fixed Start Date/Time",
-            "Is Critical Boundary", "Critical Boundary Flow",
-        }
-        unsupported = sorted(set(values) - allowed)
-        if len(set(values) & flow_types) != 1:
-            unsupported.append("multiple flow hydrograph types")
-        for key in ("Use Fixed Start Time", "Is Critical Boundary"):
-            if values.get(key, "False").casefold() not in {"false", "0"}:
-                unsupported.append(key)
-        if values.get("Stage Hydrograph TW Check", "0") != "0":
-            unsupported.append("Stage Hydrograph TW Check")
-        if values.get("Critical Boundary Flow", ""):
-            unsupported.append("Critical Boundary Flow")
-        return {
-            "boundary_index": block["boundary_index"],
-            "boundary_name": RasUnsteady._boundary_block_name(block),
-            "bc_type": block["bc_type"],
-            "qmult_explicit": raw is not None,
-            "qmult": multiplier,
-            "unsupported_modifiers": unsupported,
-            "dss_file": values.get("DSS File"),
-            "dss_path": values.get("DSS Path"),
-            "use_dss": values.get("Use DSS", "False").casefold() == "true",
-        }
-
-    @staticmethod
-    @log_call
-    def inspect_boundary_flow(
-        unsteady_file: Union[str, Path], *, river: Optional[str] = None,
-        reach: Optional[str] = None, station: Optional[str] = None,
-        sa_2d_name: Optional[str] = None, bc_line: Optional[str] = None,
-        boundary_index: Optional[int] = None, expected_bc_type: Optional[str] = None,
-        ras_object: Optional[Any] = None,
-    ) -> Dict[str, Any]:
-        """Read one exact flow boundary and its effective ordinate multiplier.
-
-        Args:
-            unsteady_file: Explicit unsteady file path (no global project lookup).
-            river, reach, station: Exact 1D selectors, or use the 2D selectors.
-            sa_2d_name, bc_line: Exact storage/2D area and boundary-line selectors.
-            boundary_index: Optional zero-based index; must agree with names.
-            expected_bc_type: Optional required boundary type.
-            ras_object: Optional caller context; no project metadata is mutated.
-
-        Returns:
-            Scalar evidence including implicit/explicit QMult, DSS binding and
-            unsupported materialized-flow modifiers. Missing QMult means unity.
-
-        Raises:
-            ValueError: Ambiguous/missing target, wrong type, mixed newlines,
-                duplicate settings or malformed multiplier.
-            FileNotFoundError: The explicit file does not exist.
-        """
-        lines, _ = RasUtils._read_text_lines_preserving_newline(Path(unsteady_file))
-        block = RasUnsteady._select_boundary_block(
-            lines, river=river, reach=reach, station=station, sa_2d_name=sa_2d_name,
-            bc_line=bc_line, boundary_index=boundary_index, expected_bc_type=expected_bc_type,
-        )
-        if block is None:
-            raise ValueError("Flow boundary selector did not match")
-        return RasUnsteady._flow_multiplier_state(lines, block)
 
     @staticmethod
     @log_call
@@ -7387,12 +9123,12 @@ class RasUnsteady:
         ----------
         unsteady_file : str or Path
             Path to the unsteady flow file (.u##)
-        river : str
-            River name for the boundary
-        reach : str
-            Reach name for the boundary
-        station : str
-            River station for the boundary
+        river : str or None
+            River name for a 1D boundary; pass ``None`` for 2D selection.
+        reach : str or None
+            Reach name for a 1D boundary; pass ``None`` for 2D selection.
+        station : str or None
+            River station for a 1D boundary; pass ``None`` for 2D selection.
         dss_file : str
             Path to the DSS file (relative to project folder)
         dss_path : str
@@ -7402,26 +9138,33 @@ class RasUnsteady:
         ras_object : optional
             Custom RAS object to use instead of the global one
         sa_2d_name, bc_line : str, optional
-            Exact 2D/storage-area boundary selectors. ``sa_2d_name`` matches
-            field index 5 and ``bc_line`` matches field index 7 of the
-            ``Boundary Location=`` record. Pass ``river``, ``reach``, and
-            ``station`` as ``None`` when using these selectors.
+            Exact 2D selector fields. ``sa_2d_name`` matches field index 5 and
+            ``bc_line`` matches field index 7 of ``Boundary Location=``.
+            Partial selectors are allowed but must resolve to one block unless
+            ``boundary_index`` disambiguates them.
         boundary_index : int, optional
-            Zero-based boundary block index used alone or to disambiguate a
-            partial selector.
+            Zero-based index among ``Boundary Location=`` blocks. It may be
+            used alone or as a cross-check for the semantic selectors.
         expected_bc_type : str, optional
-            Require the selected block to have this boundary type before
-            changing it.
-
+            Require the selected block to have this boundary-condition type
+            before changing the file.
         flow_multiplier_policy : str, default "preserve-source"
-            Preserve source QMult by default. ``materialized`` declares that
-            input flow values already include transformations; set only this
-            flow boundary's QMult to unity and reject unsupported modifiers.
+            ``materialized`` means transformations are already in the DSS
+            values. Neutralize this flow block's QMult, reject unsupported
+            modifiers, and preserve its existing newline convention. Other
+            callers retain the upstream CRLF authoring convention.
 
         Returns
         -------
         bool
             True if boundary was successfully updated, False if not found
+
+        Raises
+        ------
+        ValueError
+            If selector groups are mixed or absent, a selector is ambiguous,
+            ``boundary_index`` is invalid or inconsistent, the expected type
+            does not match, or the input has mixed newline conventions.
 
         Example
         -------
@@ -7436,185 +9179,809 @@ class RasUnsteady:
         ...     dss_path="//A119-01-00A/FLOW/31MAY2007/5MIN/RUN:1%_24HR/"
         ... )
         """
+        river_selector = RasUnsteady._clean_boundary_selector(river)
+        reach_selector = RasUnsteady._clean_boundary_selector(reach)
+        station_selector = RasUnsteady._clean_boundary_selector(station)
+        sa_2d_selector = RasUnsteady._clean_boundary_selector(sa_2d_name)
+        bc_line_selector = RasUnsteady._clean_boundary_selector(bc_line)
+        expected_type = RasUnsteady._clean_boundary_selector(expected_bc_type)
+
+        has_1d_selector = any(
+            selector is not None
+            for selector in (river_selector, reach_selector, station_selector)
+        )
+        has_2d_selector = any(
+            selector is not None
+            for selector in (sa_2d_selector, bc_line_selector)
+        )
+        if has_1d_selector and has_2d_selector:
+            raise ValueError(
+                "Provide either 1D selectors (river, reach, station) or 2D "
+                "selectors (sa_2d_name, bc_line), not both"
+            )
+
+        if boundary_index is not None:
+            if isinstance(boundary_index, bool) or not isinstance(boundary_index, int):
+                raise ValueError("boundary_index must be a zero-based integer")
+            if boundary_index < 0:
+                raise ValueError("boundary_index must be >= 0")
+
+        if boundary_index is None and not (has_1d_selector or has_2d_selector):
+            raise ValueError(
+                "Provide 1D or 2D boundary selectors, or boundary_index"
+            )
+
         ras_obj = ras_object or ras
         if ras_obj is not None:
             try:
                 ras_obj.check_initialized()
-            except:
+            except Exception:
                 pass
 
         unsteady_path = Path(unsteady_file)
         if not unsteady_path.exists():
             raise FileNotFoundError(f"Unsteady flow file not found: {unsteady_path}")
-        dss_file = RasUnsteady._format_dss_filename(
-            dss_file,
+
+        with open(
             unsteady_path,
-        )
+            "r",
+            encoding="utf-8",
+            errors="ignore",
+            newline="",
+        ) as f:
+            lines = f.readlines()
 
-        lines, newline = RasUtils._read_text_lines_preserving_newline(unsteady_path)
-        lines = [line.replace("\r\n", "\n") for line in lines]
-
-        target_block = RasUnsteady._select_boundary_block(
-            lines, river=river, reach=reach, station=station, sa_2d_name=sa_2d_name,
-            bc_line=bc_line, boundary_index=boundary_index, expected_bc_type=expected_bc_type,
+        newline = RasUnsteady._detect_line_ending(lines)
+        had_terminal_newline = bool(
+            lines and lines[-1].endswith(("\r\n", "\n", "\r"))
         )
-        if target_block is None:
-            return False
+        blocks = RasUnsteady._find_boundary_blocks(lines)
+
+        selected_block: Optional[Dict[str, Any]] = None
+        if boundary_index is not None:
+            selected_block = next(
+                (
+                    block
+                    for block in blocks
+                    if block["boundary_index"] == boundary_index
+                ),
+                None,
+            )
+            if selected_block is None:
+                raise ValueError(
+                    f"boundary_index {boundary_index} is out of range; "
+                    f"{len(blocks)} boundary blocks found"
+                )
+
+        if has_1d_selector or has_2d_selector:
+            matches = [
+                block
+                for block in blocks
+                if RasUnsteady._boundary_block_matches(
+                    block,
+                    river_selector,
+                    reach_selector,
+                    station_selector,
+                    sa_2d_selector,
+                    bc_line_selector,
+                )
+            ]
+            if selected_block is not None:
+                if selected_block not in matches:
+                    raise ValueError(
+                        f"boundary_index {boundary_index} does not match the "
+                        "provided boundary selectors"
+                    )
+            elif not matches:
+                selector = (
+                    f"river={river_selector!r}, reach={reach_selector!r}, "
+                    f"station={station_selector!r}"
+                    if has_1d_selector
+                    else f"sa_2d_name={sa_2d_selector!r}, "
+                    f"bc_line={bc_line_selector!r}"
+                )
+                logger.warning(
+                    "Boundary not found in %s for %s",
+                    unsteady_path.name,
+                    selector,
+                )
+                return False
+            elif len(matches) > 1:
+                choices = ", ".join(
+                    f"{block['boundary_index']}:"
+                    f"{RasUnsteady._boundary_block_name(block)}"
+                    for block in matches
+                )
+                raise ValueError(
+                    "Boundary selector is ambiguous. Provide boundary_index "
+                    f"to disambiguate one of: {choices}"
+                )
+            else:
+                selected_block = matches[0]
+
+        if selected_block is None:
+            raise ValueError("No boundary selected for DSS linkage")
+
         if flow_multiplier_policy not in {"preserve-source", "materialized"}:
             raise ValueError("Unsupported flow_multiplier_policy")
         if flow_multiplier_policy == "materialized":
-            state = RasUnsteady._flow_multiplier_state(lines, target_block)
+            state = RasUnsteady._flow_multiplier_state(lines, selected_block)
             if state["unsupported_modifiers"]:
                 raise ValueError(
                     "Unsupported materialized flow modifiers: "
                     + ", ".join(state["unsupported_modifiers"])
                 )
-        boundary_idx = target_block["start_idx"]
+
+        actual_bc_type = selected_block["bc_type"]
+        if expected_type is not None and actual_bc_type != expected_type:
+            raise ValueError(
+                f"Selected boundary type is {actual_bc_type!r}, not the "
+                f"expected {expected_type!r}"
+            )
+
+        formatted_dss_file = RasUnsteady._format_ras_dss_filename(
+            dss_file,
+            unsteady_path,
+        )
 
         # Inline table type keywords that may have data to remove
-        TABLE_KEYWORDS = [
-            'Flow Hydrograph=', 'Stage Hydrograph=', 'Lateral Inflow Hydrograph=',
-            'Uniform Lateral Inflow=', 'Precipitation Hydrograph=',
-            'Uniform Lateral Inflow Hydrograph='
-        ]
+        table_keywords = (
+            "Flow Hydrograph=",
+            "Stage Hydrograph=",
+            "Lateral Inflow Hydrograph=",
+            "Uniform Lateral Inflow=",
+            "Precipitation Hydrograph=",
+            "Uniform Lateral Inflow Hydrograph=",
+        )
 
-        # Scan the boundary block to find all relevant lines and inline data
-        i = boundary_idx + 1
-        dss_file_idx = None
-        dss_path_idx = None
-        use_dss_idx = None
-        interval_idx = None
-        table_header_idx = None
-        table_keyword = None
-        inline_data_start = None
-        inline_data_end = None
+        start_idx = selected_block["start_idx"]
+        end_idx = selected_block["end_idx"]
+        block_lines = lines[start_idx:end_idx]
 
-        while i < len(lines) and i < boundary_idx + 500:
-            line = lines[i]
-
-            if line.startswith('Boundary Location='):
+        table_header_idx: Optional[int] = None
+        table_keyword: Optional[str] = None
+        inline_data_start: Optional[int] = None
+        inline_data_end: Optional[int] = None
+        for i, line in enumerate(block_lines[1:], start=1):
+            for keyword in table_keywords:
+                if line.startswith(keyword):
+                    table_header_idx = i
+                    table_keyword = keyword
+                    try:
+                        count = int(line[len(keyword):].strip())
+                    except ValueError:
+                        count = 0
+                    if count > 0:
+                        inline_data_start = i + 1
+                        inline_data_end = inline_data_start
+                        for data_idx in range(inline_data_start, len(block_lines)):
+                            if "=" in block_lines[data_idx]:
+                                inline_data_end = data_idx
+                                break
+                        else:
+                            inline_data_end = len(block_lines)
+                    break
+            if table_header_idx is not None:
                 break
-            elif line.startswith('DSS File='):
-                dss_file_idx = i
-            elif line.startswith('DSS Path='):
-                dss_path_idx = i
-            elif line.startswith('Use DSS='):
-                use_dss_idx = i
-            elif line.startswith('Interval='):
-                interval_idx = i
-            else:
-                # Check for table header keywords
-                for kw in TABLE_KEYWORDS:
-                    if line.startswith(kw):
-                        table_header_idx = i
-                        table_keyword = kw
-                        # Parse count
-                        try:
-                            count = int(line.replace(kw, '').strip())
-                        except ValueError:
-                            count = 0
-                        if count > 0:
-                            # Find extent of inline data lines
-                            inline_data_start = i + 1
-                            inline_data_end = inline_data_start
-                            for k in range(inline_data_start, len(lines)):
-                                data_line = lines[k]
-                                if '=' in data_line or data_line.startswith('Boundary Location='):
-                                    inline_data_end = k
-                                    break
-                                if not data_line.strip():
-                                    continue
-                            else:
-                                inline_data_end = len(lines)
-                        break
-            i += 1
 
-        # Step 1: Remove inline data lines (if any) - do this first to preserve indices
         lines_removed = 0
-        if inline_data_start is not None and inline_data_end is not None and inline_data_end > inline_data_start:
-            del lines[inline_data_start:inline_data_end]
+        if (
+            inline_data_start is not None
+            and inline_data_end is not None
+            and inline_data_end > inline_data_start
+        ):
+            del block_lines[inline_data_start:inline_data_end]
             lines_removed = inline_data_end - inline_data_start
-            logger.debug(f"Removed {lines_removed} inline data lines")
-            # Adjust indices for removed lines
-            if dss_file_idx is not None and dss_file_idx > inline_data_start:
-                dss_file_idx -= lines_removed
-            if dss_path_idx is not None and dss_path_idx > inline_data_start:
-                dss_path_idx -= lines_removed
-            if use_dss_idx is not None and use_dss_idx > inline_data_start:
-                use_dss_idx -= lines_removed
-            if interval_idx is not None and interval_idx > inline_data_start:
-                interval_idx -= lines_removed
+            logger.debug("Removed %d inline data lines", lines_removed)
 
-        # Step 2: Set table count to 0
         if table_header_idx is not None and table_keyword is not None:
-            lines[table_header_idx] = f'{table_keyword} 0 \n'
-            logger.debug(f"Set {table_keyword.strip()} count to 0")
+            block_lines[table_header_idx] = f"{table_keyword} 0 {newline}"
+            logger.debug("Set %s count to 0", table_keyword.strip())
 
-        # Step 3: Update existing DSS/interval lines or insert missing ones
+        def find_line(prefix: str) -> Optional[int]:
+            return next(
+                (
+                    i
+                    for i, line in enumerate(block_lines[1:], start=1)
+                    if line.startswith(prefix)
+                ),
+                None,
+            )
+
+        interval_idx = find_line("Interval=")
+        dss_file_idx = find_line("DSS File=")
+        dss_path_idx = find_line("DSS Path=")
+        use_dss_idx = find_line("Use DSS=")
+
         if interval_idx is not None:
-            lines[interval_idx] = f'Interval={interval}\n'
+            block_lines[interval_idx] = f"Interval={interval}{newline}"
         if dss_file_idx is not None:
-            lines[dss_file_idx] = f'DSS File={dss_file}\n'
+            block_lines[dss_file_idx] = (
+                f"DSS File={formatted_dss_file}{newline}"
+            )
         if dss_path_idx is not None:
-            lines[dss_path_idx] = f'DSS Path={dss_path}\n'
+            block_lines[dss_path_idx] = f"DSS Path={dss_path}{newline}"
         if use_dss_idx is not None:
-            lines[use_dss_idx] = 'Use DSS=True\n'
+            block_lines[use_dss_idx] = f"Use DSS=True{newline}"
 
-        # Insert any missing lines after the table header (or after boundary location)
-        insert_after = table_header_idx if table_header_idx is not None else boundary_idx
+        insert_after = table_header_idx if table_header_idx is not None else 0
         insert_idx = insert_after + 1
-
+        missing_lines = []
         if interval_idx is None:
-            lines.insert(insert_idx, f'Interval={interval}\n')
-            insert_idx += 1
-            # Adjust subsequent indices
-            if dss_file_idx is not None and dss_file_idx >= insert_idx - 1:
-                dss_file_idx += 1
-            if dss_path_idx is not None and dss_path_idx >= insert_idx - 1:
-                dss_path_idx += 1
-            if use_dss_idx is not None and use_dss_idx >= insert_idx - 1:
-                use_dss_idx += 1
-
+            missing_lines.append(f"Interval={interval}{newline}")
         if dss_file_idx is None:
-            lines.insert(insert_idx, f'DSS File={dss_file}\n')
-            insert_idx += 1
-            if dss_path_idx is not None and dss_path_idx >= insert_idx - 1:
-                dss_path_idx += 1
-            if use_dss_idx is not None and use_dss_idx >= insert_idx - 1:
-                use_dss_idx += 1
-
+            missing_lines.append(f"DSS File={formatted_dss_file}{newline}")
         if dss_path_idx is None:
-            lines.insert(insert_idx, f'DSS Path={dss_path}\n')
-            insert_idx += 1
-            if use_dss_idx is not None and use_dss_idx >= insert_idx - 1:
-                use_dss_idx += 1
-
+            missing_lines.append(f"DSS Path={dss_path}{newline}")
         if use_dss_idx is None:
-            lines.insert(insert_idx, 'Use DSS=True\n')
+            missing_lines.append(f"Use DSS=True{newline}")
+
+        if missing_lines:
+            if (
+                insert_idx > 0
+                and not block_lines[insert_idx - 1].endswith(("\r\n", "\n", "\r"))
+            ):
+                block_lines[insert_idx - 1] += newline
+            block_lines[insert_idx:insert_idx] = missing_lines
 
         if flow_multiplier_policy == "materialized":
-            # Table/DSS insertion can shift line offsets, but not block indices.
-            block = RasUnsteady._find_boundary_blocks(lines)[target_block["boundary_index"]]
-            qmult_indices = [
-                i for i in range(block["start_idx"] + 1, block["end_idx"])
-                if lines[i].startswith("Flow Hydrograph QMult=")
+            # The caller already applied the transformation to the DSS values.
+            # An absent QMult is unity and needs no new setting.
+            for index, line in enumerate(block_lines):
+                if line.startswith("Flow Hydrograph QMult="):
+                    block_lines[index] = f"Flow Hydrograph QMult= 1 {newline}"
+
+        updated_lines = lines[:start_idx] + block_lines + lines[end_idx:]
+        if flow_multiplier_policy == "materialized":
+            updated_block = RasUnsteady._find_boundary_blocks(updated_lines)[
+                selected_block["boundary_index"]
             ]
-            if qmult_indices:
-                lines[qmult_indices[0]] = "Flow Hydrograph QMult= 1 \n"
-            # An absent QMult already means unity; do not add unnecessary settings.
-            readback = RasUnsteady._flow_multiplier_state(lines, block)
-            if readback["qmult"] != 1.0 or readback["unsupported_modifiers"]:
+            state = RasUnsteady._flow_multiplier_state(updated_lines, updated_block)
+            if state["qmult"] != 1.0 or state["unsupported_modifiers"]:
                 raise ValueError("Materialized flow multiplier readback failed")
+        if updated_lines:
+            if had_terminal_newline:
+                if not updated_lines[-1].endswith(("\r\n", "\n", "\r")):
+                    updated_lines[-1] += newline
+            elif updated_lines[-1].endswith("\r\n"):
+                updated_lines[-1] = updated_lines[-1][:-2]
+            elif updated_lines[-1].endswith(("\n", "\r")):
+                updated_lines[-1] = updated_lines[-1][:-1]
+
+        RasUnsteady._detect_line_ending(updated_lines)
         RasUnsteady._atomic_write_lines(
-            unsteady_path, [line.replace("\n", newline) for line in lines]
+            unsteady_path, updated_lines,
+            preserve_newlines=flow_multiplier_policy == "materialized",
         )
 
         logger.info(
             "Updated boundary %s to use DSS link (removed %d inline data lines)",
-            RasUnsteady._boundary_block_name(target_block),
+            RasUnsteady._boundary_block_name(selected_block),
             lines_removed,
         )
         return True
+
+    @staticmethod
+    @log_call
+    def ensure_2d_boundary_location(
+        unsteady_file: Union[str, Path],
+        geometry_file: Union[str, Path],
+        *,
+        area_2d: str,
+        bc_line: str,
+        ras_object: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Ensure one geometry-backed 2D ``Boundary Location=`` block exists.
+
+        This method creates only the empty location block. Follow it with a
+        boundary-type writer such as :meth:`set_boundary_inline_hydrograph`
+        or :meth:`set_normal_depth_boundary`. The geometry text file is
+        validated first so an unsteady-flow file cannot reference a missing
+        BC line or attach an existing line to the wrong 2D Flow Area.
+
+        Parameters
+        ----------
+        unsteady_file : str or Path
+            Unsteady-flow file path or number resolvable through
+            ``ras_object``.
+        geometry_file : str or Path
+            Exact plain-text geometry file containing the authored BC line.
+        area_2d : str
+            Exact ``BC Line Storage Area=`` value.
+        bc_line : str
+            Exact ``BC Line Name=`` value.
+        ras_object : optional
+            Project object used for short-number resolution and DataFrame
+            refresh.
+
+        Returns
+        -------
+        dict
+            Includes ``created``, the canonical location text, insertion
+            index, geometry validation evidence, and before/after boundary
+            counts.
+
+        Raises
+        ------
+        FileNotFoundError
+            If the explicit geometry file does not exist.
+        ValueError
+            If names are empty or exceed HEC-RAS fixed-field limits, the
+            geometry does not contain exactly one matching BC line, an
+            existing unsteady location conflicts, or the file header cannot
+            be identified safely.
+
+        Notes
+        -----
+        The emitted eight-field layout matches HEC-RAS 6.x 2D projects:
+        field 5 contains the 2D Flow Area and field 7 contains the BC line.
+        The operation is idempotent and uses atomic same-volume replacement.
+        """
+        area_name = str(area_2d).strip()
+        line_name = str(bc_line).strip()
+        for value, label, maximum in (
+            (area_name, "area_2d", 16),
+            (line_name, "bc_line", 32),
+        ):
+            if not value:
+                raise ValueError(f"{label} must be non-empty")
+            if any(character in value for character in (",", "\r", "\n")):
+                raise ValueError(f"{label} cannot contain commas or newlines")
+            if len(value) > maximum:
+                raise ValueError(
+                    f"{label} exceeds the HEC-RAS fixed-field limit of {maximum} characters"
+                )
+
+        geometry_path = Path(geometry_file)
+        if not geometry_path.is_file():
+            raise FileNotFoundError(f"Geometry file not found: {geometry_path}")
+        with open(
+            geometry_path,
+            "r",
+            encoding="utf-8",
+            errors="ignore",
+            newline="",
+        ) as geometry_stream:
+            geometry_lines = geometry_stream.readlines()
+
+        geometry_records: List[Tuple[str, str]] = []
+        pending_name: Optional[str] = None
+        for line in geometry_lines:
+            stripped = line.rstrip("\r\n")
+            if stripped.startswith("BC Line Name="):
+                pending_name = stripped[len("BC Line Name="):].strip()
+            elif stripped.startswith("BC Line Storage Area=") and pending_name is not None:
+                geometry_records.append(
+                    (
+                        pending_name,
+                        stripped[len("BC Line Storage Area="):].strip(),
+                    )
+                )
+                pending_name = None
+
+        exact_geometry_records = [
+            record
+            for record in geometry_records
+            if record == (line_name, area_name)
+        ]
+        same_name_records = [
+            record for record in geometry_records if record[0] == line_name
+        ]
+        if len(exact_geometry_records) != 1:
+            if same_name_records:
+                attached = sorted({record[1] for record in same_name_records})
+                raise ValueError(
+                    f"Geometry BC line {line_name!r} is attached to {attached}, "
+                    f"not exactly once to {area_name!r}"
+                )
+            raise ValueError(
+                f"Geometry file {geometry_path.name} does not contain BC line "
+                f"{line_name!r} on 2D Flow Area {area_name!r}"
+            )
+
+        unsteady_path = RasUnsteady._resolve_unsteady_file_path(
+            unsteady_file,
+            ras_object=ras_object,
+        )
+        with open(
+            unsteady_path,
+            "r",
+            encoding="utf-8",
+            errors="ignore",
+            newline="",
+        ) as unsteady_stream:
+            lines = unsteady_stream.readlines()
+        newline = RasUnsteady._detect_line_ending(lines)
+
+        boundary_locations: List[Tuple[int, str, List[str]]] = []
+        for index, line in enumerate(lines):
+            if not line.startswith("Boundary Location="):
+                continue
+            location = line[len("Boundary Location="):].rstrip("\r\n")
+            boundary_locations.append(
+                (index, location, [part.strip() for part in location.split(",")])
+            )
+
+        same_line_locations = [
+            item
+            for item in boundary_locations
+            if len(item[2]) >= 8 and item[2][7] == line_name
+        ]
+        exact_locations = [
+            item
+            for item in same_line_locations
+            if item[2][5] == area_name
+        ]
+        if len(exact_locations) > 1:
+            raise ValueError(
+                f"Unsteady file {unsteady_path.name} contains duplicate locations "
+                f"for {area_name!r}/{line_name!r}"
+            )
+        if same_line_locations and not exact_locations:
+            attached = sorted(
+                {
+                    item[2][5]
+                    for item in same_line_locations
+                    if len(item[2]) >= 6
+                }
+            )
+            raise ValueError(
+                f"Unsteady BC line {line_name!r} is already attached to {attached}, "
+                f"not {area_name!r}"
+            )
+
+        canonical_fields = (
+            ("", 16),
+            ("", 16),
+            ("", 8),
+            ("", 8),
+            ("", 16),
+            (area_name, 16),
+            ("", 16),
+            (line_name, 32),
+        )
+        canonical_location = ",".join(
+            f"{value:<{width}}" for value, width in canonical_fields
+        )
+        boundary_count_before = len(boundary_locations)
+
+        if exact_locations:
+            result = {
+                "unsteady_file": str(unsteady_path.resolve()),
+                "geometry_file": str(geometry_path.resolve()),
+                "area_2d": area_name,
+                "bc_line": line_name,
+                "created": False,
+                "insert_index": exact_locations[0][0],
+                "location": exact_locations[0][1],
+                "geometry_match_count": 1,
+                "boundary_count_before": boundary_count_before,
+                "boundary_count_after": boundary_count_before,
+                "boundaries_df_refreshed": False,
+            }
+            logger.info(
+                "2D boundary location already exists in %s: %s/%s",
+                unsteady_path.name,
+                area_name,
+                line_name,
+            )
+            return result
+
+        if boundary_locations:
+            insert_index = boundary_locations[0][0]
+        else:
+            header_prefixes = ("Flow Title=", "Program Version=", "Use Restart=")
+            header_indexes = [
+                index
+                for index, line in enumerate(lines)
+                if line.startswith(header_prefixes)
+            ]
+            if not header_indexes:
+                raise ValueError(
+                    f"Could not identify a safe boundary insertion point in {unsteady_path.name}"
+                )
+            insert_index = max(header_indexes) + 1
+
+        if insert_index > 0 and not lines[insert_index - 1].endswith(("\r\n", "\n", "\r")):
+            lines[insert_index - 1] += newline
+        location_line = f"Boundary Location={canonical_location}{newline}"
+        lines.insert(insert_index, location_line)
+        RasUnsteady._atomic_write_lines(unsteady_path, lines)
+
+        boundaries_df_refreshed = False
+        ras_obj = ras_object or ras
+        if ras_obj is not None:
+            try:
+                ras_obj.boundaries_df = ras_obj.get_boundary_conditions()
+                boundaries_df_refreshed = True
+            except Exception as exc:
+                logger.debug("boundaries_df refresh skipped: %s", exc)
+
+        logger.info(
+            "Created 2D boundary location in %s: %s/%s",
+            unsteady_path.name,
+            area_name,
+            line_name,
+        )
+        return {
+            "unsteady_file": str(unsteady_path.resolve()),
+            "geometry_file": str(geometry_path.resolve()),
+            "area_2d": area_name,
+            "bc_line": line_name,
+            "created": True,
+            "insert_index": insert_index,
+            "location": canonical_location,
+            "geometry_match_count": 1,
+            "boundary_count_before": boundary_count_before,
+            "boundary_count_after": boundary_count_before + 1,
+            "boundaries_df_refreshed": boundaries_df_refreshed,
+        }
+
+    @staticmethod
+    @log_call
+    def replace_2d_boundary_locations(
+        unsteady_file: Union[str, Path],
+        geometry_file: Union[str, Path],
+        locations: List[Dict[str, str]],
+        *,
+        preserve_area_precipitation: bool = False,
+        ras_object: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Replace every 2D boundary block with validated empty locations.
+
+        By default, existing 2D Flow Area boundary blocks—including area-wide
+        blocks with no BC-line name—are removed with their complete type/data
+        payloads. Opt in to ``preserve_area_precipitation`` to retain the
+        existing area-wide rainfall forcing for the requested areas.
+        River/reach and storage-area/structure boundary blocks are preserved.
+        Every replacement must identify exactly one BC line in the supplied
+        plain-text geometry. This is intentionally a reset operation: callers
+        assign new Flow Hydrograph, Normal Depth, or other types afterward.
+
+        Parameters
+        ----------
+        unsteady_file : str or Path
+            Unsteady-flow file path or number resolvable through
+            ``ras_object``.
+        geometry_file : str or Path
+            Exact plain-text geometry file containing all replacement lines.
+        locations : list of dict
+            Non-empty list with exact ``area_2d`` and ``bc_line`` strings.
+            BC-line names must be unique.
+        preserve_area_precipitation : bool, default False
+            Preserve area-wide Precipitation Hydrograph blocks verbatim for
+            areas named in ``locations``. In this opt-in mode, reject unknown
+            or other area-wide boundary types and precipitation on other areas
+            before writing. Perimeter boundary blocks are still replaced.
+        ras_object : optional
+            Project object used for short-number resolution and DataFrame
+            refresh.
+
+        Returns
+        -------
+        dict
+            Removed 2D locations, inserted locations, preserved non-2D block
+            count, preserved precipitation locations, insertion index, and
+            DataFrame-refresh evidence.
+
+        Raises
+        ------
+        TypeError
+            If ``preserve_area_precipitation`` is not a bool.
+        ValueError
+            If ``locations`` is empty or malformed, a BC line is missing from
+            the geometry, or, with ``preserve_area_precipitation``, an
+            area-wide boundary that cannot be preserved is present.
+        """
+        if not isinstance(locations, list) or not locations:
+            raise ValueError("locations must be a non-empty list of dicts")
+        if not isinstance(preserve_area_precipitation, bool):
+            raise TypeError("preserve_area_precipitation must be bool")
+
+        desired: List[Tuple[str, str]] = []
+        for index, spec in enumerate(locations):
+            if not isinstance(spec, dict):
+                raise ValueError(f"locations[{index}] must be a dict")
+            area_name = str(spec.get("area_2d", "")).strip()
+            line_name = str(spec.get("bc_line", "")).strip()
+            for value, label, maximum in (
+                (area_name, f"locations[{index}].area_2d", 16),
+                (line_name, f"locations[{index}].bc_line", 32),
+            ):
+                if not value:
+                    raise ValueError(f"{label} must be non-empty")
+                if any(character in value for character in (",", "\r", "\n")):
+                    raise ValueError(f"{label} cannot contain commas or newlines")
+                if len(value) > maximum:
+                    raise ValueError(
+                        f"{label} exceeds the HEC-RAS fixed-field limit of "
+                        f"{maximum} characters"
+                    )
+            desired.append((area_name, line_name))
+        if len({line_name for _, line_name in desired}) != len(desired):
+            raise ValueError("Replacement 2D BC-line names must be unique")
+
+        geometry_path = Path(geometry_file)
+        if not geometry_path.is_file():
+            raise FileNotFoundError(f"Geometry file not found: {geometry_path}")
+        with open(
+            geometry_path,
+            "r",
+            encoding="utf-8",
+            errors="ignore",
+            newline="",
+        ) as geometry_stream:
+            geometry_lines = geometry_stream.readlines()
+        geometry_records: List[Tuple[str, str]] = []
+        pending_name: Optional[str] = None
+        for line in geometry_lines:
+            stripped = line.rstrip("\r\n")
+            if stripped.startswith("BC Line Name="):
+                pending_name = stripped[len("BC Line Name="):].strip()
+            elif stripped.startswith("BC Line Storage Area=") and pending_name is not None:
+                geometry_records.append(
+                    (
+                        stripped[len("BC Line Storage Area="):].strip(),
+                        pending_name,
+                    )
+                )
+                pending_name = None
+        for area_name, line_name in desired:
+            match_count = geometry_records.count((area_name, line_name))
+            if match_count != 1:
+                raise ValueError(
+                    f"Geometry must contain exactly one BC line {line_name!r} "
+                    f"on 2D Flow Area {area_name!r}; found {match_count}"
+                )
+
+        unsteady_path = RasUnsteady._resolve_unsteady_file_path(
+            unsteady_file,
+            ras_object=ras_object,
+        )
+        with open(
+            unsteady_path,
+            "r",
+            encoding="utf-8",
+            errors="ignore",
+            newline="",
+        ) as unsteady_stream:
+            lines = unsteady_stream.readlines()
+        newline = RasUnsteady._detect_line_ending(lines)
+
+        starts = [
+            index
+            for index, line in enumerate(lines)
+            if line.startswith("Boundary Location=")
+        ]
+        removed_locations: List[Dict[str, str]] = []
+        removed_ranges: List[Tuple[int, int]] = []
+        preserved_block_count = 0
+        preserved_precipitation_locations = []
+        for position, start in enumerate(starts):
+            next_start = starts[position + 1] if position + 1 < len(starts) else None
+            end = RasUnsteady._find_boundary_block_end(lines, start, next_start)
+            location = lines[start][len("Boundary Location="):].rstrip("\r\n")
+            fields = [part.strip() for part in location.split(",")]
+            is_2d = len(fields) >= 6 and bool(fields[5])
+            malformed_2d = len(fields) >= 8 and bool(fields[7]) and not is_2d
+            if malformed_2d:
+                raise ValueError(
+                    f"Malformed 2D boundary location in {unsteady_path.name}: {location!r}"
+                )
+            if is_2d:
+                line_name = fields[7] if len(fields) >= 8 else ""
+                if preserve_area_precipitation and not line_name:
+                    bc_type = RasUnsteady._detect_boundary_type(lines, start, end)
+                    types = [kind for line in lines[start + 1:end]
+                             for prefix, kind in RasUnsteady._BOUNDARY_TYPE_KEYWORDS
+                             if line.lstrip().startswith(prefix)]
+                    if (types != ["Precipitation Hydrograph"]
+                            or fields[5] not in {area for area, _ in desired}
+                            or any(item["area_2d"] == fields[5]
+                                   for item in preserved_precipitation_locations)):
+                        raise ValueError(
+                            "Cannot preserve unsupported area-wide boundary: "
+                            f"area={fields[5]!r}, type={bc_type!r}"
+                        )
+                    preserved_precipitation_locations.append({"area_2d": fields[5], "bc_line": ""})
+                    continue
+                removed_ranges.append((start, end))
+                removed_locations.append(
+                    {
+                        "area_2d": fields[5],
+                        "bc_line": fields[7] if len(fields) >= 8 else "",
+                    }
+                )
+            else:
+                preserved_block_count += 1
+
+        removed_indexes = {
+            index
+            for start, end in removed_ranges
+            for index in range(start, end)
+        }
+        filtered_lines = [
+            line for index, line in enumerate(lines) if index not in removed_indexes
+        ]
+
+        remaining_boundary_index = next(
+            (
+                index
+                for index, line in enumerate(filtered_lines)
+                if line.startswith("Boundary Location=")
+            ),
+            None,
+        )
+        if remaining_boundary_index is not None:
+            insert_index = remaining_boundary_index
+        else:
+            header_prefixes = ("Flow Title=", "Program Version=", "Use Restart=")
+            header_indexes = [
+                index
+                for index, line in enumerate(filtered_lines)
+                if line.startswith(header_prefixes)
+            ]
+            if not header_indexes:
+                raise ValueError(
+                    f"Could not identify a safe boundary insertion point in {unsteady_path.name}"
+                )
+            insert_index = max(header_indexes) + 1
+
+        if (
+            insert_index > 0
+            and not filtered_lines[insert_index - 1].endswith(("\r\n", "\n", "\r"))
+        ):
+            filtered_lines[insert_index - 1] += newline
+        replacement_lines = []
+        for area_name, line_name in desired:
+            fields = (
+                ("", 16),
+                ("", 16),
+                ("", 8),
+                ("", 8),
+                ("", 16),
+                (area_name, 16),
+                ("", 16),
+                (line_name, 32),
+            )
+            location = ",".join(f"{value:<{width}}" for value, width in fields)
+            replacement_lines.append(f"Boundary Location={location}{newline}")
+        updated_lines = (
+            filtered_lines[:insert_index]
+            + replacement_lines
+            + filtered_lines[insert_index:]
+        )
+        RasUnsteady._atomic_write_lines(unsteady_path, updated_lines)
+
+        boundaries_df_refreshed = False
+        ras_obj = ras_object or ras
+        if ras_obj is not None:
+            try:
+                ras_obj.boundaries_df = ras_obj.get_boundary_conditions()
+                boundaries_df_refreshed = True
+            except Exception as exc:
+                logger.debug("boundaries_df refresh skipped: %s", exc)
+
+        inserted_locations = [
+            {"area_2d": area_name, "bc_line": line_name}
+            for area_name, line_name in desired
+        ]
+        logger.info(
+            "Replaced %d 2D boundary block(s) with %d geometry-backed location(s) in %s",
+            len(removed_locations),
+            len(inserted_locations),
+            unsteady_path.name,
+        )
+        return {
+            "unsteady_file": str(unsteady_path.resolve()),
+            "geometry_file": str(geometry_path.resolve()),
+            "removed_locations": removed_locations,
+            "inserted_locations": inserted_locations,
+            "preserved_non_2d_block_count": preserved_block_count,
+            "preserved_precipitation_locations": preserved_precipitation_locations,
+            "insert_index": insert_index,
+            "boundaries_df_refreshed": boundaries_df_refreshed,
+        }
 
     @staticmethod
     @log_call
@@ -7625,7 +9992,11 @@ class RasUnsteady:
         river: Optional[str] = None,
         reach: Optional[str] = None,
         station: Optional[str] = None,
-        ras_object: Optional[Any] = None
+        ras_object: Optional[Any] = None,
+        area_2d: Optional[str] = None,
+        bc_line: Optional[str] = None,
+        *,
+        max_decimals: int = 2,
     ) -> bool:
         """
         Write an inline hydrograph table to a boundary condition, converting from DSS if needed.
@@ -7634,8 +10005,8 @@ class RasUnsteady:
         removes DSS File/Path lines, writes inline hydrograph data in HEC-RAS fixed-width
         format, and updates the table count and Interval line.
 
-        The method follows the same pattern as ``set_precipitation_hyetograph()`` for
-        inline table writing.
+        Like ``set_precipitation_hyetograph()``, this writes fixed-width values,
+        but flow/stage ordinates and interval precipitation have different time semantics.
 
         Parameters
         ----------
@@ -7663,6 +10034,17 @@ class RasUnsteady:
             River station to locate the boundary.
         ras_object : optional
             Custom RAS object to use instead of the global one
+        area_2d : str, optional
+            Exact 2D Flow Area name (field 5 of ``Boundary Location=``).
+            Supply together with ``bc_line`` instead of the 1D selector.
+        bc_line : str, optional
+            Exact 2D BC line name (field 7 of ``Boundary Location=``).
+            Supply together with ``area_2d``.
+        max_decimals : int, default 2
+            Maximum decimal places for ordinates, from 0 through 6. The
+            existing fixed-width formatter reduces precision as needed to fit
+            each 8-character field; the default preserves existing output.
+            Six is the most fractional places that fit with a leading zero.
 
         Returns
         -------
@@ -7672,7 +10054,8 @@ class RasUnsteady:
         Raises
         ------
         ValueError
-            If DataFrame is missing required columns or bc_type is unsupported
+            If DataFrame is missing required columns, bc_type is unsupported,
+            or max_decimals is not an integer from 0 through 6.
         FileNotFoundError
             If unsteady flow file not found
 
@@ -7699,7 +10082,9 @@ class RasUnsteady:
         Each value is 8 characters wide, 10 values per line. The count on the header
         line is the number of values, and time is implied from the Interval setting.
 
-        Precipitation Hydrograph uses the same values-only timing convention.
+        Precipitation also stores values only, but each depth applies to the preceding
+        interval. Its dedicated writer preserves a zero-depth start ordinate; do not
+        apply that interval-depth convention to flow/stage ordinates.
 
         **State Transition**:
 
@@ -7712,6 +10097,8 @@ class RasUnsteady:
 
         See Also
         --------
+        ensure_2d_boundary_location : Create a geometry-validated empty 2D
+            boundary block before assigning its first boundary type.
         set_boundary_dss_link : Convert inline boundary to DSS mode
         set_precipitation_hyetograph : Write an incremental-depth precipitation hyetograph
         """
@@ -7723,6 +10110,9 @@ class RasUnsteady:
             "Uniform Lateral Inflow Hydrograph": "Uniform Lateral Inflow Hydrograph=",
         }
 
+        if type(max_decimals) is not int or not 0 <= max_decimals <= 6:
+            raise ValueError("max_decimals must be an integer from 0 through 6")
+
         if bc_type not in SUPPORTED_TYPES:
             raise ValueError(
                 f"Unsupported bc_type: '{bc_type}'. "
@@ -7731,11 +10121,22 @@ class RasUnsteady:
 
         table_keyword = SUPPORTED_TYPES[bc_type]
 
+        has_1d_selector = any(value is not None for value in (river, reach, station))
+        has_2d_selector = any(value is not None for value in (area_2d, bc_line))
+        if has_1d_selector and has_2d_selector:
+            raise ValueError(
+                "Provide either (river, reach, station) or (area_2d, bc_line), not both"
+            )
+        if has_1d_selector and not (river and reach and station):
+            raise ValueError("1D selector requires river, reach, and station")
+        if has_2d_selector and not (area_2d and bc_line):
+            raise ValueError("2D selector requires area_2d and bc_line")
+
         ras_obj = ras_object or ras
         if ras_obj is not None:
             try:
                 ras_obj.check_initialized()
-            except:
+            except Exception:
                 pass
 
         # Resolve unsteady file path
@@ -7760,52 +10161,86 @@ class RasUnsteady:
             )
 
         # Extract values
-        hours = hydrograph_df['hour'].values
-        values = hydrograph_df['value'].values
+        try:
+            hours = np.asarray(hydrograph_df['hour'].values, dtype=float)
+            values = np.asarray(hydrograph_df['value'].values, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Hydrograph hour and value columns must be numeric") from exc
         num_values = len(values)
 
         if num_values < 2:
             raise ValueError("DataFrame must have at least 2 rows")
+        if not np.isfinite(hours).all() or not np.isfinite(values).all():
+            raise ValueError("Hydrograph hours and values must be finite")
+        if not math.isclose(float(hours[0]), 0.0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("Hydrograph hours must start at zero")
 
         # Calculate interval from hour column
-        interval_hours = float(hours[1] - hours[0])
-        if interval_hours >= 1.0:
-            if interval_hours == int(interval_hours):
-                interval_str = f"{int(interval_hours)}HOUR"
-            else:
-                interval_min = int(interval_hours * 60)
-                interval_str = f"{interval_min}MIN"
+        intervals = np.diff(hours)
+        interval_hours = float(intervals[0])
+        if interval_hours <= 0 or not np.allclose(
+            intervals,
+            interval_hours,
+            rtol=0.0,
+            atol=1e-10,
+        ):
+            raise ValueError("Hydrograph hours must be strictly increasing and evenly spaced")
+        interval_minutes = interval_hours * 60.0
+        rounded_minutes = round(interval_minutes)
+        if rounded_minutes < 1 or not math.isclose(
+            interval_minutes,
+            rounded_minutes,
+            rel_tol=0.0,
+            abs_tol=1e-8,
+        ):
+            raise ValueError("Hydrograph interval must be a positive whole number of minutes")
+        if rounded_minutes % 60 == 0:
+            interval_str = f"{rounded_minutes // 60}HOUR"
         else:
-            interval_min = int(interval_hours * 60)
-            interval_str = f"{interval_min}MIN"
+            interval_str = f"{rounded_minutes}MIN"
 
         # Format values as fixed-width (8 chars each, 10 values per line)
         # Flow/Stage hydrographs use values only (not time-value pairs)
-        formatted_lines = []
+        formatted_rows = []
         for i in range(0, num_values, 10):
             row_values = values[i:i+10]
-            formatted_row = ''.join(f'{v:8.2f}' if abs(v) < 1e7 else f'{v:8.1f}'
-                                    for v in row_values)
-            formatted_lines.append(formatted_row + '\n')
+            formatted_rows.append(''.join(
+                RasUnsteady._format_fixed_width_value(v, max_decimals=max_decimals)
+                for v in row_values
+            ))
 
         # Read the file
-        with open(unsteady_path, 'r', encoding='utf-8', errors='ignore') as f:
+        with open(
+            unsteady_path,
+            'r',
+            encoding='utf-8',
+            errors='ignore',
+            newline='',
+        ) as f:
             lines = f.readlines()
+        newline = RasUnsteady._detect_line_ending(lines)
+        formatted_lines = [row + newline for row in formatted_rows]
 
         # Find the target boundary
         target_boundary_idx = None
         for idx, line in enumerate(lines):
             if line.startswith('Boundary Location='):
-                if river is not None or reach is not None or station is not None:
-                    loc_line = line.replace('Boundary Location=', '')
+                if has_1d_selector or has_2d_selector:
+                    loc_line = line[len('Boundary Location='):]
                     parts = [p.strip() for p in loc_line.split(',')]
-                    match = True
-                    if river is not None and (len(parts) < 1 or parts[0] != river):
-                        match = False
-                    if reach is not None and (len(parts) < 2 or parts[1] != reach):
-                        match = False
-                    if station is not None and (len(parts) < 3 or parts[2] != station):
-                        match = False
+                    if has_1d_selector:
+                        match = (
+                            len(parts) >= 3
+                            and parts[0] == river
+                            and parts[1] == reach
+                            and parts[2] == station
+                        )
+                    else:
+                        match = (
+                            len(parts) >= 8
+                            and parts[5] == area_2d
+                            and parts[7] == bc_line
+                        )
                     if match:
                         target_boundary_idx = idx
                         break
@@ -7822,7 +10257,12 @@ class RasUnsteady:
                         break
 
         if target_boundary_idx is None:
-            loc_str = f"{river}/{reach}/{station}" if river else "first matching"
+            if has_1d_selector:
+                loc_str = f"{river}/{reach}/{station}"
+            elif has_2d_selector:
+                loc_str = f"{area_2d}/{bc_line}"
+            else:
+                loc_str = "first matching"
             logger.warning(f"Boundary not found for {bc_type}: {loc_str}")
             return False
 
@@ -7835,10 +10275,13 @@ class RasUnsteady:
         use_dss_idx = None
         old_data_start = None
         old_data_end = None
-        block_end = len(lines)
+        block_end = next(
+            block['end_idx'] for block in RasUnsteady._find_boundary_blocks(lines)
+            if block['start_idx'] == target_boundary_idx
+        )
 
         i = block_start
-        while i < len(lines) and i < target_boundary_idx + 500:
+        while i < block_end:
             line = lines[i]
 
             if line.startswith('Boundary Location='):
@@ -7894,11 +10337,11 @@ class RasUnsteady:
 
         # Step 2: Update table header with new count
         if table_header_idx is not None:
-            lines[table_header_idx] = f'{table_keyword} {num_values} \n'
+            lines[table_header_idx] = f'{table_keyword} {num_values} {newline}'
         else:
             # Insert table header after Interval line (or after boundary location)
             insert_pos = interval_idx + 1 if interval_idx is not None else target_boundary_idx + 1
-            lines.insert(insert_pos, f'{table_keyword} {num_values} \n')
+            lines.insert(insert_pos, f'{table_keyword} {num_values} {newline}')
             table_header_idx = insert_pos
             # Adjust indices after insertion
             if interval_idx is not None and interval_idx >= insert_pos:
@@ -7928,10 +10371,10 @@ class RasUnsteady:
 
         # Step 4: Update Interval line
         if interval_idx is not None:
-            lines[interval_idx] = f'Interval={interval_str}\n'
+            lines[interval_idx] = f'Interval={interval_str}{newline}'
         else:
             # Insert interval before table header
-            lines.insert(table_header_idx, f'Interval={interval_str}\n')
+            lines.insert(table_header_idx, f'Interval={interval_str}{newline}')
             # Adjust all indices after this insertion
             if dss_file_idx is not None and dss_file_idx >= table_header_idx:
                 dss_file_idx += 1
@@ -7942,15 +10385,28 @@ class RasUnsteady:
 
         # Step 5: Set Use DSS=False and clear DSS File/Path
         if use_dss_idx is not None:
-            lines[use_dss_idx] = 'Use DSS=False\n'
+            lines[use_dss_idx] = f'Use DSS=False{newline}'
+        else:
+            # Recompute after table insertion: the final boundary ends before
+            # global meteorology/non-Newtonian settings, not at end of file.
+            block_end = next(
+                block['end_idx'] for block in RasUnsteady._find_boundary_blocks(lines)
+                if block['start_idx'] == target_boundary_idx
+            )
+            lines.insert(block_end, f'Use DSS=False{newline}')
         if dss_file_idx is not None:
-            lines[dss_file_idx] = 'DSS File=\n'
+            lines[dss_file_idx] = f'DSS File={newline}'
         if dss_path_idx is not None:
-            lines[dss_path_idx] = 'DSS Path=\n'
+            lines[dss_path_idx] = f'DSS Path={newline}'
 
         # Write updated content back to file
-        with open(unsteady_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+        RasUnsteady._atomic_write_lines(unsteady_path, lines)
+
+        if ras_obj is not None:
+            try:
+                ras_obj.boundaries_df = ras_obj.get_boundary_conditions()
+            except Exception as exc:
+                logger.debug("boundaries_df refresh skipped: %s", exc)
 
         peak_value = float(np.max(values))
         logger.info(
@@ -8326,8 +10782,7 @@ class RasUnsteady:
         block_after = ''.join(lines[boundary_idx:new_block_end])
 
         # 7) Persist file
-        with open(unsteady_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+        _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
 
         # 8) Refresh boundaries_df where possible
         boundaries_df_refreshed = False
@@ -8655,8 +11110,7 @@ class RasUnsteady:
             new_block_end += 1
         block_after = ''.join(lines[boundary_idx:new_block_end])
 
-        with open(unsteady_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+        _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
 
         boundaries_df_refreshed = False
         if ras_obj is not None:
@@ -9146,8 +11600,7 @@ class RasUnsteady:
         block_after = ''.join(lines[boundary_idx:new_block_end])
 
         # 7) Persist file
-        with open(unsteady_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+        _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
 
         # 8) Refresh boundaries_df where possible
         boundaries_df_refreshed = False
@@ -9183,6 +11636,83 @@ class RasUnsteady:
             'boundaries_df_refreshed': boundaries_df_refreshed,
             'block_before': block_before,
             'block_after': block_after,
+        }
+
+    @staticmethod
+    @log_call
+    def set_stage_hydrograph_initial_stage(
+        unsteady_file: Union[str, Path],
+        use_initial_stage: bool,
+        *,
+        area_2d: str,
+        bc_line: str,
+        ras_object: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Set the initial-stage flag on one exact 2D stage hydrograph.
+
+        Writes ``Stage Hydrograph Use Initial Stage=0/1`` in the selected
+        unsteady file. This controls initialization from the prescribed stage;
+        it does not change stage ordinates, flow forcing, geometry or units.
+        Supply an owned child copy. Other boundary bytes and line endings are
+        preserved. Returns the selected location and before/after flag values.
+        Missing, ambiguous or non-stage boundaries raise before any write.
+        ``unsteady_file`` accepts a path or a project-bound unsteady number.
+        No engine is run and no hydraulic acceptance is inferred.
+        """
+        if not isinstance(use_initial_stage, bool):
+            raise TypeError("use_initial_stage must be bool")
+        if any(
+            not isinstance(value, str) or not value.strip()
+            or any(c in value for c in ",\r\n")
+            for value in (area_2d, bc_line)
+        ):
+            raise ValueError("area_2d and bc_line require nonempty exact names")
+        path = RasUnsteady._resolve_unsteady_file_path(unsteady_file, ras_object)
+        original = path.read_bytes()
+        # Latin-1 is reversible for every byte. Only the ASCII flag is edited.
+        lines = original.decode("latin-1").splitlines(keepends=True)
+        blocks = [
+            b for b in RasUnsteady._find_boundary_blocks(lines)
+            if RasUnsteady._boundary_block_matches(
+                b, None, None, None, area_2d.strip(), bc_line.strip()
+            )
+        ]
+        if len(blocks) != 1 or blocks[0]["bc_type"] != "Stage Hydrograph":
+            raise ValueError("exactly one matching Stage Hydrograph boundary required")
+        block = blocks[0]
+        keyword = "Stage Hydrograph Use Initial Stage="
+        matches = [
+            i for i in range(block["start_idx"] + 1, block["end_idx"])
+            if lines[i].startswith(keyword)
+        ]
+        if len(matches) > 1:
+            raise ValueError("duplicate initial-stage flags in selected boundary")
+        previous = None
+        newline = RasUnsteady._detect_line_ending(lines)
+        replacement = keyword + str(int(use_initial_stage)) + newline
+        if matches:
+            index = matches[0]
+            previous = lines[index][len(keyword):].strip()
+            if previous not in {"0", "1"}:
+                raise ValueError("initial-stage flag must be 0 or 1")
+            ending = lines[index][len(lines[index].rstrip("\r\n")):]
+            lines[index] = keyword + str(int(use_initial_stage)) + ending
+        else:
+            index = next(
+                (i for i in range(block["start_idx"] + 1, block["end_idx"])
+                 if lines[i].startswith(("DSS Path=", "DSS File=", "Use DSS="))),
+                block["end_idx"],
+            )
+            if index > 0 and not lines[index - 1].endswith(("\r", "\n")):
+                raise ValueError("selected boundary lacks a terminating newline")
+            lines.insert(index, replacement)
+        path.write_bytes("".join(lines).encode("latin-1"))
+        return {
+            "unsteady_file": str(path),
+            "matched_location": block["location"],
+            "previous_use_initial_stage": None if previous is None else previous == "1",
+            "use_initial_stage": use_initial_stage,
+            "updated_in_place": bool(matches),
         }
 
     @staticmethod
@@ -9485,8 +12015,7 @@ class RasUnsteady:
         block_after = ''.join(lines[boundary_idx:new_block_end])
 
         # 7) Persist file
-        with open(unsteady_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+        _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
 
         # 8) Refresh boundaries_df where possible
         boundaries_df_refreshed = False
@@ -9660,8 +12189,7 @@ class RasUnsteady:
             i += 1
 
         if update_count > 0:
-            with open(unsteady_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
+            _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
             logger.info(f"Updated {update_count} DSS paths in {unsteady_path.name}")
         else:
             if old_a_part:
@@ -9794,8 +12322,7 @@ class RasUnsteady:
             i += 1
 
         if updated:
-            with open(unsteady_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
+            _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
             logger.info(f"Updated QMult to {new_multiplier} for station '{river_station}' in {unsteady_path.name}")
         else:
             logger.warning(f"Boundary not found for station '{river_station}'")
@@ -9956,8 +12483,7 @@ class RasUnsteady:
                 i += 1
 
         if total_updates > 0:
-            with open(unsteady_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
+            _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
             logger.info(f"Applied {total_updates} updates to {unsteady_path.name}")
         else:
             logger.warning("No matching boundaries found for any updates")
@@ -10163,8 +12689,7 @@ class RasUnsteady:
                     for old_sub, new_sub in mapping.items():
                         content = content.replace(old_sub, new_sub)
 
-                    with open(unsteady_path, 'w', encoding='utf-8') as f:
-                        f.write(content)
+                    _write_ras_text(unsteady_path, content, encoding="utf-8")
 
                     logger.info(f"Applied {len(updates_for_file)} updates to {unsteady_path.name}")
 
@@ -10453,12 +12978,10 @@ class RasUnsteady:
         formatted_lines = []
         for k in range(0, len(interleaved), 10):
             row_vals = interleaved[k:k + 10]
-            formatted_row = ''
-            for v in row_vals:
-                if abs(v) < 1e7:
-                    formatted_row += f'{v:8.1f}' if v != int(v) or abs(v) > 99999 else f'{int(v):>8}'
-                else:
-                    formatted_row += f'{v:8.0f}'
+            formatted_row = ''.join(
+                RasUnsteady._format_legacy_integer_or_fixed(v, 1)
+                for v in row_vals
+            )
             formatted_lines.append(formatted_row + '\n')
 
         with open(unsteady_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -10533,8 +13056,7 @@ class RasUnsteady:
         for idx, data_line in enumerate(formatted_lines):
             lines.insert(insert_pos + idx, data_line)
 
-        with open(unsteady_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+        _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
 
         boundaries_df_refreshed = False
         if ras_obj is not None:
@@ -10703,18 +13225,146 @@ class RasUnsteady:
         return pd.DataFrame({'stage': stages[:min_len], 'flow': flows[:min_len]})
 
     @staticmethod
+    def _format_fixed_width_value(
+        value: float,
+        *,
+        max_decimals: int = 2,
+        min_decimals: int = 0,
+        trim_trailing_zeros: bool = False,
+        zero_as_blank: bool = False,
+    ) -> str:
+        """Return one HEC-RAS inline-table field without allowing overflow.
+
+        HEC-RAS unsteady-flow tables are ten adjacent 8-character fields per
+        row with no separator.  The HEC-authored example
+        ``BaldEagleCrkMulti2D/BaldEagleDamBrk.u01`` shows HEC-RAS itself
+        filling all eight characters with no separating space
+        (``   7200070666.6669333.34   68000``), writing exact integers without
+        a decimal point, and otherwise using as many decimals as fit.  No
+        exponent notation appears in the tables of 124 surveyed ``.u##``
+        files, so this helper emits fixed-decimal text only.  (HEC-RAS 6.6
+        was also observed to *accept* scientific notation such as
+        ``1.00E+08`` at preprocessing; that is tolerance, not the format
+        HEC-RAS writes.)
+
+        Retain the requested decimal precision where it fits, then reduce it
+        one place at a time.  ``min_decimals`` retains a format's mandated
+        precision (the precipitation writer uses exactly two).  A value that
+        cannot fit is rejected rather than allowed to merge into the next
+        field.  A value that rounds to zero is written as positive zero
+        (never ``-0.00``).  ``zero_as_blank`` must only be used for tables
+        whose reader treats a blank field as ``0.0``.
+        """
+        return _format_fixed_width_value(
+            value,
+            max_decimals=max_decimals,
+            min_decimals=min_decimals,
+            trim_trailing_zeros=trim_trailing_zeros,
+            zero_as_blank=zero_as_blank,
+        )
+
+    @staticmethod
+    def _format_legacy_integer_or_fixed(value: float, decimals: int) -> str:
+        """Format like the legacy ``int if integral else %8.{decimals}f`` rule.
+
+        The groundwater, rating-curve, and lateral-inflow writers historically
+        wrote integral values up to 99,999 without a decimal point and all
+        other values with ``decimals`` fixed places.  This keeps that output
+        byte-identical wherever it fitted in eight characters and only drops
+        decimals where the legacy expression overflowed the field.
+        """
+        text = RasUnsteady._format_fixed_width_value(value, max_decimals=decimals)
+        numeric_value = float(value)
+        if numeric_value == int(numeric_value) and abs(numeric_value) <= 99999:
+            return RasUnsteady._format_fixed_width_value(numeric_value, max_decimals=0)
+        return text
+
+    @staticmethod
+    def _format_general_fixed_width_value(value: float) -> str:
+        """Format like the legacy ``%8g`` gate/navigation-dam rule, safely.
+
+        Values the legacy ``f"{v:8g}"`` wrote as a plain decimal of at most
+        eight characters (six significant digits) are reproduced
+        byte-for-byte.  Non-zero values below ``1e-4`` keep the legacy ``%g``
+        exponent form (``1e-07``) with as many significant digits as fit, so
+        they are not silently written as zero; HEC-RAS 6.6 parses such fields
+        although it does not write them itself.  Values that ``%8g`` would
+        have written in exponent form or wider than eight characters fall
+        back to the fixed-decimal rule of :meth:`_format_fixed_width_value`
+        (``ValueError`` if even the integer form cannot fit).
+        """
+        # Validates numeric/finite input and yields positive zero for 0/-0.
+        zero_text = RasUnsteady._format_fixed_width_value(value, max_decimals=0)
+        numeric_value = float(value)
+        if numeric_value == 0:
+            return zero_text
+        legacy = f"{numeric_value:g}"
+        if "e" not in legacy and len(legacy) <= 8:
+            return legacy.rjust(8)
+        if abs(numeric_value) < 1e-4:
+            for digits in range(6, 0, -1):
+                compact = f"{numeric_value:.{digits}g}"
+                if len(compact) <= 8:
+                    return compact.rjust(8)
+        return RasUnsteady._format_fixed_width_value(
+            numeric_value, max_decimals=6, trim_trailing_zeros=True
+        )
+
+    @staticmethod
+    def _fixed_width_data_end(
+        lines: List[str],
+        start: int,
+        count: int,
+        *,
+        stop_at_blank_line: bool,
+    ) -> int:
+        """Return the index after the fixed-width data rows starting at ``start``.
+
+        Rows are counted by their 8-character fields (not whitespace tokens),
+        so adjacent full-width fields such as ``150000123456.7`` count as two
+        values.  Scanning stops once ``count`` fields have been seen, or at the
+        first keyword line (any line containing ``=``), so the following
+        metadata line (for example the next ``Gate Name=``) is never consumed.
+        """
+        j = start
+        seen = 0
+        while j < len(lines) and seen < count:
+            line = lines[j]
+            if "=" in line:
+                break
+            stripped = line.rstrip("\r\n")
+            if not stripped.strip():
+                if stop_at_blank_line:
+                    break
+                j += 1
+                continue
+            seen += sum(
+                1
+                for k in range(0, len(stripped), 8)
+                if stripped[k:k + 8].strip()
+            )
+            j += 1
+        return j
+
+    @staticmethod
+    def _read_fixed_width_values(
+        lines: List[str], start: int, end: int, count: int
+    ) -> List[float]:
+        """Parse the first ``count`` 8-character fields of ``lines[start:end]``."""
+        if end <= start or count <= 0:
+            return []
+        table = RasUnsteady.parse_fixed_width_table(lines, start, end)
+        return [float(v) for v in table["Value"].tolist()][:count]
+
+    @staticmethod
     def _fmt8(v: float) -> str:
-        """Format a value into an 8-character fixed-width field matching HEC-RAS style."""
-        if v == 0.0:
-            return ' ' * 8
-        if v == int(v) and abs(v) < 1e8:
-            return f'{int(v):>8}'
-        for decimals in range(6, 0, -1):
-            s = f'{v:.{decimals}f}'.rstrip('0').rstrip('.')
-            if len(s) <= 8:
-                return s.rjust(8)
-        s = f'{v:.0f}'
-        return s[:8].rjust(8)
+        """Backward-compatible 8-character formatter for stage/flow tables."""
+        return RasUnsteady._format_fixed_width_value(
+            v,
+            max_decimals=6,
+            trim_trailing_zeros=True,
+            zero_as_blank=True,
+        )
 
     @staticmethod
     @log_call
@@ -10881,8 +13531,7 @@ class RasUnsteady:
             for i, bl in enumerate(new_block):
                 lines.insert(insert_pos + i, bl)
 
-        with open(unsteady_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+        _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
 
         boundaries_df_refreshed = False
         if ras_obj is not None:
@@ -11203,13 +13852,10 @@ class RasUnsteady:
         formatted_lines = []
         for k in range(0, value_count, 10):
             row_vals = flow_values[k:k + 10]
-            row_str = ''
-            for v in row_vals:
-                fv = float(v)
-                if abs(fv) < 1e7:
-                    row_str += f'{fv:8.1f}' if fv != int(fv) or abs(fv) > 99999 else f'{int(fv):>8}'
-                else:
-                    row_str += f'{fv:8.0f}'
+            row_str = ''.join(
+                RasUnsteady._format_legacy_integer_or_fixed(v, 1)
+                for v in row_vals
+            )
             formatted_lines.append(row_str + '\n')
 
         with open(unsteady_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -11311,8 +13957,7 @@ class RasUnsteady:
                 lines.insert(insert_after, slope_line)
             slope_written = slope
 
-        with open(unsteady_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+        _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
 
         boundaries_df_refreshed = False
         if ras_obj is not None:
@@ -11613,13 +14258,10 @@ class RasUnsteady:
         formatted_lines = []
         for k in range(0, value_count, 10):
             row_vals = flow_values[k:k + 10]
-            row_str = ''
-            for v in row_vals:
-                fv = float(v)
-                if abs(fv) < 1e7:
-                    row_str += f'{fv:8.1f}' if fv != int(fv) or abs(fv) > 99999 else f'{int(fv):>8}'
-                else:
-                    row_str += f'{fv:8.0f}'
+            row_str = ''.join(
+                RasUnsteady._format_legacy_integer_or_fixed(v, 1)
+                for v in row_vals
+            )
             formatted_lines.append(row_str + '\n')
 
         with open(unsteady_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -11718,8 +14360,7 @@ class RasUnsteady:
                 lines.insert(insert_after, slope_line)
             slope_written = slope
 
-        with open(unsteady_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+        _write_ras_text(unsteady_path, "".join(lines), encoding="utf-8")
 
         boundaries_df_refreshed = False
         if ras_obj is not None:
@@ -11748,3 +14389,305 @@ class RasUnsteady:
             'slope_written': slope_written,
             'boundaries_df_refreshed': boundaries_df_refreshed,
         }
+
+
+    @staticmethod
+    def _netcdf_interval_hours(times: Any) -> np.ndarray:
+        """Return per-row interval hours for instantaneous-rate NetCDF rasters."""
+        timestamps = pd.to_datetime(times)
+        n_times = len(timestamps)
+        interval_hours = np.zeros(n_times, dtype=np.float32)
+        if n_times <= 1:
+            return interval_hours
+
+        deltas = (timestamps[1:] - timestamps[:-1]).total_seconds() / 3600.0
+        deltas = np.asarray(deltas, dtype=np.float32)
+        if not np.all(np.isfinite(deltas)) or np.any(deltas <= 0):
+            raise ValueError("NetCDF precipitation times must be strictly increasing")
+
+        interval_hours[1:] = deltas
+        return interval_hours
+
+    @staticmethod
+    @log_call
+    def get_initial_point_elevations(
+        unsteady_number_or_path: Union[str, Path],
+        ras_object: Optional[Any] = None,
+    ) -> pd.DataFrame:
+        """Read named initial-elevation points without changing the file.
+
+        This table is separate from the existing flow/storage/RRR IC table.
+        Point names refer to geometry-defined IC points, not storage areas or
+        flow boundary lines. Geometry membership, units and vertical datum
+        must be verified from the selected model and its engineering contract.
+
+        Args:
+            unsteady_number_or_path: Unsteady number or explicit .u## path.
+            ras_object: Optional project context for number-based resolution.
+
+        Returns:
+            DataFrame with stable columns ``point_name`` (str), ``elevation``
+            (float), and ``trailing_fields`` (tuple of str). Trailing comma
+            fields are preserved without interpreting their meaning. An
+            absent point table returns an empty frame with the same columns.
+
+        Raises:
+            ValueError: Missing file, malformed/duplicate point records,
+                nonfinite elevation, or mixed newline conventions.
+        """
+        path = RasUnsteady._resolve_unsteady_file_path(
+            unsteady_number_or_path, ras_object=ras_object,
+        )
+        lines, _ = RasUtils._read_text_lines_preserving_newline(path)
+        records = []
+        names = set()
+        for line_number, line in enumerate(lines, start=1):
+            if not line.startswith("IC Point Elev="):
+                continue
+            fields = line.rstrip("\r\n").split("=", 1)[1].split(",")
+            if len(fields) < 2 or not fields[0].strip():
+                raise ValueError(f"Malformed IC Point Elev record at line {line_number}")
+            name = fields[0].strip()
+            try:
+                elevation = float(fields[1])
+            except ValueError as exc:
+                raise ValueError(f"Invalid IC point elevation at line {line_number}") from exc
+            if not np.isfinite(elevation):
+                raise ValueError(f"Nonfinite IC point elevation at line {line_number}")
+            if name.casefold() in names:
+                raise ValueError(f"Duplicate IC point name at line {line_number}: {name!r}")
+            names.add(name.casefold())
+            records.append({
+                "point_name": name,
+                "elevation": elevation,
+                "trailing_fields": tuple(fields[2:]),
+            })
+        return pd.DataFrame.from_records(
+            records, columns=["point_name", "elevation", "trailing_fields"],
+        ).astype({"point_name": "object", "elevation": "float64", "trailing_fields": "object"})
+
+    @staticmethod
+    def _refresh_initial_condition_context(unsteady_file, ras_object) -> None:
+        """Refresh only the context selected by a number or explicitly supplied."""
+        context = ras_object
+        if context is None and not Path(unsteady_file).is_file():
+            context = ras
+        if context is not None and getattr(context, "initialized", False):
+            context.unsteady_df = context.get_unsteady_entries()
+
+    @staticmethod
+    def _format_dss_filename(
+        dss_filename: Union[str, Path],
+        unsteady_path: Path,
+    ) -> str:
+        """Normalize a DSS filename for an HEC-RAS unsteady-flow file.
+
+        HEC-RAS requires project-relative DSS references to begin with ``.\\``
+        or ``..\\``. A bare relative directory such as ``hydrology\\input.dss``
+        is resolved as only ``input.dss`` in the project folder by HEC-RAS 6.6.
+        """
+        raw_filename = str(dss_filename).strip()
+        if not raw_filename:
+            raise ValueError("dss_filename must not be empty")
+
+        dss_path = Path(raw_filename)
+        if dss_path.is_absolute():
+            try:
+                relative_path = dss_path.relative_to(unsteady_path.parent)
+                return f".\\{relative_path}".replace("/", "\\")
+            except ValueError:
+                return str(dss_path)
+
+        normalized = raw_filename.replace("/", "\\")
+        if normalized.startswith((".\\", "..\\", "\\")):
+            return normalized
+        return f".\\{normalized}"
+
+    @staticmethod
+    def _select_boundary_block(
+        lines: List[str], *, river=None, reach=None, station=None,
+        sa_2d_name=None, bc_line=None, boundary_index=None, expected_bc_type=None,
+    ) -> Optional[Dict[str, Any]]:
+        """Share exact selector semantics between DSS mutation and readback."""
+        river = RasUnsteady._clean_boundary_selector(river)
+        reach = RasUnsteady._clean_boundary_selector(reach)
+        station = RasUnsteady._clean_boundary_selector(station)
+        sa_2d_name = RasUnsteady._clean_boundary_selector(sa_2d_name)
+        bc_line = RasUnsteady._clean_boundary_selector(bc_line)
+
+        has_1d_selector = any(
+            selector is not None for selector in (river, reach, station)
+        )
+        has_2d_selector = any(
+            selector is not None for selector in (sa_2d_name, bc_line)
+        )
+        if has_1d_selector and has_2d_selector:
+            raise ValueError(
+                "Provide either 1D selectors (river, reach, station) "
+                "or 2D selectors (sa_2d_name, bc_line), not both"
+            )
+        if boundary_index is not None:
+            if isinstance(boundary_index, bool) or not isinstance(boundary_index, int):
+                raise ValueError("boundary_index must be a zero-based integer")
+            if boundary_index < 0:
+                raise ValueError("boundary_index must be >= 0")
+        if boundary_index is None and not (has_1d_selector or has_2d_selector):
+            raise ValueError(
+                "Provide a boundary selector or boundary_index"
+            )
+
+        blocks = RasUnsteady._find_boundary_blocks(lines)
+        matches = [
+            block
+            for block in blocks
+            if RasUnsteady._boundary_block_matches(
+                block,
+                river,
+                reach,
+                station,
+                sa_2d_name,
+                bc_line,
+            )
+        ] if (has_1d_selector or has_2d_selector) else blocks
+
+        if boundary_index is not None:
+            selected = next(
+                (
+                    block
+                    for block in blocks
+                    if block["boundary_index"] == boundary_index
+                ),
+                None,
+            )
+            if selected is None:
+                raise ValueError(
+                    f"boundary_index {boundary_index} is out of range; "
+                    f"{len(blocks)} boundary blocks found"
+                )
+            if (has_1d_selector or has_2d_selector) and selected not in matches:
+                raise ValueError(
+                    f"boundary_index {boundary_index} does not match the "
+                    "provided boundary selectors"
+                )
+            target_block = selected
+        else:
+            if not matches:
+                logger.warning(
+                    "Boundary not found for selectors: "
+                    "river=%r, reach=%r, station=%r, sa_2d_name=%r, bc_line=%r",
+                    river,
+                    reach,
+                    station,
+                    sa_2d_name,
+                    bc_line,
+                )
+                return None
+            if len(matches) > 1:
+                choices = ", ".join(
+                    f"{block['boundary_index']}:"
+                    f"{RasUnsteady._boundary_block_name(block)}"
+                    for block in matches
+                )
+                raise ValueError(
+                    "Boundary selector is ambiguous. Provide boundary_index "
+                    f"to disambiguate one of: {choices}"
+                )
+            target_block = matches[0]
+
+        if expected_bc_type is not None and target_block["bc_type"] != expected_bc_type:
+            raise ValueError(
+                f"Selected boundary type is {target_block['bc_type']!r}, "
+                f"expected {expected_bc_type!r}"
+            )
+        return target_block
+
+    @staticmethod
+    def _flow_multiplier_state(lines: List[str], block: Dict[str, Any]) -> Dict[str, Any]:
+        """Inspect supported flow modifiers without changing scientific controls."""
+        flow_types = {
+            "Flow Hydrograph", "Lateral Inflow Hydrograph",
+            "Uniform Lateral Inflow", "Uniform Lateral Inflow Hydrograph",
+        }
+        if block["bc_type"] not in flow_types:
+            raise ValueError("Materialized flow requires a flow hydrograph boundary")
+        values = {}
+        for line in lines[block["start_idx"] + 1:block["end_idx"]]:
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key in values:
+                raise ValueError(f"Duplicate boundary setting: {key}")
+            values[key] = value.strip()
+        raw = values.get("Flow Hydrograph QMult")
+        try:
+            multiplier = float(raw) if raw is not None else 1.0
+        except ValueError as exc:
+            raise ValueError("Invalid Flow Hydrograph QMult") from exc
+        if not math.isfinite(multiplier) or multiplier < 0:
+            raise ValueError("Flow Hydrograph QMult must be finite and nonnegative")
+        # Slope is an energy-grade control, not an ordinate transformation.
+        allowed = {
+            *flow_types, "Boundary Name", "Interval", "Flow Hydrograph QMult",
+            "Flow Hydrograph Slope", "Stage Hydrograph TW Check", "DSS File",
+            "DSS Path", "Use DSS", "Use Fixed Start Time", "Fixed Start Date/Time",
+            "Is Critical Boundary", "Critical Boundary Flow",
+        }
+        unsupported = sorted(set(values) - allowed)
+        if len(set(values) & flow_types) != 1:
+            unsupported.append("multiple flow hydrograph types")
+        for key in ("Use Fixed Start Time", "Is Critical Boundary"):
+            if values.get(key, "False").casefold() not in {"false", "0"}:
+                unsupported.append(key)
+        if values.get("Stage Hydrograph TW Check", "0") != "0":
+            unsupported.append("Stage Hydrograph TW Check")
+        if values.get("Critical Boundary Flow", ""):
+            unsupported.append("Critical Boundary Flow")
+        return {
+            "boundary_index": block["boundary_index"],
+            "boundary_name": RasUnsteady._boundary_block_name(block),
+            "bc_type": block["bc_type"],
+            "qmult_explicit": raw is not None,
+            "qmult": multiplier,
+            "unsupported_modifiers": unsupported,
+            "dss_file": values.get("DSS File"),
+            "dss_path": values.get("DSS Path"),
+            "use_dss": values.get("Use DSS", "False").casefold() == "true",
+        }
+
+    @staticmethod
+    @log_call
+    def inspect_boundary_flow(
+        unsteady_file: Union[str, Path], *, river: Optional[str] = None,
+        reach: Optional[str] = None, station: Optional[str] = None,
+        sa_2d_name: Optional[str] = None, bc_line: Optional[str] = None,
+        boundary_index: Optional[int] = None, expected_bc_type: Optional[str] = None,
+        ras_object: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Read one exact flow boundary and its effective ordinate multiplier.
+
+        Args:
+            unsteady_file: Explicit unsteady file path (no global project lookup).
+            river, reach, station: Exact 1D selectors, or use the 2D selectors.
+            sa_2d_name, bc_line: Exact storage/2D area and boundary-line selectors.
+            boundary_index: Optional zero-based index; must agree with names.
+            expected_bc_type: Optional required boundary type.
+            ras_object: Optional caller context; no project metadata is mutated.
+
+        Returns:
+            Scalar evidence including implicit/explicit QMult, DSS binding and
+            unsupported materialized-flow modifiers. Missing QMult means unity.
+
+        Raises:
+            ValueError: Ambiguous/missing target, wrong type, mixed newlines,
+                duplicate settings or malformed multiplier.
+            FileNotFoundError: The explicit file does not exist.
+        """
+        lines, _ = RasUtils._read_text_lines_preserving_newline(Path(unsteady_file))
+        block = RasUnsteady._select_boundary_block(
+            lines, river=river, reach=reach, station=station, sa_2d_name=sa_2d_name,
+            bc_line=bc_line, boundary_index=boundary_index, expected_bc_type=expected_bc_type,
+        )
+        if block is None:
+            raise ValueError("Flow boundary selector did not match")
+        return RasUnsteady._flow_multiplier_state(lines, block)

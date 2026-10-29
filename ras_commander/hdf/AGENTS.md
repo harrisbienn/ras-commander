@@ -12,10 +12,51 @@ This file is the canonical local instruction file for `ras_commander/hdf/`.
 - Core helpers: `HdfBase`, `HdfUtils`, `HdfPlan`
 - Geometry readers: `HdfMesh`, `HdfXsec`, `HdfBndry`, `HdfStruc`, `HdfHydraulicTables`
 - Project extent / footprint: `HdfProject`
-- Results readers: `HdfResultsPlan`, `HdfResultsMesh`, `HdfResultsXsec`, `HdfResultsBreach`, `HdfResultsSediment`
 - Scenario product extraction: `HdfResultsProducts`
+- Results readers: `HdfResultsPlan`, `HdfResultsMesh`, `HdfResultView`, `HdfResultsXsec`, `HdfResultsBreach`, `HdfResultsSediment`
 - Infrastructure and land surface: `HdfPipe`, `HdfPump`, `HdfInfiltration`, `HdfLandCover`
 - Plotting and analysis: `HdfPlot`, `HdfResultsPlot`, `HdfBenefitAreas`, `HdfChannelCapacity`, `HdfFluvialPluvial`
+
+- `HdfFluvialPluvial.generate_fluvial_pluvial_polygons()` converts native polygon
+  areas using both projected horizontal CRS axis factors before applying acre
+  thresholds. Missing/geographic CRS skips filtering with a warning; unresolved
+  projected units and other processing failures log contextual ERROR plus traceback
+  and return an empty GeoDataFrame, discarding partial output. Existing upstream
+  input/decorator validation exceptions remain unchanged. No status attributes are added.
+
+
+## Native Backend
+
+- The native (Rust) engine is ras-commander's default HDF engine. The `ras_commander_fast_hdf`
+  extension is a core dependency on the platforms with wheels (Windows x64, Linux x64,
+  macOS arm64) and may be absent elsewhere, so every reader must still work on h5py alone.
+  The `Hdf*` readers are served by it through the internal adapter `ras_commander.fast_hdf`. Native routing must be invisible
+  except for speed: signatures, return types, columns, dtypes, index, CRS, attrs,
+  timestamps and exceptions equal the h5py reference in `python` and `auto` mode. Only
+  `required` mode (`RAS_COMMANDER_FAST_HDF=required` or `backend="rust"`) may raise
+  `fast_hdf.FastHdfError`; broad `except Exception` handlers in readers call
+  `reraise_required(e)` first.
+- `RAS_COMMANDER_FAST_HDF`: `0`/`off`/`false`/`python`, `auto` (default; unset/empty/`1`/`on`/`true`),
+  `required`/`rust`. An unrecognised value is `auto` plus one logged warning.
+- `RAS_COMMANDER_HDF_SESSION_CACHE`: default (unset/`1`) shares one native session per file
+  inside a public call (`log_call`/`standardize_input` open the scope) and closes it when the
+  outermost public call returns, so no HDF stays open afterwards (an open file blocks
+  rename/delete/replace on Windows and network shares). `0` opens per native read; `persist`
+  keeps up to four sessions across public calls and then requires `fast_hdf.close_sessions()`
+  before moving or deleting files and before running HEC-RAS.
+- `RAS_COMMANDER_FAST_TEXT` is the same policy switch for `ras_commander.fast_text`
+  (not used by any existing `Geom*`/`Ras*` method).
+- Public `fast_hdf` names are those in its `__all__`. `read_typed`, `read_attr(s)`, `read_dataset(s)`,
+  `mesh_series_domain`, `trace_reads`, `native_required`, `reraise_required`, `backend_scope`,
+  `release_native_sessions`, `fast_results`, `hdf/HdfFluvialNative` and `_fast_hdf_typed` are
+  internal plumbing; do not document them as user API or add new public callers outside
+  `ras_commander/`. Read one attribute with `read_attr(obj, name, default)`, never
+  `read_attrs(obj).get(name)` (an unreadable sibling must not fail the read).
+- Timestamps: `HdfUtils.convert_timesteps_to_datetimes` returns exactly what pandas has always
+  returned (`datetime64[ns]` under pandas 2.x) for every date pandas can represent; only dates
+  beyond year 2262 use `datetime64[us]` (main #548).
+- Keep this contract when adding a routed method: add a test that injects a native failure
+  (see `tests/test_native_api_conservatism.py`) and a test that the result equals the python-mode result.
 
 ## Implementation Rules
 
@@ -27,10 +68,20 @@ This file is the canonical local instruction file for `ras_commander/hdf/`.
   - `xarray`
   - `matplotlib`
   - `scipy`
-- Use `h5py.File(..., "r")` context managers for direct file access.
+- Use `h5py.File(..., "r")` context managers for direct inspection. RAS-owned
+  authoring must use the applicable native HEC-RAS API unless a method is
+  explicitly version/schema-qualified as a recovery or solver-temporary-file
+  operation.
 - Distinguish clearly between `plan_hdf` inputs and `geom_hdf` inputs when adding or modifying decorators.
 
 ## Input And Output Rules
+
+- Pump operation and hydrograph readers use only their owning DSS Profile or
+  DSS Hydrograph block's stored timestamps (seconds or milliseconds), falling
+  back to that block's finite nondecreasing numeric `Time` in days only when
+  timestamps are absent. Numeric axes expose `time_units` on DataFrames or
+  `time.units` on DataArrays. Missing, malformed or mismatched axes raise;
+  never borrow Base Output time or synthesize integer row indexes.
 
 - Accept the flexible HDF-facing input forms already used in this package: plan numbers, prefixed plan numbers, paths, and open HDF handles where the decorator pattern already allows them.
 - Return pandas or GeoPandas objects in the shapes established by nearby code. Do not invent a new container style for one method unless the surrounding API also changes.
@@ -39,6 +90,32 @@ This file is the canonical local instruction file for `ras_commander/hdf/`.
   Its COG, Parquet, footprint, metadata, preview, and numerical-summary assets
   are a package-owned contract for downstream catalogs, not an engineering
   acceptance decision.
+- Packed `Info`/`Parts`/`Points` features: Parts offsets are relative to the
+  feature's own point slice and bounded by its point count. Resolve offsets for
+  the complete feature, never per part or by whether values fit the global
+  range; legacy global offsets are accepted only when all parts together cover
+  the point slice exactly. `_packed_parts.resolve_feature_part_ranges()` does
+  this for `HdfBndry.get_refinement_regions()` and `HdfStruc.get_structures()`.
+- `HdfStruc.get_structures()` returns a MultiLineString (one line per stored
+  part, no connecting segment) for a structure whose Centerline Info Part
+  Count is greater than 1; single-part centerlines remain LineStrings.
+- A zero-point centerline (Info Point Count 0, e.g. lateral structures in
+  Muncie, Baxter, OrleansEx) is a valid empty range, as in the native engine.
+  `get_structures()` returns None geometry for it (the missing-geometry
+  convention used by `HdfPipe` and the other readers). Out-of-range starts,
+  negative counts, one-point centerlines and inconsistent Parts still raise.
+
+- CRS: `HdfBase.get_projection()`, `HdfProject.get_project_crs()` and
+  `RasPrj.project_crs` use one rule. HDF `Projection` attribute, `.rasmap`
+  projection file and `.rasmap` terrain HDFs are collected by
+  `HdfUtils.collect_hdf_crs_evidence()` and resolved by
+  `HdfUtils.resolve_crs_evidence()`; every CRS found must satisfy
+  `HdfUtils.crs_equivalent()`. Missing or conflicting evidence returns
+  `None` (never a guess, never a transform). The public string form is
+  `HdfUtils.format_crs()`: `"EPSG:n"` only for a strictly equivalent EPSG
+  code, otherwise the source WKT; never `"ESRI:n"`. New CRS-determining code
+  must reuse these helpers rather than reading `Projection` or `.prj` text
+  directly.
 
 ## Common Entry Points
 
@@ -47,15 +124,157 @@ This file is the canonical local instruction file for `ras_commander/hdf/`.
   `Plan Information/Simulation Start Time` attr, then 5.0.x `Time Window` ("<start> to <end>"),
   then the first `Unsteady Time Series/Time Date Stamp`. Required by all 2D summary reads
   (`HdfResultsMesh.get_mesh_max_ws`/`get_mesh_summary_output`); 5.0.x plan HDFs omit the 6.x attr.
+  It and `HdfBase.get_unsteady_timestamps()` accept a path or an open handle.
+- 2D cell result arrays list ghost cells after the physical cells (IDs >= `Attributes/Cell Count`).
+  Ghost values are placeholders (summary max WSE 0.0, NaN min elevation). `HdfResultsMesh` cell
+  results exclude them by default (`include_ghost_cells=True` keeps them, flagged `is_ghost_cell`).
+  `HdfMesh.get_mesh_cell_points()` still returns every center unless `include_ghost_cells=False`.
+  Never pair cell results with the full `Cells Center Coordinate` array by position.
 - 2D cell geometry and face geometry: `HdfMesh`
-- 2D face property table write (Manning's n vs Elevation): `HdfMesh.set_mesh_face_property_tables()`, `extend_face_property_tables()`, `set_face_mannings_n_values()`, `pin_property_tables()`
+- HEC-RAS 7.0 Linux solver-temporary face property-table recovery:
+  `HdfMesh.write_linux_tmp_face_property_tables()`,
+  `extend_linux_tmp_face_property_tables()`,
+  `transform_linux_tmp_face_mannings_n()`,
+  `sample_linux_tmp_face_mannings_n_from_landcover_curves()`, and
+  `set_mesh_pinned_attribute()`. These APIs are restricted to verified
+  `HEC-RAS Results` `*.p##.tmp.hdf` files and always back up and validate.
+- The historical `set_mesh_face_property_tables()`,
+  `extend_face_property_tables()`, `set_face_mannings_n_values()`, and
+  `recompute_face_mannings_n_from_landcover_curves()`, and
+  `pin_property_tables()` names are compatibility wrappers through v1.1.x.
+  The recompute name delegates to
+  `sample_linux_tmp_face_mannings_n_from_landcover_curves()`; none will be
+  removed before v1.2.0.
 - 2D face spatial filtering (polygon mask): `HdfMesh.get_face_ids_in_polygon()`, `get_face_ids_in_calibration_region()`
-- Both `extend_face_property_tables()` and `set_face_mannings_n_values()` accept optional `polygon` and `region_name` parameters for selective face application (precedence: `face_ids` > `region_name` > `polygon` > all faces)
+- Both `extend_linux_tmp_face_property_tables()` and
+  `transform_linux_tmp_face_mannings_n()` accept optional `polygon` and
+  `region_name` parameters for selective face application (precedence:
+  `face_ids` > `region_name` > `polygon` > all faces).
 - 2D results extraction: `HdfResultsMesh`
 - Deterministic client-oriented result package:
   `HdfResultsProducts.inspect_result()` and `HdfResultsProducts.export()`
+- Legacy `Log Hydraulics` (HEC-RAS 6.0-6.3.x per-mesh solver log) is read only
+  by `HdfResultsMesh.get_mesh_log_hydraulics()` as a labelled diagnostic table
+  on the Base Output clock. Never add it to `_LEGACY_MESH_SERIES_DOMAINS` or
+  infer a cell/face domain from its width.
+- `HdfFluvialPluvial` retains `(mesh_name, cell_id)` through time lookups,
+  adjacency, region growth and classification joins. Coincident edges from
+  different meshes are never neighbors. Polygon dissolution groups by mesh and
+  classification; native cell IDs remain unchanged. Both analysis entry points
+  log processing failures at ERROR with path, parameters, stage and traceback,
+  then return an empty GeoDataFrame, discarding partial geometry. Input/decorator
+  validation exceptions remain unchanged. No status/error attributes are added.
+- `HdfFluvialPluvial` results are order-invariant (behavior change after
+  v0.106.1): they depend only on stored mesh/results, never on cell-polygon row
+  order, ring direction or ring start vertex. Adjacency comes from stored
+  `Faces Cell Indexes` restricted to the returned cells; a canonical
+  shared-ring-segment fallback (also order-invariant) is used, with a WARNING,
+  only when a mesh lacks that dataset. Seeding is set-based: in each boundary
+  pair the later-peaking cell is fluvial evidence and the earlier one pluvial
+  evidence; a cell with both is seeded `ambiguous` and does not grow; equal
+  times (only possible with `delta_t <= 0`) seed nothing. Boundary lines are one
+  per boundary pair in sorted pair order and contain every shared face with the
+  stored coordinates (MultiLineString if not contiguous). Dissolve uses sorted
+  `(mesh_name, cell_id)` rows and normalized rings, so the `cell_id` column is
+  the smallest cell in each class.
+  The opt-in `engine="native"`/`"auto"` paths reproduce this mesh-scoped reference
+  (several meshes are analysed in isolation; frames keep the
+  `mesh_name, classification, geometry, cell_id` dissolve layout) and record
+  `attrs["fluvial_engine"]`; the default `engine="python"` is the reference.
+  Native uses the same stored-face adjacency and set-based seeding (no
+  last-write replay), emits boundary lines in sorted pair order through the
+  shared `_merge_shared_pieces`, and returns topologically equal polygons with
+  the same rows and attributes. It raises `FluvialNativeUnsupportedError`
+  (`"auto"` then runs Python) when it cannot match: missing
+  `Faces Cell Indexes` (Python's ring-segment fallback), physical cells that
+  differ from the polygonizable cells, invalid source cell geometry,
+  unprojected CRS, delta_t=0 (equal-time pairs) or non-millisecond thresholds.
+  With `min_polygon_area_acres`, native classifies and then runs the
+  reference's own `_dissolve_classified_cells` (over the h5py cell polygons)
+  and `_swap_small_polygons`: the swap's 'first' `area_acres`/`cell_id` follow
+  the GEOS part order of that canonical dissolve, which native ring assembly
+  does not share, so the result is then byte-identical to the reference.
+- Mesh time-series domains use authoritative stored scalar `Location`: `Cells`
+  and `Cell` mean cells; `Faces` means faces. Invalid, unknown, nonscalar or
+  contradictory present Location is refused, never bypassed with a name rule.
+  Only absent Location permits the immutable exact-name stable-core schema in
+  Base Output/Unsteady Time Series/2D Flow Areas: `Depth`/`Water Surface` are
+  cells; `Face Velocity`, `Face Shear Stress`, `Face Area`, and `Face Manning's n`
+  are faces. Provenance: unlabelled 5.0.7 output (e.g. FEMA eBFE AustinOyster.p03) and shared names compatible
+  with supported 6.x/7.x output/API fixtures; excerpts without File Version use
+  only this core table. Future version-specific names need qualified entries.
+  Both domain paths require numeric rank-two data, matching canonical Time rows,
+  stored geometry counts including ghosts, and valid physical-cell bounds.
+  A debug log identifies legacy rule use. Shapes, substrings and mutable
+  convenience lists never choose a domain. Unknown missing-Location names fail.
+  Numeric rank-one series matching Time retain `(time,)` for explicit eager,
+  lazy and streamed reads, without ghost flags or spatial coordinates. Default
+  cell/face discovery skips time-only diagnostics and reports invalid entries;
+  explicit malformed reads raise `ValueError`. One-row outputs are not broadcast.
+  Rows that differ from a valid Time axis raise `MeshSeriesAvailabilityError`
+  (a `ValueError`) from eager, view and stream reads alike; `disposition` is
+  `unwritten_placeholder` when the dataset stores no bytes (HDF5 fill only, e.g.
+  6.6/7.0.1 no-wind `Face Wind Term`, 6.6 Diffusion Wave `Face Water Surface`)
+  else `row_count_mismatch`. Never broadcast, re-time or read them as constant
+  fields. `get_mesh_timeseries_availability()` reports the same qualification.
+  Ghost filtering follows qualification. `Cell Hydraulic Depth` remains distinct
+  from `Depth` and WSE-minus-minimum-elevation depth. Summary wrappers retain
+  their separate existing schemas and are unchanged by these series rules.
+- Non-Newtonian `Face Mixture Dynamic Viscosity` (6.6/7.0.1 Bingham output) is
+  labelled `Location=Faces` but its width equals stored cells. It has no
+  established producer domain/unit contract: typed readers must keep refusing
+  it. Do not relabel it as cells, strip ghost columns, attach IDs, or convert
+  its stored `lb/ft^2*s` value. `HdfResultsMesh.inspect_mesh_series_raw()` is the
+  diagnostic route: stored identity, attrs, Time row match, geometry counts,
+  refusal reason, `raw_row`/`raw_column` axes and always-unqualified domain and
+  units. `Face Yield Stress` and `Face Viscous Stress` remain qualified face
+  series. Reader support does not establish hydraulic convergence.
+- Unsteady `HdfResultsQuery` velocity queries at integer time indexes prefer stored
+  `Cell Velocity - Velocity X/Y` components per mesh. Validate their stored
+  cell Location, time/geometry axes, physical count and velocity units; compute
+  speed from those components. Legacy components and face reconstruction remain
+  fallbacks when the stored components are absent. Malformed stored components
+  raise errors instead of silently selecting reconstruction.
+- Large 2D result access: `HdfResultsMesh.get_mesh_timeseries(...,
+  return_type="view")` returns an immutable `HdfResultView`;
+  `iter_mesh_timeseries()` emits untruncated bounded batches; and
+  `get_mesh_summary_values()` returns native summary values without Shapely
+  geometry. Eager results remain the default. A view owns no persistent HDF
+  handle and validates its source fingerprint whenever it reads.
 - 2D mobile-bed (sediment) results: `HdfResultsSediment` (`is_sediment_plan()`, `get_sediment_mesh_areas()`, `get_cell_bed_change()`/`get_cell_bed_elevation()`/`get_active_layer_grain_class()` -> GeoDataFrame, `get_bed_change_volumes()` -> erosion/deposition/net volume per area, `get_cell_bed_change_timeseries()` -> xr.DataArray). Reads the `Sediment Bed` output block; per-cell arrays align with computed `Cells Surface Area` (zero-area ghost cells drop out of volume integrals). Covered by `examples/230_mesh_sensitivity_analysis.ipynb`.
+  Active-layer diameters are validated against their own dataset `Units`
+  (`mm`; any other label raises) and never against the model unit system.
+  Length results (bed change/elevation, volumes) resolve the model unit as:
+  `unit_system=` override, then the project `.prj` marker (`ras_object`, or
+  the initialized global project that contains the HDF), then embedded HDF
+  metadata.
+- Result-HDF unit resolution (`HdfBase.get_result_unit_metadata()`, shared by
+  `HdfResultsSediment`, `HdfResultsQuery` velocity qualification and profile
+  attrs, and `HdfResultsProducts`): a `project_file` `.prj` marker is
+  authoritative (root `/@Units System` disagreeing with it raises). For a
+  standalone HDF, root `SI Units` with `/Geometry/@SI Units = False` is the
+  RasMapper geometry default that HEC-RAS 6.6/7.0 never updates (Weise_2D).
+  It resolves to SI with a `warnings` entry only when at least one result
+  dataset `Units` label in the file is `m` and none is `ft`; both attributes
+  stay in `evidence`. Every other disagreement (including root US with
+  geometry `True`) raises, and the error names the `unit_system=` override.
+  Never apply the model unit system to unlabelled sediment tables:
+  `Sediment/Grain Class Data/Density Data` is stored in lb/ft3 even in SI
+  projects.
 - 1D cross section geometry and results: `HdfXsec`, `HdfResultsXsec`
+- `HdfStruc1D.list_1d_structures()` and `get_structure_max_values()` prefer
+  unsteady Base Output `Inline Structures`, `Bridges`, `Culverts` and `Pumping
+  Stations`. Match exact, unique geometry Type/River/Reach/RS or pump Name;
+  validate local time rows and primary `Variable_Unit` columns. Use Stage HW,
+  Stage TW and Total Flow (inline) or Flow in native units. Direct results never
+  estimate TW from HW or substitute nearby XS values; missing/all-NaN quantities
+  remain None. Pumps use empty River/Reach and Name as RS in the existing schema
+  and lookup signature. Malformed direct layouts raise ValueError. Legacy generic
+  Structures and cross-section fallbacks remain; empty inventories keep their
+  five documented columns. Nested gate/pump component series are not aggregated.
+- `HdfStruc.get_structures()` keeps one-based public `Structure ID` values,
+  joining bridge coefficients by their native zero-based Attributes row IDs.
+  Duplicate, noninteger or out-of-range coefficient IDs are errors.
 - 1D river edge lines: `HdfXsec.get_river_edge_lines()` (stored `Geometry/River Edge Lines`);
   `HdfXsec.generate_river_edge_lines()` builds them from XS cut-line end points when none are
   stored (pure-Python equivalent of RASMapper "Create Edge Lines at XS Limits") — it returns a
@@ -78,17 +297,74 @@ This file is the canonical local instruction file for `ras_commander/hdf/`.
   `close_with_end_xs=False` for the legacy straight-chord closure, `dissolve=True` for a single
   (multi)polygon.
 - True model extent polygon: `HdfProject.get_project_extent(..., geometry_type='footprint')`
-  unions 2D flow-area perimeters with 1D reach footprints (multipart when multiple areas/reaches).
+  unions 2D flow-area perimeters, storage areas, and 1D reach footprints (multipart when multiple
+  areas/reaches).
+  Missing HDF components fall back to companion plain-text geometry by default; pass
+  `fallback_to_plaintext=False` for strict HDF-only extraction.
   Use `include_1d=False` / `include_2d=False` for 2D-only / 1D-only extents, and
   `buffer_percent=0` for the raw footprint. `fill_holes=True` (default, footprint mode) removes the
   thin interior sliver gaps left where 1D reach footprints and 2D flow areas overlap without
   aligning exactly — it drops interior rings only, never disconnected parts of a multipart model;
   pass `fill_holes=False` to keep the raw union. `geometry_type='bbox'` returns the legacy buffered
   bounding box (still used by `get_project_bounds_latlon` for data downloads).
+- `HdfStruc.get_storage_area_polygons()` attaches the available project CRS
+  through `HdfBase.get_projection()` without transforming the stored coordinates.
+  Unknown CRS remains unset; no geographic default is assigned.
 - Land cover and infiltration preprocessing: `HdfLandCover`, `HdfInfiltration`
-- Infiltration group authoring: `HdfInfiltration.create_infiltration_group()`, `HdfInfiltration.set_infiltration_baseoverrides()`
+- Native infiltration geometry authoring:
+  `HdfInfiltration.create_infiltration_override_regions()`,
+  `get_infiltration_region_overrides()`,
+  `set_infiltration_base_overrides()`,
+  `set_infiltration_region_overrides()`,
+  `scale_infiltration_base_overrides()`, and
+  `scale_infiltration_region_overrides()` for HEC-RAS 6.x and 7.0.x. Native
+  Base Overrides are the geometry-wide class-to-parameter fallback;
+  per-region values are separate native parameter tables. Region polygons
+  containing holes fail closed because HEC-RAS 6.0–7.0.1 drops interior-ring
+  topology during native parameter resampling.
+  Native sidecar editing uses `set_infiltration_sidecar_parameters()` and
+  `scale_infiltration_sidecar_parameters()`. Historical spellings remain
+  working compatibility wrappers through v1.1.x; do not recreate or
+  selectively delete `/Geometry/Infiltration` datasets with `h5py`.
 
 ## Testing
 
 - Use real example HDF files when validating behavior.
 - Prefer targeted tests over synthetic HDF fixtures unless a regression cannot be reproduced against real examples.
+
+## Packed perimeter offsets
+
+- Collection-level `HdfMesh.get_mesh_areas()` resolves Parts offsets for each
+  complete feature through `HdfBase._feature_part_ranges()`. Native local
+  offsets are valid when every part lies within the feature's point count
+  (gaps and unused vertices allowed, as in the native engine) and take
+  precedence. Legacy global offsets remain supported only when all parts
+  exactly cover the feature's point slice. Any other layout, including mixed
+  conventions, fails closed.
+
+## Pipe network reads
+
+- `HdfPipe.get_pipe_network_timeseries(..., pipe_network_name=None,
+  output_block="DSS Hydrograph Output")` defaults to the first geometry Attributes
+  network. Base and DSS use only their own timestamps; absent/mismatched axes raise.
+- Domain comes from stored Location plus geometry count. Positional `location`
+  remains available; `node_id`/`conduit_id` hold exact Node/Conduit Indices.
+  `extract_timeseries_for_node` and `extract_timeseries_for_conduit` select stored IDs,
+  accept network/block options and raise for unknown IDs. Both preserve the
+  explicit `ras_object` for positional and keyword `plan_hdf_path` plan numbers.
+- `get_pipe_network_summary(..., pipe_network_name=None)` returns literal Base
+  summary rows and volume-accounting attributes in long form. Row/column ordinals,
+  labels, units, values, shapes and raw metadata are retained. Volume-accounting
+  rows carry null units; the `Vol Accounting in` row names the volume unit.
+  `get_pipe_conduits` validates terrain-profile start/count slices and refuses
+  partially present profile tables. The legacy
+  Summary/Pipe Network table keeps its historical return shape when present
+  without geometry network identities. One-row minima never
+  receive a fabricated time row; absent Location does not imply a typed domain.
+- Pipe geometry defaults to the stored CRS; explicit `crs` overrides it. Parts
+  offsets are relative to each feature's Points slice. Unqualified multipart polygon
+  topology refuses. Network Node Points resolve global stored IDs, and Cell Property
+  Table rows align by cell position, not their separate lookup-table Info Index.
+- `get_pipe_profile` uses a global conduit geometry row (the stored conduit ID),
+  not its position in a selected network. Optional inlets can be absent; a present
+  inlet group missing Attributes raises rather than disappearing silently.

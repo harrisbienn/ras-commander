@@ -62,10 +62,12 @@ import subprocess
 import time
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 # Import decorator from parent package
+from .._ras_text import _write_ras_text
 from ..Decorators import log_call
+from ..ComputeResults import TerrainExportResult
 from ..LoggingConfig import get_logger
 from ..RasUtils import RasUtils
 from ..RasterPerformance import (
@@ -112,6 +114,92 @@ class RasTerrain:
         Path("C:/Program Files (x86)/HEC/HEC-RAS"),
         Path("C:/Program Files/HEC/HEC-RAS"),
     ]
+
+    @staticmethod
+    @log_call
+    def export_rasmapper_terrain(
+        ras_project_path: Union[str, Path],
+        output_tif: Union[str, Path],
+        terrain_name: Optional[str] = None,
+        extent: Optional[Sequence[float]] = None,
+        downsample_factor: int = 1,
+        rasterize_modifications: bool = True,
+        overwrite: bool = False,
+        timeout_seconds: float = 1800.0,
+        hecras_version: Optional[str] = None,
+        ras_object=None,
+        receipt_path: Optional[Union[str, Path]] = None,
+    ) -> TerrainExportResult:
+        """Export one registered RAS Mapper terrain to a validated GeoTIFF.
+
+        This is a supervised wrapper around HEC-RAS's own terrain
+        consolidation operation. It loads the selected terrain from the
+        project's ``.rasmap`` so registered source order, stitches, masks, and
+        vector modifications remain native RAS Mapper behavior.
+
+        Args:
+            ras_project_path: Project folder, ``.prj``, or ``.rasmap`` path.
+            output_tif: Destination single-band Float32 GeoTIFF.
+            terrain_name: Exact registered terrain name. May be omitted only
+                when the project registers exactly one terrain.
+            extent: Optional ``(xmin, ymin, xmax, ymax)`` export bounds.
+            downsample_factor: Exact source-derived factor: 1, 2, 4, or 8.
+            rasterize_modifications: Apply native RAS Mapper vector terrain
+                modifications through ``resampleVecMods``.
+            overwrite: Replace existing output and receipt when true.
+            timeout_seconds: Total bounded runtime, including validation.
+            hecras_version: Accepted HEC-RAS runtime: 6.4.1, 6.5, 6.6, 7.0.1,
+                or forward-open 7.1. The existing ``6.4`` installation alias resolves to
+                6.4.1. When omitted, use the exact runtime recorded by
+                ``ras_object``.
+            ras_object (RasPrj, optional): Optional initialized project object for multi-project
+                and runtime-version context. Its ``ras_version`` is checked
+                before filesystem or native work; an unsupported version or a
+                conflict with ``hecras_version`` raises ``ValueError``.
+            receipt_path: Machine-readable JSON receipt path. Defaults to
+                ``<output_tif>.receipt.json``.
+
+        Returns:
+            TerrainExportResult: Bool-compatible typed result. Operational
+            failures and timeouts return a failed result and failure receipt;
+            invalid inputs raise before native execution.
+
+        Notes:
+            Qualified releases are HEC-RAS 6.4.1, 6.5, 6.6, and 7.0.1.
+            HEC-RAS 6.3 lacks the required bounded contract, 6.4 has an
+            official terrain-elevation defect, 6.7 is beta-only, and 7.0.0
+            has an official terrain-modification export defect. HEC-RAS 7.0.1
+            fixes that defect. HEC-RAS 6.4.1, 6.5, 6.6, and 7.0.1 are qualified
+            on native Windows and under Wine. HEC-RAS 7.1
+            is forward-open for its future official binary, with the helper's
+            exact managed-contract check retained as the runtime safety gate.
+            Windows-drive and UNC project/input paths are supported, but direct
+            output to a UNC share is not qualified because the task-local GDAL
+            junction may not be staged on a remote volume; use a local output
+            and copy the committed TIFF and receipt afterward. Fully qualified
+            helper response paths beyond the legacy .NET 260-character limit
+            are also unqualified; select a shorter local output path.
+            The base export is always nearest-neighbor. The derivative is not
+            registered in or otherwise written back to the source project.
+            ``RasTerrainMod.compute_modified_terrain_raster()`` is a deprecated
+            row-sampled compatibility method scheduled for removal in 1.1; it
+            is not used as a production fallback.
+        """
+        from ..native.terrain_export_host import export_rasmapper_terrain
+
+        return export_rasmapper_terrain(
+            ras_project_path=ras_project_path,
+            output_tif=output_tif,
+            terrain_name=terrain_name,
+            extent=extent,
+            downsample_factor=downsample_factor,
+            rasterize_modifications=rasterize_modifications,
+            overwrite=overwrite,
+            timeout_seconds=timeout_seconds,
+            hecras_version=hecras_version,
+            ras_object=ras_object,
+            receipt_path=receipt_path,
+        )
 
     @staticmethod
     def _empty_bank_lines_gdf(crs=None):
@@ -431,9 +519,9 @@ class RasTerrain:
         Parameters:
             geom_path (Union[str, Path]): Path to a plain-text `.g##` geometry
                 file or compiled `.g##.hdf` geometry HDF file.
-            crs: Optional CRS to assign to the returned GeoDataFrame. If omitted
+            crs (pyproj.CRS or str, optional): Optional CRS to assign to the returned GeoDataFrame. If omitted
                 and an HDF input exposes a CRS, that CRS is preserved.
-            ras_object: Optional RasPrj instance for multi-project workflows.
+            ras_object (RasPrj, optional): Optional RasPrj instance for multi-project workflows.
 
         Returns:
             geopandas.GeoDataFrame: Bank lines with columns:
@@ -1169,6 +1257,9 @@ class RasTerrain:
                 bank_lines_gdf = bank_lines_gdf.copy()
                 bank_lines_gdf["source"] = "hdf_bank_lines"
         except Exception as e:
+            from ..fast_hdf import reraise_required
+
+            reraise_required(e)
             logger.warning(f"Could not read river bank lines from {geom_path}: {e}")
             bank_lines_gdf = gpd.GeoDataFrame(geometry=[], crs=crs)
 
@@ -1356,12 +1447,12 @@ class RasTerrain:
             raster_cell_size: Cell size in project units. Required when
                 ``output_raster`` is provided. If provided without
                 ``output_raster``, an in-memory raster array is returned.
-            crs: Optional CRS override. Plain geometry files otherwise try to
+            crs (pyproj.CRS or str, optional): Optional CRS override. Plain geometry files otherwise try to
                 resolve CRS from the sibling geometry HDF/RASMapper projection.
             channel_only: If True, clip/interpolate between left and right
                 bank stations or RAS bank lines. If False, use full XS extents.
             nodata: NoData value for raster output.
-            ras_object: Optional RasPrj instance for project context.
+            ras_object (RasPrj, optional): Optional RasPrj instance for project context.
 
         Returns:
             dict: Contains ``points``, ``triangles``, ``channel_polygon``,
@@ -1928,7 +2019,7 @@ class RasTerrain:
         output_prj.parent.mkdir(parents=True, exist_ok=True)
 
         # Write PRJ file
-        output_prj.write_text(prj_wkt, encoding="utf-8")
+        _write_ras_text(output_prj, prj_wkt, encoding="utf-8")
         logger.info(f"Projection file created: {output_prj.name}")
         logger.debug(f"Projection file path: {output_prj}")
 
@@ -2002,15 +2093,15 @@ class RasTerrain:
 
         Notes:
             - The RasProcess.exe command requires all paths to be quoted
-              due to spaces in "Program Files".
+                due to spaces in "Program Files".
             - Input rasters are processed in order - first raster has
-              priority in overlapping areas.
+                priority in overlapping areas.
             - The output folder will be created automatically if it doesn't
-              exist.
+                exist.
             - Verified working with HEC-RAS 6.6 (tested 2025-12-25).
             - Threading applies only to GDAL operations that support
-              ``GDAL_NUM_THREADS``; serial HEC-RAS terrain-HDF stages remain
-              serial.
+                ``GDAL_NUM_THREADS``; serial HEC-RAS terrain-HDF stages remain
+                serial.
         """
         # Convert to Path objects. Resolve to ABSOLUTE paths: RasProcess.exe runs with
         # cwd=hecras_path (so HEC's bundled GDAL/PROJ resolve correctly), which means any
@@ -2133,6 +2224,83 @@ class RasTerrain:
         logger.debug(f"Terrain HDF output path: {output_hdf} " f"({file_size:,} bytes)")
 
         return output_hdf
+
+    @staticmethod
+    @log_call
+    def create_terrain_hdf_lossless(
+        input_raster: Union[str, Path],
+        output_hdf: Union[str, Path],
+        projection_prj: Union[str, Path],
+        units: str = "Feet",
+        hecras_version: str = "6.6",
+        timeout_seconds: float = 1800,
+        gdal_num_threads: int = 1,
+    ) -> Path:
+        """Register one Float32 foot DEM without rounding or reprojection.
+
+        Uses HEC-RAS 6.6's native ``TerrainComputable`` with ``RoundTo.None``
+        in an isolated Windows/Wine Python process. Regenerates the TIFF,
+        overviews and native HDF caches together; never replaces a TIFF after
+        compilation. Input must be square, north-up, nodata=-9999 with no explicit
+        validity mask and in the
+        same projected foot CRS as the PRJ. Values must already be in feet;
+        no vertical datum or unit conversion is performed.
+
+        Creates a new HDF/TIFF/VRT prefix, ``.creation.json`` validation receipt
+        and ``.creation.log``. Existing output prefixes are rejected and the
+        input is read-only. Validates exact stored pixel bits and native HDF
+        structure. Native centre, mesh and hydraulic qualification are separate
+        checks. Requires rasterio, NumPy, h5py, pythonnet and installed HEC-RAS 6.6.
+        The ordinary ``create_terrain_hdf`` defaults remain unchanged.
+
+        Args:
+            input_raster: Read-only Float32 GeoTIFF with elevations in feet.
+            output_hdf: New .hdf path; creates its parent directory and siblings.
+            projection_prj: PRJ defining the same projected foot CRS as the raster.
+            units: Elevation units. Only "Feet" is supported (default).
+            hecras_version: Installed native runtime. Only "6.6" is supported (default).
+            timeout_seconds: Positive native subprocess deadline, default 1800 seconds.
+                Excludes input inspection and output validation. An expired deadline
+                terminates only the launched process tree and retains a failed receipt.
+            gdal_num_threads: Positive GDAL thread cap, default 1.
+
+        Returns:
+            Path to the new native terrain HDF after registration and stored-bit checks.
+
+        Raises:
+            ValueError: Unsupported inputs, options, or an existing output prefix.
+            FileNotFoundError: Input, projection, or native runtime is unavailable.
+            RuntimeError: Native creation or output validation fails.
+            subprocess.TimeoutExpired: The native subprocess exceeds its deadline.
+        """
+        import math
+
+        from ._lossless_create import create_lossless
+
+        if units != "Feet" or hecras_version != "6.6":
+            raise ValueError(
+                "Lossless native creation supports only Feet and HEC-RAS 6.6"
+            )
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        if (
+            isinstance(gdal_num_threads, bool)
+            or not isinstance(gdal_num_threads, int)
+            or gdal_num_threads < 1
+        ):
+            raise ValueError("gdal_num_threads must be a positive integer")
+        source, output, projection = (
+            RasUtils.safe_resolve(Path(path))
+            for path in (input_raster, output_hdf, projection_prj)
+        )
+        for path in (source, projection):
+            if not path.is_file():
+                raise FileNotFoundError(path)
+        install = RasTerrain._get_hecras_path(hecras_version)
+        env = RasTerrain._build_hecras_terrain_env(install, gdal_num_threads)
+        return create_lossless(
+            source, output, projection, install, env, timeout_seconds
+        )
 
     @staticmethod
     @log_call

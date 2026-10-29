@@ -1,5 +1,57 @@
 # Scenario Worker
 
+## Upstream integration compatibility
+
+Scenario preparation removes inactive inherited DSS boundaries through an
+owned editing stage. The stage inventories execution assets but always records
+`execution_readiness="not_ready"`; it cannot establish compute readiness.
+Project, plan, geometry-text and flow-text references, copied bytes, source
+identity and exact boundary checksums remain required. Selected removals use
+one atomic transaction. The preparer verifies the original clone before
+publishing the edited unsteady file and then runs workspace validation.
+
+When inactive boundaries exist, allow disk space for one additional temporary
+project copy. Successful preparation keeps `boundary-edit-evidence.json` with
+file counts, sizes, checksums and mutation evidence. Failed operations can
+retain an isolated `.boundary-edit-*` directory for diagnosis; they do not
+authorize execution.
+
+Materialized flow inputs retain exact-once QMult handling and newline
+preservation. DSS grid copying accepts a zero-length tail for copy/translation
+workflows. Long translations and hydraulic product exports retain Year 3000
+timestamps. Existing hydraulic product keys and hydrograph columns remain
+stable. Upstream square raster grids and physical-cell filtering can change
+pixels relative to older exports; compare and accept derivatives before
+replacing published products. Source HDF files remain read only.
+
+Hydraulic product manifest version `2.0` restores full coupled model coverage:
+`result-footprint.geojson` unions the 1D river, 2D flow-area and storage-area
+polygons, while `raster-support.geojson` retains the per-mesh 2D polygons.
+Both GeoJSON assets use WGS84; their `proj:bbox` and `proj:code` describe the
+source projected coordinates. The full domain is not an inundation extent.
+Missing or invalid declared 1D/storage geometry prevents product publication.
+
+The manifest declares `spatial.support="coupled_model_domain"`, binds the
+footprint and raster-support asset keys separately, and gives each raster a
+`support_asset="raster-support"` reference. `spatial.bbox` covers the full
+domain; `spatial.raster_bbox` covers the meshes. Raster sampling and masks remain
+2D-only. Hydrograph coverage does not expand raster support. Consumers must
+accept and validate version 2 before adopting this exporter. Historical version
+1 packages remain immutable and must not be relabeled as version 2. Worker
+request/result envelope versions are unchanged; the product receipt carries the
+exporter's independent manifest version.
+
+The historical direct-path `RasUnsteady.delete_boundary()` interface is rejected;
+use an owned stage and exact inventory evidence. Land-cover edits require the
+native writer's explicit HEC-RAS version or initialized project context. Legacy
+study scripts that omit this context need migration before using the candidate.
+Native Manning edits verify class identities and unrequested parameters after
+saving; a mismatch restores the sidecar and native backup. This postcondition
+does not reinstate the legacy raw-HDF writer or qualify a new installed runtime.
+Model execution and engineering acceptance remain separate gates.
+
+## Worker contract
+
 `ras-scenario-worker` is the package-owned process boundary for one isolated
 HEC-RAS scenario. It lets an orchestrator invoke RAS Commander from a dedicated
 RAS environment without importing RAS Commander into the orchestrator.

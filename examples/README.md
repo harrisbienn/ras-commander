@@ -5,7 +5,7 @@ The notebooks are reference workflows for hydraulic modelers and developers;
 use them to understand API patterns, then move repeatable production logic into
 library code or scripts.
 
-The current git inventory contains **127 canonical notebooks** under
+The current git inventory contains **139 canonical notebooks** under
 `examples/`. Executed copies, temporary test notebooks, extracted HEC-RAS
 projects, and generated artifacts are intentionally excluded from this README.
 
@@ -35,10 +35,18 @@ projects, and generated artifacts are intentionally excluded from this README.
 - [410_2d_hdf_data_extraction.ipynb](410_2d_hdf_data_extraction.ipynb), [412_2d_detail_face_data_extraction.ipynb](412_2d_detail_face_data_extraction.ipynb), and [413_profile_line_flow_extraction.ipynb](413_profile_line_flow_extraction.ipynb) - HDF mesh and results extraction.
 - [720_precipitation_methods_comprehensive.ipynb](720_precipitation_methods_comprehensive.ipynb), [721_precipitation_hyetograph_comparison.ipynb](721_precipitation_hyetograph_comparison.ipynb), and [725_atlas14_spatial_variance.ipynb](725_atlas14_spatial_variance.ipynb) - precipitation methods.
 - [910_usgs_gauge_catalog.ipynb](910_usgs_gauge_catalog.ipynb) through [923_stofs3d_coastal_boundary.ipynb](923_stofs3d_coastal_boundary.ipynb) - gauge, validation, forecast, and coastal boundary workflows.
-- [917_mrms_precipitation_qpe.ipynb](917_mrms_precipitation_qpe.ipynb) and [924_mrms_netcdf_rain_on_grid.ipynb](924_mrms_netcdf_rain_on_grid.ipynb) - MRMS QPE workflows, including direct NetCDF rain-on-grid validation.
-- [920_terrain_creation.ipynb](920_terrain_creation.ipynb), [925_xs_interpolation_surface.ipynb](925_xs_interpolation_surface.ipynb), and [930_terrain_modification_analysis.ipynb](930_terrain_modification_analysis.ipynb) - terrain and geometry surface workflows.
+- [917_mrms_precipitation_qpe.ipynb](917_mrms_precipitation_qpe.ipynb) - MRMS source inspection and spatially averaged, uniform precipitation-boundary comparisons. Use [924_mrms_netcdf_rain_on_grid.ipynb](924_mrms_netcdf_rain_on_grid.ipynb) for spatial MRMS forcing through direct NetCDF rain-on-grid.
+- [920_terrain_creation.ipynb](920_terrain_creation.ipynb), [925_xs_interpolation_surface.ipynb](925_xs_interpolation_surface.ipynb), [930_terrain_modification_analysis.ipynb](930_terrain_modification_analysis.ipynb), and [931_native_rasmapper_terrain_export.ipynb](931_native_rasmapper_terrain_export.ipynb) - terrain creation, analysis, and native registered-terrain export workflows.
 - [950_ebfe_spring_creek.ipynb](950_ebfe_spring_creek.ipynb) through [958_model_sources_showcase.ipynb](958_model_sources_showcase.ipynb) - FEMA eBFE/BLE organization and validation.
 - [960_cloud_native_geometry_export.ipynb](960_cloud_native_geometry_export.ipynb) through [962_cloud_native_cog_results_export.ipynb](962_cloud_native_cog_results_export.ipynb) - cloud-native export with `ras2cng`.
+
+## Floodway example status
+
+Notebooks 223 and 311 have been withdrawn pending engineering qualification.
+Steady encroachment parsing and 2D solver application are not established by
+those examples' prior outputs. See the
+[floodway diagnostic scope](../docs/user-guide/quality-assurance/floodway-check.md)
+for experimental API status and the evidence required before restoring them.
 
 ## Current Inventory
 
@@ -69,7 +77,7 @@ projects, and generated artifacts are intentionally excluded from this README.
 `217_1d_levee_authoring.ipynb`, `218_infiltration_base_override_authoring.ipynb`,
 `219_1d_bridge_xs_plotting.ipynb`,
 `220_calibration_workflow.ipynb`, `221_calibration_1d_workflow.ipynb`,
-`222_steady_flow_calibration.ipynb`, `223_steady_floodway_encroachment.ipynb`,
+`222_steady_flow_calibration.ipynb`,
 `224_steady_flow_authoring.ipynb`, `225_fixit_blocked_obstructions.ipynb`,
 `226_2d_connection_culvert_invert_validation.ipynb`,
 `227_2d_connection_culvert_authoring.ipynb`, `228_mannings_n_from_nlcd.ipynb`,
@@ -81,7 +89,7 @@ projects, and generated artifacts are intentionally excluded from this README.
 ### 300s - Unsteady Flow & DSS
 
 `300_unsteady_flow_operations.ipynb`, `301_flow_hydrograph_optimization.ipynb`,
-`310_dss_boundary_extraction.ipynb`, `311_2d_floodway_encroachment.ipynb`,
+`310_dss_boundary_extraction.ipynb`,
 `312_boundary_df_qmult_dss_paths.ipynb`, `313_hms_to_ras_boundary_matching.ipynb`,
 `314_reference_line_generation.ipynb`, `315_2d_computation_options.ipynb`,
 `316_terrain_modifications.ipynb`, `317_restart_file_settings.ipynb`,
@@ -116,7 +124,8 @@ projects, and generated artifacts are intentionally excluded from this README.
 `720_precipitation_methods_comprehensive.ipynb`,
 `721_precipitation_hyetograph_comparison.ipynb`,
 `722_gridded_precipitation_atlas14.ipynb`, `723_storm_generator_abm_validation.ipynb`,
-`725_atlas14_spatial_variance.ipynb`, `726_abm_hyetograph_grid.ipynb`
+`725_atlas14_spatial_variance.ipynb`, `726_abm_hyetograph_grid.ipynb`,
+`729_direct_geotiff_gridded_rain_on_grid.ipynb`
 
 ### 800s - Quality Assurance
 
@@ -147,13 +156,15 @@ projects, and generated artifacts are intentionally excluded from this README.
 ### 920s - Terrain & Surfaces
 
 `920_terrain_creation.ipynb`, `925_xs_interpolation_surface.ipynb`,
-`930_terrain_modification_analysis.ipynb`
+`930_terrain_modification_analysis.ipynb`,
+`931_native_rasmapper_terrain_export.ipynb`
 
 ### 950s - eBFE Delivery
 
 `950_ebfe_spring_creek.ipynb`, `951_ebfe_north_galveston_bay.ipynb`,
 `952_ebfe_upper_guadalupe_cascade.ipynb`, `953_ebfe_rio_hondo_steady_collection.ipynb`,
 `954_ebfe_lake_maurepas_validation.ipynb`, `955_ebfe_tickfaw_validation.ipynb`,
+`956_hydrofabric_conflation_visual_qa.ipynb`,
 `957_ebfe_spring_river_validation.ipynb`, `958_model_sources_showcase.ipynb`
 
 ### 960s - Cloud-Native Export

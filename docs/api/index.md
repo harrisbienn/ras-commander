@@ -2,6 +2,11 @@
 
 This section provides documentation for the RAS Commander Python API.
 
+Use the [capability map](../capabilities.md) to choose an operation by its inputs
+and outputs. The [example catalog](../examples/index.md) adds selected runtime
+requirements and evidence scope; the [execution contract](../user-guide/plan-execution.md#execution-capabilities-and-return-values)
+explains single-plan and batch return semantics.
+
 ## Core Classes
 
 Primary classes for project management and execution:
@@ -19,6 +24,15 @@ Primary classes for project management and execution:
 - [`RasProcess`](core.md#rasprocess) - RasProcess.exe CLI automation, stored maps, and native reference validators
 - [`RasControl`](core.md#rascontrol) - Legacy COM interface
 
+<a id="rasmapper-and-automated-mesh-generation"></a>
+
+## Meshing and Spatial Operations
+
+- [Meshing](meshing.md) — generation, layout/cell diagnostics, containment, BC conflicts, repairs, and property tables
+- [RASMapper](rasmapper/index.md) — screenshots, map/geometry layers, display, associations, and geometry completion
+- [Results Queries](results-queries.md) — offline sampling, native profiles, and recorded reference hydrographs
+- [Stored Maps](stored-maps.md) — export existing results to raster products
+
 ## Benefits Analysis
 
 Rasterized depth-comparison benefits and mesh-based WSE comparison:
@@ -28,6 +42,33 @@ Rasterized depth-comparison benefits and mesh-based WSE comparison:
 - [`BenefitAreaResult`](benefits.md#calculate-from-existing-depth-rasters) - Raster paths, thresholds, and class-area statistics
 - [`HdfBenefitAreas`](benefits.md#raster-benefitarea-versus-hdfbenefitareas) - Separate 2D mesh/WSE benefit and rise analysis
 
+## ras2fim-2D Flood Inundation Mapping (Optional)
+
+- [`RasFim`](fim.md) - Batch depth/WSE rasters and floodplain polygons from 2D cell WSE profiles with the ras2fim-2D Step 05 method and the separate `ras2fim-batch` engine; bounding-box or polygon AOI; product manifest
+
+## Hydrofabric Conflation
+
+- [`RasNetworkConflation`](hydrofabric.md) - Extent-first network-edge classification with optional multi-criteria QA
+- [`NetworkEdgeCoverageResult`](hydrofabric.md#extent-first-edge-classification) - One model–edge row with inside length and fraction
+- [`NetworkConflationResult`](hydrofabric.md#advanced-reach-edge-candidate-audit) - Resolved matches, ranked candidates, reach metrics, and HUC intersections
+- [`NetworkAdapter`](hydrofabric.md#hydrofabric-adapters) - Generic directed-network schema normalization used by NHDPlus, NWM, NextGen, and custom adapters
+
+## 1D Breakout Extraction
+
+- [`RasBreakout1D`](breakout-1d.md) - Single- and multi-source steady 1D breakout selection, assembly, restationing, validation, execution, and comparison
+- [`Breakout1DSelection`](breakout-1d.md#select-a-reach-slice) - Resolved contiguous cross-section selection
+- [`Breakout1DSourceCatalog`](breakout-1d.md#catalog-multiple-source-models) - GeoParquet-ready source model, footprint, centerline, and cross-section catalog
+- [`Breakout1DPlan`](breakout-1d.md#plan-one-network-edge-across-multiple-models) - Confirmed source reaches, directed ownership slices, provisional seams, and fail-closed handoff diagnostics
+- [`Breakout1DResult`](breakout-1d.md#extract-and-validate) - Independent project artifacts, validation, and boundary provenance
+
+## 2D Breakout Geometry Preparation
+
+- [`RasBreakout2D`](breakout-2d.md) - Pure-2D qualification, component cloning, geometry trimming/remeshing, and parent-flux review without boundary authoring or plan execution
+- [`Breakout2DSpec`](breakout-2d.md#qualify-the-proposed-child-domain) - Source plan, 2D area, and contained child-boundary contract
+- [`Breakout2DPreflight`](breakout-2d.md#qualify-the-proposed-child-domain) - Spatial checks, feature dispositions, and existing-boundary inventory
+- [`Breakout2DPreparationResult`](breakout-2d.md#clone-associations-and-prepare-geometry) - Clone associations, mesh audit, and byte-identical unsteady-file evidence
+- [`Breakout2DFluxReview`](breakout-2d.md#review-parent-face-flux-locations) - Oriented parent-face series and unassigned candidate flux zones
+
 ## HDF Modules
 
 Classes for reading HDF result files:
@@ -36,8 +77,8 @@ Classes for reading HDF result files:
 - [`HdfPlan`](hdf.md#hdfplan) - Plan information
 - [`HdfMesh`](hdf.md#hdfmesh) - Mesh geometry
 - [`HdfResultsMesh`](hdf.md#hdfresultsmesh) - 2D mesh results
-- [`HdfResultsProducts`](hdf.md#hdfresultsproducts) - Deterministic hydraulic
-  product package
+- [`HdfResultsProducts`](hdf.md#hdfresultsproducts) - Completed-result
+  inspection and deterministic hydraulic product contracts
 - [`HdfResultsPlan`](hdf.md#hdfresultsplan) - Plan-level results
 - [`HdfResultsXsec`](hdf.md#hdfresultsxsec) - 1D cross-section results
 - [`HdfStruc`](hdf.md#hdfstruc) - Structure data
@@ -59,9 +100,9 @@ Classes for parsing and authoring geometry files:
 - [`GeomBcLines`](geometry.md#geombclines) - 2D boundary condition line authoring
 - [`GeomLateral`](geometry.md#geomlateral) - Lateral structure parsing
 - [`GeomStorage`](geometry.md#geomstorage) - Storage area and 2D flow area writing
-- [`GeomLevee`](geometry.md#geomlevee) - Levee read/write
+- [Cross-section levees](geometry.md#cross-section-levees) - `GeomCrossSection` levee read/write
 - [`RasGeometryUtils`](geometry.md#rasgeometryutils) - Parsing utilities
-- [`RasStruct`](geometry.md#rasstruct) - Inline structures
+- [`GeomInlineWeir`, `GeomBridge`, and `GeomCulvert`](geometry.md#structure-apis) - Inline structures
 - [`RasBreach`](geometry.md#rasbreach) - Breach parameters
 
 ## Terrain Modules
@@ -69,7 +110,7 @@ Classes for parsing and authoring geometry files:
 Classes for terrain creation, modification writing, and terrain-modification
 analysis:
 
-- [`RasTerrain`](terrain.md#rasterrain) - Terrain HDF creation from rasters
+- [`RasTerrain`](terrain.md#rasterrain) - Terrain HDF creation and native registered-terrain GeoTIFF export
 - [`RasTerrainModWriter`](terrain.md#rasterrainmodwriter) / `RasTerrainModification` - Line and polygon terrain modification HDF/.rasmap writing
 - [`RasTerrainMod`](terrain.md#rasterrainmod) - Terrain profile and volume comparison with modifications applied
 
@@ -77,15 +118,26 @@ analysis:
 
 Automated geometry repair:
 
-- [`RasFixit`](fixit.md#rasfixit) - Fix blocked obstruction overlaps
+- [`RasFixit`](fixit.md#rasfixit) - Obstructions, HTAB starting elevations, bank stations, ineffective areas, and Manning’s n
 - [`FixResults`](fixit.md#fixresults) - Fix operation results
 - [`log_parser`](fixit.md#log-parser) - HEC-RAS log parsing for error detection
 
 ## DSS Modules
 
-Classes for reading DSS files:
+Classes for reading and writing DSS files:
 
 - [`RasDss`](dss.md#rasdss) - DSS file operations
+
+## Containers and Slurm
+
+- [`RasDocker`](containers.md#rasdocker) - Wine preprocessing and native Linux computation
+- [`ContainerResult`](containers.md#containerresult) / [`ContainerBatchResult`](containers.md#containerbatchresult) - Stage and batch outcomes
+- [`RasPortableDocker`](remote.md#rasportabledocker-source-reference) - Portable request execution through Docker
+- [`RasSlurm`](remote.md#rasslurm-source-reference) - Portable request pools on Slurm/Apptainer
+- [`RasApptainer`](remote.md#rasapptainer-source-reference) - Prepared native unsteady plans on Slurm
+
+Compare [execution backends](../user-guide/execution-backends.md) and select a
+compatible image from the [container catalog](../user-guide/container-images.md).
 
 ## Remote Modules
 
@@ -99,7 +151,10 @@ Classes for distributed execution:
 
 ## Usage Pattern
 
-All primary classes use static methods:
+Most operation classes, such as `RasCmdr` and `HdfMesh`, are static namespaces.
+Call them directly. `RasPrj`, workers, result records, and configuration objects
+are instances; follow their constructors rather than applying this pattern to
+every exported type:
 
 ```python
 # No instantiation needed
@@ -116,7 +171,8 @@ RAS Commander uses two key decorators that affect method behavior:
 
 ### @standardize_input
 
-Automatically converts various input types to the correct HDF file path. This decorator is applied to all HDF methods.
+Automatically converts various input types to the correct HDF file path. Input support is method-specific; use the documented signature and decorator
+for the selected method. Some low-level readers require an explicit path.
 
 **Accepted Input Types:**
 
@@ -130,7 +186,7 @@ Automatically converts various input types to the correct HDF file path. This de
 
 **file_type Parameter:**
 
-```python
+```text
 @standardize_input(file_type='plan_hdf')  # Default - looks for .p##.hdf
 @standardize_input(file_type='geom_hdf')  # Looks for .g##.hdf
 @standardize_input(file_type='plan')      # Looks for .p## (plain text)
@@ -139,6 +195,7 @@ Automatically converts various input types to the correct HDF file path. This de
 **Usage Examples:**
 
 ```python
+from pathlib import Path
 from ras_commander import HdfResultsMesh, init_ras_project
 
 init_ras_project("/path/to/project", "6.5")

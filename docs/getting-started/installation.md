@@ -1,5 +1,10 @@
 # Installation
 
+The website documents `main`, which can be ahead of the released package.
+Check the [release notes](../development/release-notes.md) before using an
+unreleased API, and retain your package version or source commit alongside
+the HEC-RAS version in reproducible workflows.
+
 ## Requirements
 
 - **Python**: 3.10 or higher (3.13 recommended for new installations)
@@ -60,8 +65,8 @@ RAS Commander uses two standard environment names:
 conda create -n RasCommander python=3.13
 conda activate RasCommander
 
-# Install ras-commander
-pip install ras-commander
+# Install ras-commander with the dependencies the examples and notebooks use
+pip install "ras-commander[full]"
 
 # Install Jupyter (for notebooks)
 pip install jupyter ipykernel
@@ -71,16 +76,97 @@ python -m ipykernel install --user --name RasCommander --display-name "Python (R
 !!! tip "Quick Install"
     For a quick install without Jupyter:
     ```bash
-    pip install --upgrade ras-commander
+    pip install --upgrade "ras-commander[full]"
     ```
 
-## Core Dependencies
+## Installation Profiles
 
 These are installed automatically with `pip install ras-commander`:
 
 ```bash
-h5py numpy pandas requests tqdm scipy xarray geopandas matplotlib shapely rasterstats rtree pywin32 psutil
+h5py numpy pandas
+ras-commander-fast-hdf   # Windows x64, Linux x64 and macOS arm64 only
 ```
+
+`ras-commander-fast-hdf` is ras-commander's default HDF engine, written in
+Rust. On the three platforms above, pip installs its binary wheel; no Rust
+toolchain or HDF5 C library is needed. Public `Hdf*` results are identical to
+the h5py reference implementation, and large reads, such as 2D cell polygons
+and mesh time series on large meshes, are faster. In the default `auto` mode,
+any read the engine refuses uses h5py.
+
+- **Turn it off:** set `RAS_COMMANDER_FAST_HDF=h5py` before the first HDF
+  read. Every read then uses h5py.
+- **Other platforms** (for example Linux aarch64, macOS x86_64 or Windows
+  ARM64): pip does not install the engine, and ras-commander uses h5py for
+  every read with the same results. `pip install "ras-commander[fast]"`
+  requests the engine anyway and builds it from source, which needs Rust.
+- **Linux x64 without a compatible wheel** (glibc older than 2.28, or musl, for
+  example Alpine) and free-threaded CPython builds: the dependency still
+  applies, so pip tries to build the engine from source. Install a Rust
+  toolchain, or run `pip install h5py numpy pandas` and then
+  `pip install --no-deps ras-commander` to use h5py.
+- **Check which engine is available:**
+  `python -c "from ras_commander import fast_hdf; print(fast_hdf.available())"`
+  prints `True` when the native engine is installed and compatible.
+
+The `fast` and `fast-hdf` extras are no longer needed; they remain so existing
+install commands keep working. See
+[Native Rust HDF engine](../native-engine.md) for modes, qualification and
+performance.
+
+The core install supports project inventory: `init_ras_project()` and the
+project DataFrames, including geometry counts read from geometry HDF files.
+Downloading example projects with
+`RasExamples.extract_project()` also needs `requests`. Without it, the call
+raises an `ImportError` that names the `full` extra. Geospatial, plotting, and
+precipitation APIs need the `full` extra.
+
+For command-line HEC-RAS execution and compute-message parsing without
+RasControl/COM or the full geospatial stack:
+
+```bash
+pip install "ras-commander[compute]"
+```
+
+The `execution` extra is an alias for `compute`. Both add psutil and, on
+Windows, pywin32 for the normal process and dialog supervision used by
+`RasCmdr.compute_plan()`.
+
+The `compute` install reads results that are returned as pandas DataFrames.
+Examples are plan-level results from `HdfResultsPlan` (compute messages,
+runtime, and volume accounting) and geometry-free 2D mesh summary values from
+`HdfResultsMesh.get_mesh_summary_values()`. The HDF result classes import
+without the optional packages. Functions that return an xarray object (time
+series such as `HdfResultsMesh.get_mesh_timeseries()` and
+`HdfResultsXsec.get_xsec_timeseries()`) need xarray. Functions that return a
+GeoDataFrame (such as `HdfResultsMesh.get_mesh_max_ws()` and
+`HdfResultsMesh.get_mesh_max_depth()`) need geopandas. Without the package,
+these functions raise an `ImportError` that names the package and the install
+command. Most per-cell readers also return a typed pandas table with
+`include_geometry=False`, which works without geopandas; see
+[Typed tables without geometry](../user-guide/hdf-data-extraction.md#typed-tables-without-geometry).
+To add the complete results stack to a `compute` install:
+
+```bash
+pip install "ras-commander[compute,full]"
+```
+
+For the historical complete feature dependency set, including geospatial,
+plotting, scientific, precipitation, and remote-data dependencies:
+
+```bash
+pip install "ras-commander[full]"
+```
+
+Use `ras-commander[all]` when you also want every optional backend and
+integration. Extras are additive and can be combined.
+
+!!! note "Compute extra scope"
+    The extra controls Python dependencies only; it does not install HEC-RAS or
+    Wine. It preserves the normal `RasCmdr.compute_plan()` behavior, including
+    project/result DataFrame refresh after execution. It does not expose a
+    reduced-refresh execution mode and does not route computation through COM.
 
 ## Optional Dependencies
 
@@ -139,7 +225,10 @@ winetricks -q corefonts     # Arial, Times New Roman, etc.
     Verified on the CLB07 Proxmox container `ras2cng-wine` (Debian 13, Wine 11.0). Custom `wine_executable` paths or wrappers are supported; helper tools such as `winepath` are resolved automatically.
 
 !!! note "Scope"
-    Wine support covers wrapped `RasProcess.exe` workflows. Full HEC-RAS simulation (`Ras.exe`) still requires Windows. HDF analysis and Python-native geometry association writes work on Linux without Wine.
+    Wine support covers wrapped `RasProcess.exe` workflows. Full HEC-RAS
+    simulation (`Ras.exe`) still requires Windows. Read-only HDF analysis works
+    on Linux without Wine; native geometry association requires the applicable
+    HEC-RAS/RASMapper runtime.
 
 **Verify installation**:
 

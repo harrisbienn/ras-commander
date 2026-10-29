@@ -8,11 +8,9 @@ Available Workers:
     - PsexecWorker: Windows remote execution via PsExec (IMPLEMENTED)
     - LocalWorker: Local parallel execution using RasCmdr.compute_plan() (IMPLEMENTED)
     - DockerWorker: Linux container execution using HEC-RAS 6.6 (IMPLEMENTED, requires: docker)
-    - SshWorker: SSH-based remote execution (stub, requires: paramiko)
-    - WinrmWorker: WinRM-based remote execution (stub, requires: pywinrm)
-    - SlurmWorker: HPC cluster execution (stub)
-    - AwsEc2Worker: AWS EC2 cloud execution (stub, requires: boto3)
-    - AzureFrWorker: Azure cloud execution (stub, requires: azure-*)
+
+For Slurm/HPC clusters, use ``RasSlurm`` (portable request pool) or
+``RasApptainer`` (Apptainer containers) rather than a worker.
 
 Usage:
     from ras_commander import init_ras_worker, compute_parallel_remote
@@ -25,11 +23,7 @@ Usage:
 
 Installation Options:
     pip install ras-commander                    # Base (includes PsExec worker)
-    pip install ras-commander[remote-ssh]        # + SSH worker
-    pip install ras-commander[remote-winrm]      # + WinRM worker
     pip install ras-commander[remote-docker]     # + Docker worker
-    pip install ras-commander[remote-aws]        # + AWS EC2 worker
-    pip install ras-commander[remote-azure]      # + Azure worker
     pip install ras-commander[remote-all]        # All remote backends
 """
 
@@ -39,15 +33,45 @@ from .RasWorker import RasWorker, init_ras_worker, load_workers_from_json
 # Worker implementations
 from .PsexecWorker import PsexecWorker
 from .LocalWorker import LocalWorker
-from .SshWorker import SshWorker
-from .WinrmWorker import WinrmWorker
 from .DockerWorker import DockerWorker
-from .SlurmWorker import SlurmWorker
-from .AwsEc2Worker import AwsEc2Worker
-from .AzureFrWorker import AzureFrWorker
 
 # Execution functions
 from .Execution import compute_parallel_remote, ExecutionResult, get_worker_status
+
+# Portable one-core steady execution contract and result validation.
+# ``PortableExecution.execute_request`` is intentionally not re-exported here:
+# ``ras_commander.remote.execute_request`` is the CLI submodule, and importing it
+# would rebind a same-named package attribute.
+from .ExecutionContract import (
+    PreprocessPolicy,
+    RasExecutionReceipt,
+    RasExecutionRequest,
+    StoredMapsRequest,
+    validate_execution_receipt,
+)
+from .PortableExecution import validate_steady_results, validate_unsteady_results
+# Imported eagerly (stdlib-only dependencies) so the class, not the same-named
+# submodule, is the package attribute after ``import ...remote.RasPortableDocker``.
+from .RasPortableDocker import (
+    PortableDockerExecutionResult,
+    PortableDockerPoolResult,
+    RasPortableDocker,
+)
+
+# ras_commander.RasSlurm imports this package, so its names resolve lazily.
+_PORTABLE_SLURM_EXPORTS = {
+    'RasSlurm', 'SlurmCollection', 'SlurmSiteConfig', 'SlurmStatus',
+    'SlurmSubmission', 'SlurmTaskAccounting', 'SlurmTransportConfig',
+}
+
+
+def __getattr__(name):
+    """Resolve the portable Slurm adapter names on first access."""
+    from importlib import import_module
+
+    if name in _PORTABLE_SLURM_EXPORTS:
+        return getattr(import_module("..RasSlurm", __name__), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     # Base class
@@ -56,12 +80,7 @@ __all__ = [
     # Worker implementations
     'PsexecWorker',
     'LocalWorker',
-    'SshWorker',
-    'WinrmWorker',
     'DockerWorker',
-    'SlurmWorker',
-    'AwsEc2Worker',
-    'AzureFrWorker',
 
     # Functions
     'init_ras_worker',
@@ -69,4 +88,23 @@ __all__ = [
     'compute_parallel_remote',
     'ExecutionResult',
     'get_worker_status',
+    'validate_steady_results',
+    'validate_unsteady_results',
+
+    # Portable one-core steady execution
+    'PreprocessPolicy',
+    'RasExecutionRequest',
+    'RasExecutionReceipt',
+    'StoredMapsRequest',
+    'validate_execution_receipt',
+    'RasPortableDocker',
+    'PortableDockerExecutionResult',
+    'PortableDockerPoolResult',
+    'RasSlurm',
+    'SlurmSiteConfig',
+    'SlurmTransportConfig',
+    'SlurmSubmission',
+    'SlurmStatus',
+    'SlurmTaskAccounting',
+    'SlurmCollection',
 ]

@@ -18,11 +18,13 @@ import numpy as np
 import pandas as pd
 
 from .Decorators import log_call
+from .fast_hdf import read_attr, read_typed
 from .LoggingConfig import get_logger
 from .RasPlan import RasPlan
 from .RasPrj import ras
 from .RasUtils import RasUtils
 from . import _land_classification_helper as _lch
+from .fast_hdf import h5py_until_qualified
 
 logger = get_logger(__name__)
 
@@ -54,7 +56,14 @@ _POLYGON_POINTS_ATTRS = {
 
 
 class RasEncroachments:
-    """Static helpers for 2D floodway encroachment authoring."""
+    """Experimental helpers for 2D floodway GIS-input authoring.
+
+    Input readback is distinct from solver application. In the withdrawn
+    notebook 311, the HEC-RAS 6.6 run returned completion booleans but no native
+    unsteady encroachment result arrays and zero maximum-WSE differences.
+    Hydraulic application of these authored inputs remains unqualified; see
+    the floodway-check guide. The GIS authoring APIs remain available.
+    """
 
     @staticmethod
     @log_call
@@ -232,14 +241,14 @@ class RasEncroachments:
             group = hdf[_ENCROACHMENTS_GROUP]
             if "Base Plan Filename" in group.attrs:
                 settings["base_plan_filename"] = _decode_hdf_string(
-                    group.attrs["Base Plan Filename"]
+                    read_attr(group, "Base Plan Filename")
                 )
             if "Maximum Target Rise" in group.attrs:
-                settings["maximum_target_rise"] = float(group.attrs["Maximum Target Rise"])
+                settings["maximum_target_rise"] = float(read_attr(group, "Maximum Target Rise"))
             if "Fill Slope" in group.attrs:
-                settings["fill_slope"] = float(group.attrs["Fill Slope"])
+                settings["fill_slope"] = float(read_attr(group, "Fill Slope"))
             if "Additional Fill" in group.attrs:
-                settings["additional_fill"] = float(group.attrs["Additional Fill"])
+                settings["additional_fill"] = float(read_attr(group, "Additional Fill"))
         return settings
 
     @staticmethod
@@ -284,7 +293,12 @@ class RasEncroachments:
         ras_object=None,
     ) -> Dict[str, Any]:
         """
-        Create or configure a 2D floodway encroachment plan from structured input.
+        Create or configure experimental 2D floodway GIS inputs.
+
+        This authors files and layers; it does not establish that the solver
+        applies the encroachment. The retained notebook 311 run had no native
+        encroachment result arrays and all compared maximum-WSE differences
+        were zero. Independently qualify solver application before study use.
 
         When ``new_plan_shortid`` or ``new_title`` is supplied, ``template_plan``
         is cloned with :meth:`RasPlan.clone_plan` before authoring the companion
@@ -671,6 +685,7 @@ def _build_attribute_array(records: Sequence[Dict[str, Any]], feature_kind: str)
     raise ValueError(f"Unsupported feature kind: {feature_kind}")
 
 
+@h5py_until_qualified
 def _read_feature_table(
     hdf_path: Optional[Path],
     group_path: str,
@@ -686,10 +701,10 @@ def _read_feature_table(
         if not all(name in group for name in ("Attributes", "Polygon Info", "Polygon Parts", "Polygon Points")):
             return []
 
-        attrs = group["Attributes"][:]
-        polygon_info = group["Polygon Info"][:]
-        polygon_parts = group["Polygon Parts"][:]
-        polygon_points = group["Polygon Points"][:]
+        attrs = read_typed(group["Attributes"], slice(None))
+        polygon_info = read_typed(group["Polygon Info"], slice(None))
+        polygon_parts = read_typed(group["Polygon Parts"], slice(None))
+        polygon_points = read_typed(group["Polygon Points"], slice(None))
 
         records = []
         for fid, row in enumerate(attrs):

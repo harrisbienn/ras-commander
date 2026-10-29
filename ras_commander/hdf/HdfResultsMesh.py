@@ -42,9 +42,13 @@ Understanding when each return type is used:
 
 ## Public Functions
 - get_mesh_summary(): Get summary output data for a variable → gpd.GeoDataFrame
+- get_mesh_summary_values(): Get summary values without geometry → pd.DataFrame
 - get_mesh_timeseries(): Get timeseries for one mesh/variable → xr.DataArray
+- iter_mesh_timeseries(): Stream bounded time-major xarray batches
+- inspect_mesh_series_raw(): Untyped stored identity/attrs/refusal diagnostic → dict
 - get_mesh_faces_timeseries(): Get face variables for one mesh → xr.Dataset
 - get_mesh_cells_timeseries(): Get cell timeseries for all meshes → Dict[str, xr.Dataset]
+- get_mesh_timeseries_availability(): Report per-dataset series availability → pd.DataFrame
 - get_mesh_last_iter(): Get last iteration count → pd.DataFrame
 - get_mesh_max_ws(): Get maximum water surface → gpd.GeoDataFrame
 - get_mesh_min_ws(): Get minimum water surface → gpd.GeoDataFrame
@@ -77,20 +81,198 @@ HdfUtils for common operations. Methods use @log_call decorator for logging and
 
 """
 
+from __future__ import annotations
+
+
+import operator
+import re
+from pathlib import Path
+from types import MappingProxyType
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Union,
+    overload,
+)
+
+import h5py
 import numpy as np
 import pandas as pd
-import xarray as xr
-from pathlib import Path
-import h5py
-from typing import Union, List, Optional, Dict, Any, Tuple
-from .HdfMesh import HdfMesh
-from .HdfBase import HdfBase
-from .HdfUtils import HdfUtils
+
+from .._optional_deps import (
+    OptionalDependencyError,
+    optional_module,
+    require_module,
+)
+from .._rasmap_schema import rasmap_dataframe_is_usable
 from ..Decorators import log_call, standardize_input
-from ..LoggingConfig import setup_logging, get_logger
-import geopandas as gpd
+from ..LoggingConfig import get_logger
+from .. import fast_results
+from ..fast_hdf import (
+    FastHdfError,
+    mesh_series_domain,
+    native_required,
+    read_attr,
+    read_attrs,
+    read_dataset,
+    read_typed,
+    reraise_required,
+)
+from .HdfBase import HdfBase
+from .HdfMesh import HdfMesh
+from .HdfResultView import HdfResultView, Selection
+from .HdfUtils import HdfUtils
+from ._raster_interpolation import (
+    _build_interpolator, _nearest_grid_indices, _write_interpolated_raster,
+)
+
+gpd = optional_module("geopandas", "Returning GeoDataFrame results from HdfResultsMesh")
+xr = optional_module("xarray", "Returning xarray results from HdfResultsMesh")
 
 logger = get_logger(__name__)
+
+# Meshes already reported as lacking 'Cell Count' (warn once per mesh name).
+_UNKNOWN_CELL_COUNT_WARNED: set = set()
+
+HdfInput = Union[int, str, Path, h5py.File]
+
+
+# Stable-core schema for Base Output/Unsteady Time Series/2D Flow Areas only.
+# Observed without Location in HEC-RAS 5.0.7 (e.g. FEMA eBFE AustinOyster.p03.hdf);
+# shared names remain compatible with supported 6.x/7.x output and API fixtures.
+# Minimal excerpts may omit File Version. These exact rules still apply; future
+# version-specific names require separate qualification, not convenience lists.
+_LEGACY_MESH_SERIES_DOMAINS = MappingProxyType({
+    "Depth": "cell_id",
+    "Water Surface": "cell_id",
+    "Face Velocity": "face_id",
+    "Face Shear Stress": "face_id",
+    "Face Area": "face_id",
+    "Face Manning's n": "face_id",
+})
+
+_BASE_OUTPUT_TIME_PATH = (
+    "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Time"
+)
+
+
+class MeshSeriesAvailabilityError(ValueError):
+    """A Base Output mesh series whose stored rows differ from the Time axis.
+
+    Raised identically by eager, lazy-view and streamed mesh time-series
+    reads (and by explicit-variable multi-variable reads). It subclasses
+    ``ValueError`` and keeps the historical message prefix, so existing
+    handlers continue to work. The dataset is never broadcast, truncated,
+    padded or re-timed to fit the clock.
+
+    Attributes:
+        dataset_path: Absolute HDF path of the refused dataset.
+        rows: Stored leading (time) dimension of the dataset.
+        time_rows: Length of the Base Output ``Time`` axis.
+        stored_bytes: Bytes of data the producer actually stored
+            (``h5py`` ``get_storage_size()``).
+        disposition: ``"unwritten_placeholder"`` when the producer stored no
+            data at all (``stored_bytes == 0``). Its readable values are only
+            the HDF5 fill value, not results, so the series is unavailable.
+            HEC-RAS 6.6 and 7.0.1 leave ``Face Wind Term`` (no wind forcing)
+            and 6.6 leaves ``Face Water Surface`` this way: an extendable
+            one-row dataset with no stored chunks beside a longer clock.
+            ``"row_count_mismatch"`` when stored data exists but its rows
+            differ from the clock; the alignment is unknown.
+    """
+
+    def __init__(
+        self,
+        dataset_path: str,
+        rows: int,
+        time_rows: int,
+        stored_bytes: int,
+    ) -> None:
+        self.dataset_path = dataset_path
+        self.rows = int(rows)
+        self.time_rows = int(time_rows)
+        self.stored_bytes = int(stored_bytes)
+        if self.stored_bytes == 0:
+            self.disposition = "unwritten_placeholder"
+            detail = (
+                "unwritten placeholder: the producer stored no data for this "
+                "dataset, so its values are HDF5 fill values, not results; "
+                "the series is unavailable"
+            )
+        else:
+            self.disposition = "row_count_mismatch"
+            detail = (
+                "row count mismatch: stored rows cannot be aligned with the "
+                "Time axis"
+            )
+        super().__init__(
+            f"Series rows differ from Base Output Time axis: {dataset_path} "
+            f"(rows={self.rows}, Time rows={self.time_rows}, "
+            f"stored bytes={self.stored_bytes}; {detail}). See "
+            "HdfResultsMesh.get_mesh_timeseries_availability()."
+        )
+
+    @classmethod
+    def from_dataset(
+        cls, dataset: h5py.Dataset, time_rows: int
+    ) -> "MeshSeriesAvailabilityError":
+        """Build the error from an open dataset and the clock length."""
+        return cls(
+            dataset.name,
+            dataset.shape[0],
+            time_rows,
+            dataset.id.get_storage_size(),
+        )
+
+
+# Legacy 2D solver convergence log: Base Output/Unsteady Time Series/2D Flow
+# Areas/<mesh>/Log Hydraulics. A per-mesh table, not a cell or face series.
+# Field labels are the producer's own "Column N" attributes; the accepted label
+# strings are exactly those embedded in RasUnsteady.exe 6.0, 6.1, 6.2, 6.3 and
+# 6.3.1 (absent from the 5.0.x and 6.4.1+ binaries). One authentic 6.3.1
+# output was inspected. Columns with a single producer label have a fixed
+# unit suffix regardless of Units System, so that suffix is not unit evidence.
+_LOG_HYDRAULICS_NAME = "Log Hydraulics"
+_LOG_HYDRAULICS_VERSION_BOUNDS = ((6, 0), (6, 4))  # inclusive lower, exclusive upper
+_LOG_HYDRAULICS_COLUMNS = (
+    ("total_iterations", ("Total iterations",), "count"),
+    ("outer_loop_iterations", ("Outer-loop iterations",), "count"),
+    ("inner_loop_iterations", ("Inner-loop iterations",), "count"),
+    ("outer_loop_max_water_surface_correction", (
+        "Outer-loop max water surface correction (ft)",
+        "Outer-loop max water surface correction (m)",
+    ), "length"),
+    ("max_water_surface_correction_cell_location", (
+        "Cell location of max water surface correction",
+    ), "cell_location"),
+    ("inner_loop_max_volume_residual_per_wet_area", (
+        "Inner-loop max volume residual divided by wet area (ft)",
+    ), "length"),
+    ("max_volume_residual_cell_location", (
+        "Cell location of max volume residual divided by wet area",
+    ), "cell_location"),
+    ("total_volume_balance", (
+        "Total volume balance (ft^3)",
+        "Total volume balance (m^3)",
+    ), "volume"),
+    ("max_water_surface_elevation", (
+        "Max water surface elevation (ft)",
+        "Max water surface elevation (m)",
+    ), "length"),
+    ("min_water_surface_elevation", (
+        "Min water surface elevation (m)",
+    ), "length"),
+)
+_LOG_HYDRAULICS_UNIT_FAMILIES = {
+    "US Customary": {"ft", "ft^3"},
+    "SI Units": {"m", "m^3"},
+}
+
 
 class HdfResultsMesh:
     """
@@ -111,7 +293,13 @@ class HdfResultsMesh:
         "Precipitation Rate", "Infiltration Rate", "Evaporation Rate",
         "Percolation Rate", "Groundwater Elevation", "Groundwater Depth",
         "Groundwater Flow", "Groundwater Velocity", "Groundwater Velocity X",
-        "Groundwater Velocity Y"
+        "Groundwater Velocity Y", "Cell Courant",
+        "Cell Divergence Term", "Cell Storage Term", "Cell Water Source Term",
+        "Cell Eddy Viscosity - Eddy Viscosity X",
+        "Cell Eddy Viscosity - Eddy Viscosity Y",
+        "Cell Velocity - Velocity X", "Cell Velocity - Velocity Y",
+        "Cell Volume", "Cell Volume Error", "Cell Water Surface Error",
+        "Cell Flow Balance", "Cell Invert Depth", "Cell Hydraulic Depth",
     ]
 
     MESH_FACE_TIME_SERIES_OUTPUT_VARS = [
@@ -119,62 +307,196 @@ class HdfResultsMesh:
         "Face Manning's n", "Face Courant", "Face Cumulative Volume",
         "Face Eddy Viscosity", "Face Flow Period Average",
         "Face Friction Term", "Face Pressure Gradient Term",
-        "Face Shear Stress", "Face Tangential Velocity"
+        "Face Shear Stress", "Face Tangential Velocity", "Face Wind Term",
     ]
 
     @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_mesh_summary(hdf_path: Path, var: str, round_to: str = "100ms") -> pd.DataFrame:
-        """
-        Get timeseries output for a specific mesh and variable.
+    def get_mesh_summary_values(
+        hdf_path: HdfInput,
+        var: str,
+        round_to: str = "100ms",
+        include_ghost_cells: bool = False,
+    ) -> pd.DataFrame:
+        """Return mesh summary values without constructing geometry.
 
         Args:
-            hdf_path (Path): Path to the HDF file
-            mesh_name (str): Name of the mesh
-            var (str): Variable to retrieve (see valid options below)
-            truncate (bool): Whether to truncate trailing zeros (default True)
+            hdf_path: Path to the plan result HDF.
+            var: HEC-RAS summary-output variable name.
+            round_to: Time rounding specification for paired time rows.
+            include_ghost_cells: Keep rows for the ghost cells HEC-RAS writes
+                outside the mesh perimeter (default False). Ghost values are
+                placeholders, not solution results. Cell results always carry
+                an ``is_ghost_cell`` column.
 
         Returns:
-            xr.DataArray: DataArray with dimensions:
-                - time: Timestamps
-                - face_id/cell_id: IDs for faces/cells
-                And attributes:
-                - units: Variable units
-                - mesh_name: Name of mesh
-                - variable: Variable name
+            DataFrame with mesh name, cell or face identifier, value, and an
+            optional time column. Cell results add ``is_ghost_cell``. HDF
+            dataset attributes are retained in ``DataFrame.attrs``. No
+            Shapely geometry is constructed.
 
-        Valid variables include:
-            "Water Surface", "Face Velocity", "Cell Velocity X"...
+        Raises:
+            ValueError: If the summary data cannot be read or has an unexpected
+                shape.
+        """
+        try:
+            with h5py.File(hdf_path, "r") as hdf_file:
+                return HdfResultsMesh._get_mesh_summary_values_output(
+                    hdf_file,
+                    var,
+                    round_to,
+                    include_ghost_cells,
+                )
+        except Exception as exc:
+            reraise_required(exc)
+            logger.error("Error reading geometry-free mesh summary: %s", exc)
+            raise ValueError(f"Failed to get mesh summary values: {exc}") from exc
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type='plan_hdf')
+    def get_mesh_summary(
+        hdf_path: HdfInput,
+        var: str,
+        round_to: str = "100ms",
+        include_ghost_cells: bool = False,
+        *,
+        include_geometry: bool = True,
+    ) -> Union[gpd.GeoDataFrame, pd.DataFrame]:
+        """Get spatial summary output for a mesh variable.
+
+        Args:
+            hdf_path: Plan number, plan-result HDF path, or open HDF handle.
+            var: HEC-RAS summary-output variable name, such as
+                ``"Maximum Water Surface"``.
+            round_to: Time rounding specification for paired time rows.
+            include_ghost_cells: Keep rows for the ghost cells HEC-RAS writes
+                outside the mesh perimeter (default False). Ghost values are
+                placeholders, not solution results. Cell results always carry
+                an ``is_ghost_cell`` column.
+            include_geometry: Keyword-only. Default True is the convenient
+                output: a GeoDataFrame with cell/face geometry. False is the
+                fast output: the typed table of
+                :meth:`get_mesh_summary_output` (no geometry, ``str``/``string``
+                mesh_name, ``int64`` IDs, stored value dtype), keyed by
+                ``mesh_name`` and ``cell_id``/``face_id``.
+
+        Returns:
+            GeoDataFrame with mesh name, cell or face identifier, summary
+            values, optional summary times, and cell/face geometry; or the
+            typed DataFrame when ``include_geometry=False``.
+
+        Raises:
+            ValueError: If the summary or geometry cannot be read.
         """
         try:
             with h5py.File(hdf_path, 'r') as hdf_file:
-                return HdfResultsMesh.get_mesh_summary_output(hdf_file, var, round_to)
+                return HdfResultsMesh.get_mesh_summary_output(
+                    hdf_file, var, round_to, include_ghost_cells,
+                    include_geometry=include_geometry,
+                )
+        except OptionalDependencyError:
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error in get_mesh_summary: {str(e)}")
             logger.error(f"Variable: {var}")
             raise ValueError(f"Failed to get summary output: {str(e)}")
 
     @staticmethod
+    @overload
+    def get_mesh_timeseries(
+        hdf_path: HdfInput,
+        mesh_name: str,
+        var: str,
+        truncate: bool = True,
+        *,
+        time_selection: Selection = None,
+        spatial_selection: Selection = None,
+        return_type: Literal["xarray"] = "xarray",
+        include_ghost_cells: bool = False,
+    ) -> xr.DataArray: ...
+
+    @staticmethod
+    @overload
+    def get_mesh_timeseries(
+        hdf_path: HdfInput,
+        mesh_name: str,
+        var: str,
+        truncate: bool = True,
+        *,
+        time_selection: Selection = None,
+        spatial_selection: Selection = None,
+        return_type: Literal["view"],
+        include_ghost_cells: bool = False,
+    ) -> HdfResultView: ...
+
+    @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_mesh_timeseries(hdf_path: Path, mesh_name: str, var: str, truncate: bool = True) -> xr.DataArray:
+    def get_mesh_timeseries(
+        hdf_path: HdfInput,
+        mesh_name: str,
+        var: str,
+        truncate: bool = True,
+        *,
+        time_selection: Selection = None,
+        spatial_selection: Selection = None,
+        return_type: Literal["xarray", "view"] = "xarray",
+        include_ghost_cells: bool = False,
+    ) -> Union[xr.DataArray, HdfResultView]:
         """
         Get timeseries output for a specific mesh and variable.
 
+        Numeric series must match canonical Base Output Time rows. Rank-one
+        time-only series return ``(time,)`` without ghost or spatial coordinates.
+        Rank-two series use authoritative scalar ``Location`` (``Cells``,
+        ``Cell`` or ``Faces``). Only absent Location permits the immutable
+        exact-name legacy schema: Depth/Water Surface are cells; Face Velocity,
+        Face Shear Stress, Face Area and Face Manning's n are faces. These
+        canonical stable-core names support observed 5.0.7 and compatible
+        6.x/7.x output, including excerpts without File Version. Both paths
+        require matching stored geometry counts. Invalid present Location,
+        unknown legacy names and contradictory axes raise ValueError; shape
+        and name substrings never select a domain. ``Cell Hydraulic Depth`` is
+        a literal variable distinct from ``Depth``; no alias is applied.
+
         Args:
-            hdf_path (Path): Path to the HDF file
-            mesh_name (str): Name of the mesh
-            var (str): Variable to retrieve (see valid options below)
-            truncate (bool): Whether to truncate trailing zeros (default True)
+            hdf_path: Plan number, plan-result HDF path, or open HDF handle.
+            mesh_name: Name of the 2D flow area.
+            var: HEC-RAS time-series variable to retrieve.
+            truncate: Whether to truncate leading/trailing zero-only
+                rows (default True). An all-zero selection retains its full
+                time extent. Eager materialization reads once and trims in
+                memory; lazy views defer the bounded scan until needed.
+            time_selection: Source-coordinate integer or forward slice applied
+                before materialization.
+            spatial_selection: Source-coordinate integer or forward slice of
+                cells/faces applied before materialization. Truncation is
+                evaluated over this selected spatial subset.
+            return_type: ``"xarray"`` (default) or opt-in ``"view"``.
+            include_ghost_cells: Keep the ghost-cell columns HEC-RAS writes
+                after the physical cells of a cell variable (default False).
+                Ghost values are placeholders, not solution results. When
+                False, ``spatial_selection`` is clipped to the physical cells,
+                negative positions count back from the last physical cell, and
+                selecting a single ghost cell raises ``ValueError``. Face
+                variables are unaffected.
 
         Returns:
-            xr.DataArray: **Single variable** time series data.
+            xr.DataArray or HdfResultView: **Single variable** time series data.
                 Use DataArray when extracting ONE variable for ONE mesh.
+                ``return_type="view"`` returns a lazy source-backed view.
 
                 Dimensions:
                     - time: Timestamps
                     - face_id/cell_id: IDs for faces/cells
+
+                Coordinates (cell variables, xarray only):
+                    - is_ghost_cell: True for ghost cells outside the mesh
+                      perimeter (cell IDs at or above the area's
+                      ``Cell Count``)
 
                 Attributes:
                     - units: Variable units
@@ -182,13 +504,437 @@ class HdfResultsMesh:
                     - variable: Variable name
 
                 When to use: Single variable extraction for focused analysis.
-                For multiple variables, use get_mesh_cells_timeseries() → Dict[str, Dataset].
+                For multiple variables, use ``get_mesh_cells_timeseries()``
+                which returns ``Dict[str, Dataset]``.
+
+        Raises:
+            MeshSeriesAvailabilityError: If the stored rows differ from the
+                Base Output Time axis (a ``ValueError`` subclass naming the
+                dataset, its row count, the clock length and whether it is an
+                unwritten producer placeholder). Raised when the view is
+                created, so eager, view and streamed reads fail identically.
+            ValueError: If the variable or return type is invalid.
+            TypeError: If a selection is not integer-like or a slice.
+            IndexError: If an integer selection is outside the source extent.
+            FileNotFoundError: If a lazy view's source is moved before use.
+            RuntimeError: If a lazy view's source changes after creation.
 
         Valid variables include:
-            "Water Surface", "Face Velocity", "Cell Velocity X"...
+            "Water Surface", "Face Velocity", "Cell Velocity - Velocity X"...
         """
-        with h5py.File(hdf_path, 'r') as hdf_path:
-            return HdfResultsMesh._get_mesh_timeseries_output(hdf_path, mesh_name, var, truncate)
+        if return_type not in ("xarray", "view"):
+            raise ValueError("return_type must be 'xarray' or 'view'")
+        view, cell_count = HdfResultsMesh._get_mesh_result_view(
+            hdf_path,
+            mesh_name,
+            var,
+            truncate=truncate,
+            time_selection=time_selection,
+            spatial_selection=spatial_selection,
+            include_ghost_cells=include_ghost_cells,
+        )
+        if return_type == "view":
+            return view
+        return HdfResultsMesh._flag_ghost_cell_coord(view.to_xarray(), cell_count)
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type='plan_hdf')
+    def iter_mesh_timeseries(
+        hdf_path: HdfInput,
+        mesh_name: str,
+        var: str,
+        *,
+        time_selection: Selection = None,
+        spatial_selection: Selection = None,
+        batch_size: Optional[int] = None,
+        max_chunk_bytes: int = 16 * 1024 * 1024,
+        include_ghost_cells: bool = False,
+    ) -> Iterator[xr.DataArray]:
+        """Yield untruncated, bounded time-major batches for one mesh variable.
+
+        The returned iterator owns one read-only HDF handle for the duration of
+        iteration. Each batch uses the established xarray DataArray schema.
+        Geometry is not constructed. The iterator deliberately does not trim
+        leading or trailing zero-only rows so every selected source timestep is
+        emitted exactly once.
+
+        Args:
+            hdf_path: Plan number, plan-result HDF path, or open HDF handle.
+            mesh_name: Name of the 2D flow area.
+            var: HEC-RAS time-series variable name.
+            time_selection: Source-coordinate integer or forward slice.
+            spatial_selection: Source-coordinate integer or forward slice of
+                cells or faces.
+            batch_size: Optional explicit number of timesteps per batch.
+            max_chunk_bytes: Byte target used when ``batch_size`` is omitted.
+            include_ghost_cells: Keep the ghost-cell columns of a cell
+                variable (default False). When False, ``spatial_selection`` is
+                clipped to the physical cells.
+
+        Returns:
+            Iterator of labeled xarray DataArray batches.
+
+        Raises:
+            MeshSeriesAvailabilityError: If the stored rows differ from the
+                Base Output Time axis; raised before any batch is produced.
+            ValueError: If the variable, selection, or batch sizing is invalid.
+            TypeError: If a selection is not integer-like or a slice.
+            IndexError: If an integer selection is outside the source extent.
+            FileNotFoundError: If the source is moved before iteration.
+            RuntimeError: If the source changes after iterator creation.
+        """
+        view, _cell_count = HdfResultsMesh._get_mesh_result_view(
+            hdf_path,
+            mesh_name,
+            var,
+            truncate=False,
+            time_selection=time_selection,
+            spatial_selection=spatial_selection,
+            include_ghost_cells=include_ghost_cells,
+        )
+        return view.iter_batches(
+            batch_size=batch_size,
+            max_chunk_bytes=max_chunk_bytes,
+        )
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type='plan_hdf')
+    def inspect_mesh_series_raw(
+        hdf_path: HdfInput,
+        mesh_name: str,
+        var: str,
+        *,
+        include_values: bool = False,
+    ) -> Dict[str, Any]:
+        """Describe one Base Output mesh series exactly as stored, without typing it.
+
+        This is a diagnostic accessor for series that the typed readers refuse,
+        such as a dataset whose stored ``Location`` contradicts its width. It
+        reports the stored identity, shape, dtype and attributes, the canonical
+        Time row count, the stored geometry counts, and the typed-reader outcome
+        with its refusal reason. It never assigns a physical domain or a unit
+        interpretation: ``physical_domain`` and ``units_interpretation`` are
+        always ``"unqualified"``, and a rank-two dataset's axes are
+        ``("raw_row", "raw_column")``. ``time_axis["matches_rows"]`` reports
+        whether the row count equals the canonical Base Output Time axis; no
+        timestamps are attached. Column positions are not cell or face
+        identifiers. No values are
+        converted, relabelled, filtered, broadcast or reconstructed. Use
+        ``get_mesh_timeseries()`` or ``iter_mesh_timeseries()`` for qualified
+        spatial series.
+
+        Args:
+            hdf_path: Plan number, plan-result HDF path, or open HDF handle.
+            mesh_name: Name of the 2D flow area.
+            var: Exact dataset name under the mesh's Base Output Unsteady Time
+                Series group.
+            include_values: Return a copy of the stored array under ``values``
+                (default False). Values keep the stored dtype and are not
+                interpreted.
+
+        Returns:
+            dict with keys ``dataset_path``, ``mesh_name``, ``variable``,
+            ``file_version`` (stored text or None), ``shape``, ``dtype``,
+            ``attrs`` (stored attributes; bytes decoded as UTF-8 when possible),
+            ``stored_location``, ``stored_units``, ``axes``, ``time_axis``
+            (``path``, ``rows``, ``matches_rows``), ``geometry_counts``
+            (``stored_cells``, ``physical_cells``, ``faces``; None when absent),
+            ``typed_status`` (``"qualified"`` or ``"refused"``), ``typed_domain``
+            (the typed readers' ``"cell_id"``, ``"face_id"`` or ``"time"``, or
+            None when refused), ``refusal_reason``, ``physical_domain``,
+            ``units_interpretation`` and ``values`` (None unless requested).
+
+        Raises:
+            ValueError: If the dataset is absent or is not an HDF dataset.
+        """
+        def raw(value: Any) -> Any:
+            if isinstance(value, (bytes, np.bytes_)):
+                try:
+                    return bytes(value).decode("utf-8")
+                except UnicodeDecodeError:
+                    return bytes(value)
+            if isinstance(value, np.ndarray):
+                return [raw(item) for item in value.tolist()] if value.ndim else raw(value.item())
+            if isinstance(value, np.generic):
+                return value.item()
+            return value
+
+        def stored_text(attrs: Dict[str, Any], key: str) -> Optional[str]:
+            value = attrs.get(key)
+            if isinstance(value, list) and len(value) == 1:
+                value = value[0]
+            return value if isinstance(value, str) else None
+
+        dataset_path = HdfResultsMesh._get_mesh_timeseries_output_path(mesh_name, var)
+        time_path = (
+            "Results/Unsteady/Output/Output Blocks/Base Output/"
+            "Unsteady Time Series/Time"
+        )
+        source_path = Path(hdf_path)
+        stat_before = source_path.stat()
+        with h5py.File(source_path, "r") as hdf_file:
+            dataset = hdf_file.get(dataset_path)
+            if not isinstance(dataset, h5py.Dataset):
+                raise ValueError(f"Mesh series dataset not found: /{dataset_path}")
+            attrs = {key: raw(value) for key, value in dataset.attrs.items()}
+            version = hdf_file.attrs.get("File Version")
+            time = hdf_file.get(time_path)
+            time_rows = (
+                int(time.shape[0])
+                if isinstance(time, h5py.Dataset) and time.ndim == 1
+                else None
+            )
+            geometry = f"Geometry/2D Flow Areas/{mesh_name}"
+            counts = {}
+            for key, name in (("stored_cells", "Cells Center Coordinate"),
+                              ("faces", "Faces FacePoint Indexes")):
+                item = hdf_file.get(f"{geometry}/{name}")
+                counts[key] = (
+                    int(item.shape[0])
+                    if isinstance(item, h5py.Dataset) and item.ndim >= 1
+                    else None
+                )
+            try:
+                counts["physical_cells"] = HdfResultsMesh._physical_cell_counts(
+                    hdf_file
+                ).get(mesh_name)
+            except (KeyError, ValueError, TypeError):
+                counts["physical_cells"] = None
+            try:
+                typed_domain = HdfResultsMesh._mesh_series_id_dim(
+                    hdf_file, mesh_name, dataset
+                )
+                typed_status, refusal_reason = "qualified", None
+            except ValueError as exc:
+                typed_domain, typed_status, refusal_reason = None, "refused", str(exc)
+            except FastHdfError as exc:
+                # Native mode: report the engine's refusal; a diagnostic never raises it.
+                typed_domain, typed_status, refusal_reason = None, "refused", f"native: {exc}"
+            values = dataset[()].copy() if include_values else None
+            shape = tuple(int(value) for value in dataset.shape)
+            result = {
+                "dataset_path": dataset.name,
+                "mesh_name": mesh_name,
+                "variable": var,
+                "file_version": raw(version) if version is not None else None,
+                "shape": shape,
+                "dtype": str(dataset.dtype),
+                "attrs": attrs,
+                "stored_location": stored_text(attrs, "Location"),
+                "stored_units": stored_text(attrs, "Units"),
+                "axes": tuple(
+                    ("raw_row", "raw_column")[axis] if axis < 2 else f"raw_axis_{axis}"
+                    for axis in range(len(shape))
+                ),
+                "time_axis": {
+                    "path": "/" + time_path,
+                    "rows": time_rows,
+                    "matches_rows": bool(
+                        time_rows is not None and len(shape) >= 1
+                        and shape[0] == time_rows
+                    ),
+                },
+                "geometry_counts": counts,
+                "typed_status": typed_status,
+                "typed_domain": typed_domain,
+                "refusal_reason": refusal_reason,
+                "physical_domain": "unqualified",
+                "units_interpretation": "unqualified",
+                "values": values,
+            }
+        stat_after = source_path.stat()
+        if (stat_after.st_size, stat_after.st_mtime_ns) != (
+            stat_before.st_size, stat_before.st_mtime_ns
+        ):
+            raise RuntimeError("HDF result source changed while it was being inspected")
+        return result
+
+    @staticmethod
+    def _get_mesh_result_view(
+        hdf_path: HdfInput,
+        mesh_name: str,
+        var: str,
+        *,
+        truncate: bool,
+        time_selection: Selection,
+        spatial_selection: Selection,
+        include_ghost_cells: bool = False,
+    ) -> Tuple[HdfResultView, Optional[int]]:
+        """Create a fingerprinted lazy view without reading result values.
+
+        Returns the view and the mesh's physical cell count (``None`` for
+        face variables or when the HDF does not record ``Cell Count``).
+        """
+        source_path = Path(hdf_path).resolve()
+        stat_before = source_path.stat()
+        dataset_path = HdfResultsMesh._get_mesh_timeseries_output_path(
+            mesh_name,
+            var,
+        )
+        time_path = (
+            "Results/Unsteady/Output/Output Blocks/Base Output/"
+            "Unsteady Time Series/Time"
+        )
+        with h5py.File(source_path, "r") as hdf_file:
+            if dataset_path not in hdf_file:
+                raise ValueError(f"Path {dataset_path} not found in HDF file")
+            if time_path not in hdf_file:
+                raise ValueError(f"Path {time_path} not found in HDF file")
+            dataset = hdf_file[dataset_path]
+            id_dim = HdfResultsMesh._mesh_series_id_dim(hdf_file, mesh_name, dataset)
+            units = HdfResultsMesh._decode_hdf_attr(
+                read_attr(dataset, "Units", "")
+            )
+            shape = tuple(int(value) for value in dataset.shape)
+            dtype = dataset.dtype.str
+            cell_count = None
+            if id_dim == "cell_id" and len(shape) == 2:
+                cell_count = HdfResultsMesh._physical_cell_count(
+                    HdfResultsMesh._physical_cell_counts(hdf_file),
+                    mesh_name,
+                    include_ghost_cells,
+                )
+                if not include_ghost_cells and cell_count is not None:
+                    spatial_selection = HdfResultsMesh._physical_spatial_selection(
+                        spatial_selection, cell_count
+                    )
+
+        stat = source_path.stat()
+        if (
+            stat.st_size != stat_before.st_size
+            or stat.st_mtime_ns != stat_before.st_mtime_ns
+        ):
+            raise RuntimeError(
+                "HDF result source changed while the lazy view was being created"
+            )
+        view = HdfResultView(
+            source_path=source_path,
+            dataset_path=dataset_path,
+            time_path=time_path,
+            mesh_name=mesh_name,
+            variable=var,
+            units=units,
+            id_dim=id_dim,
+            source_shape=shape,
+            source_dtype=dtype,
+            source_size=stat.st_size,
+            source_mtime_ns=stat.st_mtime_ns,
+            truncate=truncate,
+        )
+        return view.select(
+            time=time_selection,
+            spatial=spatial_selection,
+        ), cell_count
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type='plan_hdf')
+    def get_mesh_timeseries_availability(
+        hdf_path: HdfInput,
+        mesh_name: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Report whether each Base Output mesh dataset is readable as a series.
+
+        Reads metadata only (no result values). Each dataset directly under
+        ``Base Output/Unsteady Time Series/2D Flow Areas/<mesh>`` is qualified
+        by the same rule as :meth:`get_mesh_timeseries`, so ``status`` predicts
+        whether an eager, view or streamed read of that variable succeeds.
+        Subgroups (for example ``Boundary Conditions``) are not series and are
+        omitted.
+
+        Args:
+            hdf_path: Plan number, plan-result HDF path, or open HDF handle.
+            mesh_name: Optional 2D flow area name; all meshes when omitted.
+
+        Returns:
+            pd.DataFrame: One row per dataset with columns ``mesh_name``,
+            ``variable``, ``dataset_path``, ``shape``, ``rows``, ``time_rows``
+            (None when the Time axis is missing or malformed),
+            ``stored_bytes``, ``id_dim`` (``cell_id``, ``face_id``, ``time``
+            or None), ``status`` and ``reason``. ``status`` is:
+
+            - ``"available"``: readable; ``id_dim`` gives the domain.
+            - ``"unwritten_placeholder"``: rows differ from the clock and the
+                producer stored no data (``stored_bytes == 0``). The values are
+                only HDF5 fill values, so the series is unavailable. It is not
+                a constant field and is never broadcast over the clock.
+            - ``"row_count_mismatch"``: stored data whose rows differ from
+                the clock.
+            - ``"unqualified"``: any other refusal (invalid Location, unknown
+                legacy name, non-numeric data, malformed Time or geometry);
+                ``reason`` holds the reader's message.
+            - ``"native_refused"``: only with ``RAS_COMMANDER_FAST_HDF=native``;
+                the native engine refused the series, so a native read raises
+                :class:`~ras_commander.fast_hdf.FastHdfError` (reported here,
+                never raised).
+
+            ``stored_bytes`` is reported for every dataset. A dataset whose
+            rows match the clock but that stores no data still reads as fill
+            values; check ``stored_bytes`` when that distinction matters.
+
+        Raises:
+            ValueError: If ``mesh_name`` has no Base Output time-series group.
+        """
+        columns = [
+            "mesh_name", "variable", "dataset_path", "shape", "rows",
+            "time_rows", "stored_bytes", "id_dim", "status", "reason",
+        ]
+        group_root = HdfResultsMesh._get_mesh_timeseries_output_path("", "").rstrip("/")
+        records = []
+        with h5py.File(Path(hdf_path), "r") as hdf_file:
+            root = hdf_file.get(group_root)
+            meshes = [
+                name for name, item in (root.items() if isinstance(root, h5py.Group) else [])
+                if isinstance(item, h5py.Group)
+            ]
+            if mesh_name is not None:
+                if mesh_name not in meshes:
+                    raise ValueError(
+                        f"Mesh '{mesh_name}' has no Base Output time-series group in HDF file"
+                    )
+                meshes = [mesh_name]
+            time = hdf_file.get(_BASE_OUTPUT_TIME_PATH)
+            time_rows = (
+                len(time)
+                if isinstance(time, h5py.Dataset) and time.ndim == 1
+                and time.dtype.kind in "iuf"
+                else None
+            )
+            for mesh in meshes:
+                for variable, dataset in root[mesh].items():
+                    if not isinstance(dataset, h5py.Dataset):
+                        continue
+                    record = {
+                        "mesh_name": mesh,
+                        "variable": variable,
+                        "dataset_path": dataset.name,
+                        "shape": tuple(int(n) for n in dataset.shape),
+                        "rows": int(dataset.shape[0]) if dataset.ndim else None,
+                        "time_rows": time_rows,
+                        "stored_bytes": int(dataset.id.get_storage_size()),
+                        "id_dim": None,
+                        "status": "available",
+                        "reason": None,
+                    }
+                    try:
+                        record["id_dim"] = HdfResultsMesh._mesh_series_id_dim(
+                            hdf_file, mesh, dataset
+                        )
+                    except MeshSeriesAvailabilityError as exc:
+                        record["status"] = exc.disposition
+                        record["reason"] = str(exc)
+                    except ValueError as exc:
+                        record["status"] = "unqualified"
+                        record["reason"] = str(exc)
+                    except FastHdfError as exc:
+                        # Native mode: the engine refused this series, so a native read
+                        # raises; reported, never raised, by this metadata report.
+                        record["status"] = "native_refused"
+                        record["reason"] = str(exc)
+                    records.append(record)
+        return pd.DataFrame.from_records(records, columns=columns)
 
     @staticmethod
     def _truncate_profile_line_flow_dataframe(
@@ -224,14 +970,57 @@ class HdfResultsMesh:
         """
         Return a flow time series across a RAS Mapper profile/reference line.
 
-        This canonical entry point uses RasMapperLib through pythonnet. Native
-        reference lines first use ``ObservedDataLayer.TryReadRefLineFlow()``
-        when RAS Mapper exposes a precomputed hydrograph; otherwise native
-        reference-line faces and ad-hoc profile lines are read through
+        Recorded computed reference-line Flow is read first through
+        ``HdfResultsXsec.get_ref_lines_timeseries()``, without pythonnet or
+        face-output requirements. Observed Event Conditions data is not used.
+        Otherwise native reference-line faces and ad-hoc profile lines are read through
         ``RASResults.ReadUnsteadyTimeSeries()`` after selecting ad-hoc faces
         with ``MeshFV2D.PerimeterFacesAlongPolyline()``.
+
+        Args:
+            hdf_path: Completed plan HDF, with the matching geometry available.
+            line_name: Exact reference-line or profile-layer feature name.
+            mesh_name: Optional 2D flow area selector.
+            profile_lines_path: Optional external profile-line layer. Coordinates
+                must match the model CRS; project metadata can resolve this path.
+            direction: ``"absolute"`` takes the absolute value of a recorded
+                reference hydrograph, but sums absolute face flows in a fallback
+                branch. ``"signed"`` preserves the recorded hydrograph sign,
+                or sums native face-normal signs without line-orientation
+                correction in a fallback. These are not interchangeable fluxes.
+            truncate: Trim leading and trailing zero-flow samples when true.
+            ras_object (RasPrj, optional): Optional initialized project context.
+
+        Returns:
+            DataFrame with ``time``, ``flow``, ``line_name``, ``mesh_name``,
+            ``direction``, ``face_count`` and ``selection_source``. Attributes
+            include units, variable and face IDs. Preserve this provenance:
+            ``reference_line_recorded_flow`` identifies the computed HDF
+            reference matrix, with its dataset path and reference ID in attrs;
+            face-selection routes identify
+            aggregation of stored face output, not a new solver calculation.
+            Missing units are not inferred.
+
+        Notes:
+            Face fallbacks require pythonnet and compatible RasMapperLib. For an
+            offline approximation use ``get_profile_line_flow_timeseries_legacy``.
+            To read recorded reference matrices directly without native mapping,
+            use ``HdfResultsXsec.get_ref_lines_timeseries``. Reading an HDF cannot
+            create reference output that was not recorded by the model run.
         """
         direction = HdfResultsMesh._normalize_profile_line_direction(direction)
+        refline_flow = HdfResultsMesh._try_read_ref_line_flow_rasmapper(
+            hdf_path=hdf_path,
+            line_name=line_name,
+            mesh_name=mesh_name,
+            direction=direction,
+        )
+        if refline_flow is not None:
+            return HdfResultsMesh._truncate_profile_line_flow_dataframe(
+                refline_flow,
+                truncate,
+            )
+
         native_faces = HdfResultsMesh._get_native_profile_line_faces(
             hdf_path=hdf_path,
             line_name=line_name,
@@ -239,18 +1028,6 @@ class HdfResultsMesh:
             ras_object=ras_object,
         )
         if not native_faces.empty:
-            refline_flow = HdfResultsMesh._try_read_ref_line_flow_rasmapper(
-                hdf_path=hdf_path,
-                line_name=line_name,
-                mesh_name=mesh_name,
-                direction=direction,
-            )
-            if refline_flow is not None:
-                return HdfResultsMesh._truncate_profile_line_flow_dataframe(
-                    refline_flow,
-                    truncate,
-                )
-
             resolved_mesh_name = HdfResultsMesh._resolve_single_mesh_name(
                 native_faces,
                 mesh_name,
@@ -446,10 +1223,13 @@ class HdfResultsMesh:
         """
         Return peak flow across a RAS Mapper profile/reference line.
 
-        For ``direction="absolute"``, the peak is the maximum absolute-flow
-        sum. For ``direction="signed"``, the peak timestep is selected by
+        For ``direction="absolute"``, the peak is the maximum of the selected
+        extraction route's absolute-flow series: absolute recorded reference
+        hydrograph flow or a sum of absolute face flows. Preserve ``selection_source`` to
+        distinguish these quantities. For ``direction="signed"``, the peak timestep is selected by
         maximum signed-flow magnitude and the returned ``peak_flow`` preserves
-        the native sign at that timestep.
+        the native sign at that timestep. A peak from saved output times need
+        not equal a peak over every computational timestep.
         """
         flow_df = HdfResultsMesh.get_profile_line_flow_timeseries(
             hdf_path=hdf_path,
@@ -562,53 +1342,94 @@ class HdfResultsMesh:
         mesh_name: Optional[str],
         direction: str,
     ) -> Optional[pd.DataFrame]:
-        """Read a native RAS Mapper reference-line flow hydrograph if present."""
-        try:
-            from ..dotnet.clr_bootstrap import load_clr
+        """Read recorded computed Flow; the historical private name is retained.
 
-            load_clr()
-            from RasMapperLib import (  # type: ignore
-                ObservedDataLayer,
-                RASEventConditions,
-                RASResults,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "pythonnet/RasMapperLib is required for canonical profile-line "
-                "flow time-series extraction. Use "
-                "get_profile_line_flow_timeseries_legacy() for offline analysis."
-            ) from exc
+        ObservedDataLayer.TryReadRefLineFlow reads observed Event Conditions,
+        so it must never supply the computed-flow API. Missing computed output
+        permits a face fallback; malformed output for the selected recorded
+        identity does not. Unrelated recorded output does not select a route.
+        """
+        from .HdfResultsXsec import HdfResultsXsec
 
-        results = RASResults(str(Path(hdf_path)))
-        if not bool(results.LoadedSuccessfully):
-            raise RuntimeError(f"RASResults could not load {hdf_path}")
+        group_path = (
+            "Results/Unsteady/Output/Output Blocks/Base Output/"
+            "Unsteady Time Series/Reference Lines"
+        )
+        flow_path = f"{group_path}/Flow"
+        with h5py.File(hdf_path, "r") as hdf_file:
+            if group_path not in hdf_file:
+                return None
+            group = hdf_file[group_path]
+            if not isinstance(group, h5py.Group):
+                raise ValueError(f"Malformed reference-line group: {group_path}")
+            if "Flow" not in group:
+                return None
+            names = group.get("Name")
+            if (
+                not isinstance(names, h5py.Dataset)
+                or names.ndim != 1
+                or h5py.check_string_dtype(names.dtype) is None
+            ):
+                raise ValueError(f"Malformed reference-line Name dataset: {group_path}/Name")
+            identities = [HdfResultsXsec._decode_reference_name_mesh(value) for value in read_typed(names, slice(None))]
+            positions = [
+                index for index, (name, mesh) in enumerate(identities)
+                if name == str(line_name) and (mesh_name is None or mesh == str(mesh_name))
+            ]
+            if not positions:
+                return None
+            if len(positions) != 1:
+                raise ValueError(
+                    f"Ambiguous recorded reference-line Flow for '{line_name}' "
+                    f"(mesh_name={mesh_name!r}); select a unique name and mesh."
+                )
+            position = positions[0]
+            flow_dataset = group["Flow"]
+            if (
+                not isinstance(flow_dataset, h5py.Dataset)
+                or flow_dataset.ndim != 2
+                or flow_dataset.dtype.kind not in "iuf"
+                or flow_dataset.shape[1] != len(names)
+            ):
+                raise ValueError(f"Malformed recorded reference-line Flow matrix: {flow_path}")
+            # The general reference reader skips incompatible matrices. Here a
+            # present Flow must fail explicitly rather than change the product.
+            times = pd.DatetimeIndex(HdfBase.get_unsteady_timestamps(hdf_file))
+            if (
+                flow_dataset.shape[0] != len(times)
+                or times.hasnans
+                or not times.is_monotonic_increasing
+            ):
+                raise ValueError(f"Recorded reference-line Flow timestamps do not match: {flow_path}")
+            units_attr = read_attr(flow_dataset, "Units", "")
+            units_array = np.asarray(units_attr)
+            if units_array.size != 1 or not isinstance(
+                units_array.reshape(-1)[0], (str, bytes, np.str_, np.bytes_)
+            ):
+                raise ValueError(f"Malformed recorded reference-line Flow Units: {flow_path}")
 
-        observed = ObservedDataLayer(RASEventConditions(results))
-        met_ts = observed.TryReadRefLineFlow(str(line_name))
-        if met_ts is None:
-            return None
-
-        values = np.asarray([float(value) for value in met_ts.AllValues], dtype=float)
+        reference_ds = HdfResultsXsec.get_ref_lines_timeseries(hdf_path, variables="Flow")
+        if "Flow" not in reference_ds:
+            raise ValueError(f"Recorded reference-line Flow could not be read: {flow_path}")
+        hydrograph = reference_ds["Flow"].isel(refln_id=position)
+        values = hydrograph.values.copy()
         if direction == "absolute":
             values = np.abs(values)
 
-        dates = [pd.Timestamp(str(value)) for value in met_ts.AllDates]
-        if len(dates) != len(values):
-            dates = HdfResultsMesh._profile_times_from_hdf(hdf_path, results)
-        dates = dates[: len(values)]
-
         result = pd.DataFrame({
-            "time": pd.to_datetime(dates),
+            "time": pd.to_datetime(hydrograph["time"].values),
             "flow": values,
-            "line_name": str(line_name),
-            "mesh_name": "" if mesh_name is None else str(mesh_name),
+            "line_name": str(reference_ds["refln_name"].values[position]),
+            "mesh_name": str(reference_ds["mesh_name"].values[position]),
             "direction": direction,
             "face_count": 0,
-            "selection_source": "try_read_ref_line_flow",
+            "selection_source": "reference_line_recorded_flow",
         })
         result.attrs["face_ids"] = []
-        result.attrs["units"] = str(getattr(met_ts, "UnitString", "") or "")
+        result.attrs["units"] = hydrograph.attrs.get("units", "")
         result.attrs["variable"] = "Reference Line Flow"
+        result.attrs["hdf_path"] = flow_path
+        result.attrs["refln_id"] = int(reference_ds["refln_id"].values[position])
         return result
 
     @staticmethod
@@ -743,9 +1564,10 @@ class HdfResultsMesh:
             with h5py.File(hdf_path, "r") as hdf_file:
                 if dataset_path in hdf_file:
                     units = HdfResultsMesh._decode_hdf_attr(
-                        hdf_file[dataset_path].attrs.get("Units", "")
+                        read_attr(hdf_file[dataset_path], "Units", "")
                     )
-        except Exception:
+        except Exception as exc:
+            reraise_required(exc)
             units = ""
 
         result = pd.DataFrame({
@@ -775,12 +1597,12 @@ class HdfResultsMesh:
                 if time_path in hdf_file:
                     return list(pd.to_datetime(
                         HdfUtils.convert_timesteps_to_datetimes(
-                            np.asarray(hdf_file[time_path][:]),
+                            np.asarray(read_typed(hdf_file[time_path], slice(None))),
                             start_time,
                         )
                     ))
-        except Exception:
-            pass
+        except Exception as exc:
+            reraise_required(exc)
 
         if results is not None:
             try:
@@ -982,7 +1804,7 @@ class HdfResultsMesh:
                     ras_obj = None
 
             rasmap_df = getattr(ras_obj, "rasmap_df", None)
-            if rasmap_df is not None and not rasmap_df.empty and "profile_lines_path" in rasmap_df.columns:
+            if rasmap_dataframe_is_usable(rasmap_df) and "profile_lines_path" in rasmap_df.columns:
                 for value in rasmap_df["profile_lines_path"].tolist():
                     if isinstance(value, (list, tuple, set)):
                         candidate_paths.extend(value)
@@ -1119,6 +1941,11 @@ class HdfResultsMesh:
         """
         Get timeseries output for all face-based variables of a specific mesh.
 
+        Discover numeric datasets qualified by authoritative ``Location=Faces``
+        or the exact-name legacy face schema when Location is absent, with
+        validated time/face counts. Unqualified entries are skipped with diagnostics;
+        one-row datasets are never broadcast onto the full Time axis.
+
         Args:
             hdf_path (Path): Path to the HDF file.
             mesh_name (str): Name of the mesh.
@@ -1131,8 +1958,7 @@ class HdfResultsMesh:
                 Use Dataset when extracting MULTIPLE variables for a SINGLE mesh area.
 
                 Data variables:
-                    Any available face-based HDF time-series outputs listed in
-                    MESH_FACE_TIME_SERIES_OUTPUT_VARS, normalized to lowercase
+                    Any qualified face-based HDF time-series outputs, normalized to lowercase
                     names such as face_velocity, face_flow,
                     face_water_surface, face_area, and face_mannings_n.
                     Each variable shares common dimensions.
@@ -1148,7 +1974,9 @@ class HdfResultsMesh:
         datasets = []
 
         with h5py.File(hdf_path, 'r') as hdf_file:
-            for var in HdfResultsMesh.MESH_FACE_TIME_SERIES_OUTPUT_VARS:
+            for var, id_dim in HdfResultsMesh._discover_mesh_series(hdf_file, mesh_name).items():
+                if id_dim != "face_id":
+                    continue
                 path = HdfResultsMesh._get_mesh_timeseries_output_path(mesh_name, var)
                 if path not in hdf_file:
                     logger.debug(f"Variable '{var}' not found for mesh '{mesh_name}'. Skipping.")
@@ -1164,7 +1992,10 @@ class HdfResultsMesh:
                     # Assign the variable name as the DataArray name
                     da.name = HdfResultsMesh._mesh_data_var_name(var)
                     datasets.append(da)
+                except OptionalDependencyError:
+                    raise
                 except Exception as e:
+                    reraise_required(e)
                     logger.warning(f"Failed to process {var} for mesh {mesh_name}: {str(e)}")
         
         if not datasets:
@@ -1173,16 +2004,37 @@ class HdfResultsMesh:
         
         try:
             return xr.merge(datasets, join="outer")
+        except OptionalDependencyError:
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Failed to merge datasets: {str(e)}")
             return xr.Dataset()
 
     @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_mesh_cells_timeseries(hdf_path: Path, mesh_names: Optional[Union[str, List[str]]] = None, var: Optional[str] = None, truncate: bool = False, ras_object: Optional[Any] = None) -> Dict[str, xr.Dataset]:
+    def get_mesh_cells_timeseries(
+        hdf_path: Path,
+        mesh_names: Optional[Union[str, List[str]]] = None,
+        var: Optional[str] = None,
+        truncate: bool = False,
+        ras_object: Optional[Any] = None,
+        include_ghost_cells: bool = False,
+    ) -> Dict[str, xr.Dataset]:
         """
         Get mesh cells timeseries output.
+
+        With ``var=None``, discover actual numeric cell and face datasets using
+        authoritative stored ``Location`` (``Cells``/``Cell``/``Faces``) or the
+        exact-name stable-core legacy schema when Location is absent (see
+        ``get_mesh_timeseries``), matching geometry counts and Base Output Time.
+        Time-only diagnostics are available by explicit selection. This can return more variables
+        and use more memory than a fixed convenience list; select ``var`` for
+        focused reads. Unqualified datasets are skipped with diagnostics.
+        An explicitly selected malformed dataset raises ValueError. No times
+        are invented for one-row outputs. Hydraulic depth remains distinct
+        from ``Depth``. Ghost-cell defaults and flags apply after validation.
 
         Args:
             hdf_path (Path): Path to HDF file
@@ -1190,6 +2042,10 @@ class HdfResultsMesh:
             var (str, optional): Variable name. If None, retrieves all variables
             truncate (bool): Remove trailing zeros if True
             ras_object (Any, optional): RAS object if available
+            include_ghost_cells (bool): Keep the ghost-cell columns HEC-RAS
+                writes after the physical cells (default False). Cell
+                variables always carry an ``is_ghost_cell`` coordinate along
+                ``cell_id``; face variables are unaffected.
 
         Returns:
             Dict[str, xr.Dataset]: **Multiple mesh areas with multiple variables**.
@@ -1218,45 +2074,90 @@ class HdfResultsMesh:
         """
         try:
             with h5py.File(hdf_path, 'r') as hdf_path:
-                return HdfResultsMesh._get_mesh_cells_timeseries_output(hdf_path, mesh_names, var, truncate)
+                return HdfResultsMesh._get_mesh_cells_timeseries_output(
+                    hdf_path, mesh_names, var, truncate, include_ghost_cells
+                )
+        except (OptionalDependencyError, MeshSeriesAvailabilityError):
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error in get_mesh_cells_timeseries: {str(e)}")
             raise ValueError(f"Error processing timeseries output data: {e}")
 
     @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_mesh_last_iter(hdf_file: Path) -> pd.DataFrame:
+    def get_mesh_last_iter(
+        hdf_file: Path,
+        include_ghost_cells: bool = False,
+        *,
+        include_geometry: bool = True,
+    ) -> Union[gpd.GeoDataFrame, pd.DataFrame]:
         """
         Get last iteration count for each mesh cell.
 
         Args:
-            hdf_path (Path): Path to the HDF file.
+            hdf_file (Path): Path to the HDF file.
+            include_ghost_cells (bool): Keep rows for the ghost cells HEC-RAS
+                writes outside the mesh perimeter (default False). Rows always
+                carry an ``is_ghost_cell`` column.
+            include_geometry (bool): Keyword-only. Default True is the
+                convenient output: a GeoDataFrame with cell-center points.
+                False is the fast output: the typed DataFrame of
+                :meth:`get_mesh_summary_output` (no geometry, ``str``/``string``
+                mesh_name, ``int64`` IDs, stored value dtype), keyed by
+                ``mesh_name`` and ``cell_id`` for a join to geometry read once
+                per model (see :meth:`get_mesh_summary_output`).
 
         Returns:
             pd.DataFrame: DataFrame containing last iteration counts.
         """
-        return HdfResultsMesh.get_mesh_summary_output(hdf_file, "Cell Last Iteration")
+        return HdfResultsMesh.get_mesh_summary_output(
+            hdf_file, "Cell Last Iteration", include_ghost_cells=include_ghost_cells,
+            include_geometry=include_geometry,
+        )
 
 
     @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_mesh_max_ws(hdf_path: Path, round_to: str = "100ms") -> gpd.GeoDataFrame:
+    def get_mesh_max_ws(
+        hdf_path: Path,
+        round_to: str = "100ms",
+        include_ghost_cells: bool = False,
+        *,
+        include_geometry: bool = True,
+    ) -> Union[gpd.GeoDataFrame, pd.DataFrame]:
         """
         Get maximum water surface elevation for each mesh cell.
 
         Args:
             hdf_path (Path): Path to the HDF file.
             round_to (str): Time rounding specification (default "100ms").
+            include_ghost_cells (bool): Keep rows for the ghost cells HEC-RAS
+                writes outside the mesh perimeter (default False). Rows always
+                carry an ``is_ghost_cell`` column.
+            include_geometry (bool): Keyword-only. Default True is the
+                convenient output: a GeoDataFrame with cell-center points.
+                False is the fast output: the typed DataFrame of
+                :meth:`get_mesh_summary_output` (no geometry, ``str``/``string``
+                mesh_name, ``int64`` IDs, stored value dtype), keyed by
+                ``mesh_name`` and ``cell_id`` for a join to geometry read once
+                per model (see :meth:`get_mesh_summary_output`).
 
         Returns:
             gpd.GeoDataFrame: GeoDataFrame containing maximum water surface elevations with geometry.
         """
         try:
             with h5py.File(hdf_path, 'r') as hdf_file:
-                return HdfResultsMesh.get_mesh_summary_output(hdf_file, "Maximum Water Surface", round_to)
+                return HdfResultsMesh.get_mesh_summary_output(
+                    hdf_file, "Maximum Water Surface", round_to, include_ghost_cells,
+                    include_geometry=include_geometry,
+                )
+        except OptionalDependencyError:
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error in get_mesh_max_ws: {str(e)}")
             raise ValueError(f"Failed to get maximum water surface: {str(e)}")
         
@@ -1267,55 +2168,107 @@ class HdfResultsMesh:
     @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_mesh_min_ws(hdf_path: Path, round_to: str = "100ms") -> gpd.GeoDataFrame:
+    def get_mesh_min_ws(
+        hdf_path: Path,
+        round_to: str = "100ms",
+        include_ghost_cells: bool = False,
+        *,
+        include_geometry: bool = True,
+    ) -> Union[gpd.GeoDataFrame, pd.DataFrame]:
         """
         Get minimum water surface elevation for each mesh cell.
 
         Args:
             hdf_path (Path): Path to the HDF file.
             round_to (str): Time rounding specification (default "100ms").
+            include_ghost_cells (bool): Keep rows for the ghost cells HEC-RAS
+                writes outside the mesh perimeter (default False). Rows always
+                carry an ``is_ghost_cell`` column.
+            include_geometry (bool): Keyword-only. Default True is the
+                convenient output: a GeoDataFrame with cell-center points.
+                False is the fast output: the typed DataFrame of
+                :meth:`get_mesh_summary_output` (no geometry, ``str``/``string``
+                mesh_name, ``int64`` IDs, stored value dtype), keyed by
+                ``mesh_name`` and ``cell_id`` for a join to geometry read once
+                per model (see :meth:`get_mesh_summary_output`).
 
         Returns:
             gpd.GeoDataFrame: GeoDataFrame containing minimum water surface elevations with geometry.
         """
         try:
             with h5py.File(hdf_path, 'r') as hdf_file:
-                return HdfResultsMesh.get_mesh_summary_output(hdf_file, "Minimum Water Surface", round_to)
+                return HdfResultsMesh.get_mesh_summary_output(
+                    hdf_file, "Minimum Water Surface", round_to, include_ghost_cells,
+                    include_geometry=include_geometry,
+                )
+        except OptionalDependencyError:
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error in get_mesh_min_ws: {str(e)}")
             raise ValueError(f"Failed to get minimum water surface: {str(e)}")
 
     @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_mesh_max_face_v(hdf_path: Path, round_to: str = "100ms") -> pd.DataFrame:
+    def get_mesh_max_face_v(
+        hdf_path: Path,
+        round_to: str = "100ms",
+        *,
+        include_geometry: bool = True,
+    ) -> Union[gpd.GeoDataFrame, pd.DataFrame]:
         """
         Get maximum face velocity for each mesh face.
 
         Args:
             hdf_path (Path): Path to the HDF file.
             round_to (str): Time rounding specification (default "100ms").
+            include_geometry (bool): Keyword-only. Default True is the
+                convenient output: a GeoDataFrame with face lines.
+                False is the fast output: the typed DataFrame of
+                :meth:`get_mesh_summary_output` (no geometry, ``str``/``string``
+                mesh_name, ``int64`` IDs, stored value dtype), keyed by
+                ``mesh_name`` and ``face_id`` for a join to geometry read once
+                per model (see :meth:`get_mesh_summary_output`).
 
         Returns:
             pd.DataFrame: DataFrame containing maximum face velocities.
         """
         try:
             with h5py.File(hdf_path, 'r') as hdf_file:
-                return HdfResultsMesh.get_mesh_summary_output(hdf_file, "Maximum Face Velocity", round_to)
+                return HdfResultsMesh.get_mesh_summary_output(
+                    hdf_file, "Maximum Face Velocity", round_to,
+                    include_geometry=include_geometry,
+                )
+        except OptionalDependencyError:
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error in get_mesh_max_face_v: {str(e)}")
             raise ValueError(f"Failed to get maximum face velocity: {str(e)}")
 
     @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_mesh_min_face_v(hdf_path: Path, round_to: str = "100ms") -> pd.DataFrame:
+    def get_mesh_min_face_v(
+        hdf_path: Path,
+        round_to: str = "100ms",
+        *,
+        include_geometry: bool = True,
+    ) -> Union[gpd.GeoDataFrame, pd.DataFrame]:
         """
         Get minimum face velocity for each mesh cell.
 
         Args:
             hdf_path (Path): Path to the HDF file.
             round_to (str): Time rounding specification (default "100ms").
+            include_geometry (bool): Keyword-only. Default True is the
+                convenient output: a GeoDataFrame with face lines.
+                False is the fast output: the typed DataFrame of
+                :meth:`get_mesh_summary_output` (no geometry, ``str``/``string``
+                mesh_name, ``int64`` IDs, stored value dtype), keyed by
+                ``mesh_name`` and ``face_id`` for a join to geometry read once
+                per model (see :meth:`get_mesh_summary_output`).
 
         Returns:
             pd.DataFrame: DataFrame containing minimum face velocities.
@@ -1325,21 +2278,43 @@ class HdfResultsMesh:
         """
         try:
             with h5py.File(hdf_path, 'r') as hdf_file:
-                return HdfResultsMesh.get_mesh_summary_output(hdf_file, "Minimum Face Velocity", round_to)
+                return HdfResultsMesh.get_mesh_summary_output(
+                    hdf_file, "Minimum Face Velocity", round_to,
+                    include_geometry=include_geometry,
+                )
+        except OptionalDependencyError:
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error in get_mesh_min_face_v: {str(e)}")
             raise ValueError(f"Failed to get minimum face velocity: {str(e)}")
 
     @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_mesh_max_ws_err(hdf_path: Path, round_to: str = "100ms") -> pd.DataFrame:
+    def get_mesh_max_ws_err(
+        hdf_path: Path,
+        round_to: str = "100ms",
+        include_ghost_cells: bool = False,
+        *,
+        include_geometry: bool = True,
+    ) -> Union[gpd.GeoDataFrame, pd.DataFrame]:
         """
         Get maximum water surface error for each mesh cell.
 
         Args:
             hdf_path (Path): Path to the HDF file.
             round_to (str): Time rounding specification (default "100ms").
+            include_ghost_cells (bool): Keep rows for the ghost cells HEC-RAS
+                writes outside the mesh perimeter (default False). Rows always
+                carry an ``is_ghost_cell`` column.
+            include_geometry (bool): Keyword-only. Default True is the
+                convenient output: a GeoDataFrame with cell-center points.
+                False is the fast output: the typed DataFrame of
+                :meth:`get_mesh_summary_output` (no geometry, ``str``/``string``
+                mesh_name, ``int64`` IDs, stored value dtype), keyed by
+                ``mesh_name`` and ``cell_id`` for a join to geometry read once
+                per model (see :meth:`get_mesh_summary_output`).
 
         Returns:
             pd.DataFrame: DataFrame containing maximum water surface errors.
@@ -1349,8 +2324,14 @@ class HdfResultsMesh:
         """
         try:
             with h5py.File(hdf_path, 'r') as hdf_file:
-                return HdfResultsMesh.get_mesh_summary_output(hdf_file, "Cell Maximum Water Surface Error", round_to)
+                return HdfResultsMesh.get_mesh_summary_output(
+                    hdf_file, "Cell Maximum Water Surface Error", round_to, include_ghost_cells,
+                    include_geometry=include_geometry,
+                )
+        except OptionalDependencyError:
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error in get_mesh_max_ws_err: {str(e)}")
             raise ValueError(f"Failed to get maximum water surface error: {str(e)}")
 
@@ -1358,13 +2339,29 @@ class HdfResultsMesh:
     @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_mesh_max_iter(hdf_path: Path, round_to: str = "100ms") -> gpd.GeoDataFrame:
+    def get_mesh_max_iter(
+        hdf_path: Path,
+        round_to: str = "100ms",
+        include_ghost_cells: bool = False,
+        *,
+        include_geometry: bool = True,
+    ) -> Union[gpd.GeoDataFrame, pd.DataFrame]:
         """
         Get maximum iteration count for each mesh cell.
 
         Args:
             hdf_path (Path): Path to the HDF file.
             round_to (str): Time rounding specification (default "100ms").
+            include_ghost_cells (bool): Keep rows for the ghost cells HEC-RAS
+                writes outside the mesh perimeter (default False). Rows always
+                carry an ``is_ghost_cell`` column.
+            include_geometry (bool): Keyword-only. Default True is the
+                convenient output: a GeoDataFrame with cell-center points.
+                False is the fast output: the typed DataFrame of
+                :meth:`get_mesh_summary_output` (no geometry, ``str``/``string``
+                mesh_name, ``int64`` IDs, stored value dtype), keyed by
+                ``mesh_name`` and ``cell_id`` for a join to geometry read once
+                per model (see :meth:`get_mesh_summary_output`).
 
         Returns:
             gpd.GeoDataFrame: GeoDataFrame containing maximum iteration counts with geometry.
@@ -1377,24 +2374,300 @@ class HdfResultsMesh:
         """
         try:
             with h5py.File(hdf_path, 'r') as hdf_file:
-                return HdfResultsMesh.get_mesh_summary_output(hdf_file, "Cell Last Iteration", round_to)
+                return HdfResultsMesh.get_mesh_summary_output(
+                    hdf_file, "Cell Last Iteration", round_to, include_ghost_cells,
+                    include_geometry=include_geometry,
+                )
+        except OptionalDependencyError:
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error in get_mesh_max_iter: {str(e)}")
             raise ValueError(f"Failed to get maximum iteration count: {str(e)}")
 
     @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_mesh_max_depth(hdf_path: Path) -> gpd.GeoDataFrame:
+    def get_mesh_log_hydraulics(hdf_path: Path, mesh_name: str) -> pd.DataFrame:
+        """
+        Read the legacy per-mesh 2D solver log table ``Log Hydraulics``.
+
+        HEC-RAS 6.0 through 6.3.x can write ``Results/Unsteady/Output/Output
+        Blocks/Base Output/Unsteady Time Series/2D Flow Areas/<mesh>/Log
+        Hydraulics``: one row per Base Output time and one column per solver
+        diagnostic, labelled by ``Column 0`` ... ``Column N`` attributes. It has
+        no ``Location``; its columns are fields, never cells or faces, so
+        ``get_mesh_timeseries()`` keeps refusing it. This is a diagnostic
+        reader only. It does not establish hydraulic convergence or result
+        quality.
+
+        Accepted schema (all checked; any deviation raises ``ValueError``):
+
+        - root ``File Version`` is HEC-RAS 6.0 through 6.3.x. These bounds
+          come from producer strings in the HEC-RAS 6.0-6.3.1 solver binaries
+          (absent from 5.0.x and 6.4.1+) and one authentic 6.3.1 result.
+        - a rank-2 numeric dataset at the canonical path with no ``Location``.
+        - exactly one ``Column i`` label per stored column, each one of the
+          producer label strings for that position (10 columns).
+        - rows equal the length of the canonical Base Output ``Time`` and its
+          ``Time Date Stamp (ms)`` (or ``Time Date Stamp``) datasets. The table
+          is never aligned to any other clock or resampled.
+
+        Units are taken only from a label suffix that the producer varies by
+        unit system and that agrees with the root ``Units System``. Fixed-suffix
+        labels (``Inner-loop max volume residual divided by wet area (ft)``,
+        ``Min water surface elevation (m)``) and conflicting suffixes get
+        ``units=None``; values are never converted. Cell-location columns are
+        stored float values of a solver cell location whose index base is
+        unqualified; they are not joined to mesh geometry.
+
+        Row semantics within each output interval (instantaneous step at the
+        output time versus an interval aggregate) are not established. In the
+        inspected 6.3.1 output the first row (simulation start) is all zero, and
+        the max/min water surface columns repeat the Water Surface dataset's
+        stored ``Maximum/Minimum Value of Data Set`` attributes rather than the
+        per-row extrema of the stored Water Surface rows.
+
+        Args:
+            hdf_path: Plan number, plan-result HDF path, or open HDF handle.
+            mesh_name: Name of the 2D flow area.
+
+        Returns:
+            pd.DataFrame: One row per Base Output time with columns
+            ``time_index``, ``time`` (stored Base Output ``Time`` values),
+            ``timestamp`` and the ten field columns, ``total_iterations``,
+            ``outer_loop_iterations``, ``inner_loop_iterations``,
+            ``outer_loop_max_water_surface_correction``,
+            ``max_water_surface_correction_cell_location``,
+            ``inner_loop_max_volume_residual_per_wet_area``,
+            ``max_volume_residual_cell_location``, ``total_volume_balance``,
+            ``max_water_surface_elevation`` and
+            ``min_water_surface_elevation``. Field values keep the stored
+            dtype. ``DataFrame.attrs`` carries ``diagnostic`` (True),
+            ``dataset_path``, ``mesh_name``, ``file_version``,
+            ``units_system``, ``clock`` (``"Base Output"``), ``time_source``,
+            ``timestamp_source``, ``time_units``, ``version_bounds``,
+            ``units`` (field -> unit or None) and ``columns`` (per-field
+            ``column_index``, verbatim ``label``, ``label_unit``, ``units``
+            and ``units_status``).
+
+        Raises:
+            KeyError: If the mesh has no ``Log Hydraulics`` dataset.
+            ValueError: If the file version, labels, shape, Location or clock
+                fall outside the accepted schema.
+        """
+        if isinstance(hdf_path, h5py.File):
+            return HdfResultsMesh._read_mesh_log_hydraulics(hdf_path, mesh_name)
+        with h5py.File(hdf_path, "r") as hdf_file:
+            return HdfResultsMesh._read_mesh_log_hydraulics(hdf_file, mesh_name)
+
+    @staticmethod
+    def _read_mesh_log_hydraulics(hdf_file: h5py.File, mesh_name: str) -> pd.DataFrame:
+        """Validate and read one ``Log Hydraulics`` table (see public method)."""
+        decode = HdfResultsMesh._decode_hdf_attr
+        path = "/" + HdfResultsMesh._get_mesh_timeseries_output_path(mesh_name, _LOG_HYDRAULICS_NAME)
+        dataset = hdf_file.get(path)
+        if dataset is None:
+            raise KeyError(f"No {_LOG_HYDRAULICS_NAME} dataset for mesh '{mesh_name}': {path}")
+        if not isinstance(dataset, h5py.Dataset) or dataset.ndim != 2 or dataset.dtype.kind not in "iuf":
+            raise ValueError(f"Unsupported {_LOG_HYDRAULICS_NAME} schema (rank-2 numeric required): {path}")
+
+        file_version = decode(hdf_file.attrs.get("File Version")).strip()
+        match = re.match(r"HEC-RAS (\d+)\.(\d+)(?!\d)", file_version)
+        low, high = _LOG_HYDRAULICS_VERSION_BOUNDS
+        if match is None or not low <= (int(match.group(1)), int(match.group(2))) < high:
+            raise ValueError(
+                f"{_LOG_HYDRAULICS_NAME} is qualified only for HEC-RAS 6.0-6.3.x; "
+                f"File Version is {file_version or 'absent'!r}: {path}"
+            )
+        if "Location" in dataset.attrs:
+            raise ValueError(f"{_LOG_HYDRAULICS_NAME} with a stored Location is not the qualified schema: {path}")
+
+        column_attrs = sorted(name for name in dataset.attrs if re.fullmatch(r"Column \d+", name))
+        n_columns = dataset.shape[1]
+        if n_columns != len(_LOG_HYDRAULICS_COLUMNS) or set(column_attrs) != {
+            f"Column {i}" for i in range(n_columns)
+        }:
+            raise ValueError(
+                f"{_LOG_HYDRAULICS_NAME} requires {len(_LOG_HYDRAULICS_COLUMNS)} columns labelled "
+                f"Column 0..{len(_LOG_HYDRAULICS_COLUMNS) - 1}; found shape {dataset.shape} "
+                f"and labels {column_attrs}: {path}"
+            )
+
+        units_system = decode(hdf_file.attrs.get("Units System")).strip()
+        family = _LOG_HYDRAULICS_UNIT_FAMILIES.get(units_system)
+        columns = []
+        for index, (field, labels, kind) in enumerate(_LOG_HYDRAULICS_COLUMNS):
+            raw = dataset.attrs[f"Column {index}"]
+            if np.asarray(raw).size != 1:
+                raise ValueError(f"Column {index} requires one stored label: {path}")
+            try:
+                label = decode(raw)
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"Invalid Column {index} label text: {path}") from exc
+            if label not in labels:
+                raise ValueError(
+                    f"Unqualified {_LOG_HYDRAULICS_NAME} Column {index} label {label!r}; "
+                    f"expected one of {list(labels)}: {path}"
+                )
+            suffix = re.search(r"\(([^()]+)\)$", label)
+            label_unit = suffix.group(1) if suffix else None
+            if kind == "count":
+                units, status = "count", "dimensionless_count"
+            elif kind == "cell_location":
+                units, status = None, "cell_location_index_base_unqualified"
+            elif len(labels) == 1:
+                units, status = None, "fixed_producer_label_not_unit_evidence"
+            elif family is None:
+                units, status = None, "units_system_unavailable"
+            elif label_unit in family:
+                units, status = label_unit, "label_matches_units_system"
+            else:
+                units, status = None, "label_conflicts_units_system"
+            columns.append({
+                "field": field, "column_index": index, "label": label,
+                "label_unit": label_unit, "units": units, "units_status": status,
+            })
+
+        base = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series"
+        rows = dataset.shape[0]
+        time = hdf_file.get(f"{base}/Time")
+        if (not isinstance(time, h5py.Dataset) or time.ndim != 1
+                or time.dtype.kind not in "iuf" or len(time) != rows):
+            raise ValueError(f"{_LOG_HYDRAULICS_NAME} rows differ from Base Output Time axis: {path}")
+        timestamp_source = None
+        for name, parse in (
+            ("Time Date Stamp (ms)", HdfUtils.parse_ras_datetime_ms),
+            ("Time Date Stamp", HdfUtils.parse_ras_datetime),
+        ):
+            stamps = hdf_file.get(f"{base}/{name}")
+            if stamps is None:
+                continue
+            if not isinstance(stamps, h5py.Dataset) or stamps.ndim != 1 or len(stamps) != rows:
+                raise ValueError(f"{_LOG_HYDRAULICS_NAME} rows differ from Base Output {name}: {path}")
+            timestamps = [parse(decode(value)) for value in stamps[()]]
+            timestamp_source = stamps.name
+            break
+        if timestamp_source is None:
+            raise ValueError(f"No Base Output Time Date Stamp for {_LOG_HYDRAULICS_NAME}: {path}")
+
+        values = dataset[()]
+        frame = pd.DataFrame({
+            "time_index": np.arange(rows, dtype=np.int64),
+            "time": time[()],
+            "timestamp": pd.to_datetime(timestamps),
+        })
+        for column in columns:
+            frame[column["field"]] = values[:, column["column_index"]]
+        time_units = decode(time.attrs.get("Time")).strip() or None
+        frame.attrs.update({
+            "diagnostic": True,
+            "dataset_path": dataset.name,
+            "mesh_name": mesh_name,
+            "file_version": file_version,
+            "units_system": units_system or None,
+            "clock": "Base Output",
+            "time_source": time.name,
+            "timestamp_source": timestamp_source,
+            "time_units": time_units,
+            "version_bounds": "HEC-RAS >=6.0,<6.4",
+            "units": {column["field"]: column["units"] for column in columns},
+            "columns": columns,
+        })
+        return frame
+
+    @staticmethod
+    def _get_mesh_temporal_maximum(
+        result_ds,
+        minimum_elevation: Optional[np.ndarray] = None,
+        max_chunk_bytes: int = 16 * 1024 * 1024,
+        max_chunk_rows: int = 32,
+    ) -> np.ndarray:
+        """Reduce a ``(time, cell)`` HDF dataset without materializing it.
+
+        Uses the optional native reduction (``fast_results``) when policy and
+        the dataset allow it; the loop below is the Python reference route.
+        """
+        native = fast_results.native_temporal_reduce(
+            result_ds, minimum_elevation, max_block_bytes=max_chunk_bytes
+        )
+        if native is not None:
+            return native.maximum
+        time_count, cell_count = result_ds.shape
+        maximum = np.full(cell_count, np.nan, dtype=np.float32)
+        if time_count == 0 or cell_count == 0:
+            return maximum
+
+        row_bytes = cell_count * np.dtype(np.float32).itemsize
+        rows_by_bytes = max(1, max_chunk_bytes // row_bytes)
+        chunk_rows = max(1, min(max_chunk_rows, rows_by_bytes))
+
+        if minimum_elevation is not None:
+            minimum_elevation = np.asarray(
+                minimum_elevation,
+                dtype=np.float32,
+            )
+
+        for start in range(0, time_count, chunk_rows):
+            stop = min(start + chunk_rows, time_count)
+            block = (slice(start, stop), slice(None))
+            values = np.array(
+                read_dataset(result_ds, block)
+                if isinstance(result_ds, h5py.Dataset) else result_ds[block],
+                dtype=np.float32,
+                copy=True,
+            )
+
+            if minimum_elevation is not None:
+                np.subtract(
+                    values,
+                    minimum_elevation[np.newaxis, :],
+                    out=values,
+                )
+
+            finite_values = np.isfinite(values)
+            if minimum_elevation is not None:
+                np.maximum(
+                    values,
+                    0.0,
+                    out=values,
+                    where=finite_values,
+                )
+            values[~finite_values] = np.nan
+
+            chunk_maximum = np.fmax.reduce(values, axis=0)
+            np.fmax(maximum, chunk_maximum, out=maximum)
+
+        return maximum
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type='plan_hdf')
+    def get_mesh_max_depth(
+        hdf_path: Path,
+        include_ghost_cells: bool = False,
+        *,
+        include_geometry: bool = True,
+    ) -> Union[gpd.GeoDataFrame, pd.DataFrame]:
         """
         Get the maximum depth for each 2D mesh cell.
 
-        The preferred source is the stored ``Depth`` time series. HEC-RAS
-        projects may omit that optional output while retaining ``Water
-        Surface`` and ``Cells Minimum Elevation``. In that case this method
-        computes depth at every timestep as water surface minus minimum cell
-        elevation, clips negative values to zero, and then takes the temporal
-        maximum.
+        The preferred source is the stored ``Depth`` time series. HEC-RAS can
+        omit that optional output while retaining ``Water Surface`` and
+        ``Cells Minimum Elevation``. In that case, depth is derived at every
+        timestep as water surface minus minimum cell elevation, clipped at
+        zero, and then reduced to the temporal maximum.
+
+        Non-finite samples are ignored when a cell has at least one finite
+        sample. A cell with no finite samples is returned with a NaN maximum.
+        Both stored and derived time series are reduced in bounded time
+        chunks rather than materialized as a complete ``(time, cell)`` array;
+        HDF5 still decompresses each whole storage chunk that a read touches.
+
+        One INFO message per mesh identifies provenance. If the HDF contains
+        ``Depth``, that stored HEC-RAS dataset is read only. Otherwise, depth
+        is derived in memory from ``Water Surface`` minus ``Cells Minimum
+        Elevation``; the method does not create or write a ``Depth`` dataset.
 
         Attribution: Implementation pattern derived from ras-agent
         (https://github.com/gheistand/ras-agent) by Glenn Heistand / CHAMP —
@@ -1402,39 +2675,91 @@ class HdfResultsMesh:
 
         Args:
             hdf_path (Path): Path to the HDF file.
+            include_ghost_cells (bool): Keep rows for the ghost cells HEC-RAS
+                writes outside the mesh perimeter (default False).
+            include_geometry (bool): Keyword-only. Default True is the
+                convenient output: the GeoDataFrame below. False is the fast
+                output: a DataFrame with the same
+                rows, order and values but no ``geometry`` column, without
+                reading cell-center coordinates or building Shapely points:
+                ``mesh_name`` (pandas ``str``/``string``), ``cell_id`` (``int64``),
+                ``maximum_depth`` (``float32``), ``is_ghost_cell`` (``bool``).
 
         Returns:
             gpd.GeoDataFrame: GeoDataFrame with columns:
                 - mesh_name (str): Name of the 2D flow area
                 - cell_id (int): Cell index
                 - maximum_depth (float): Maximum depth at that cell
+                - is_ghost_cell (bool): True for ghost cells outside the
+                  perimeter (cell IDs at or above the area's ``Cell Count``)
                 - geometry (Point): Cell center point geometry
+
+        Raises:
+            ValueError: If the HDF file cannot be read, a declared mesh is
+                missing required geometry or result datasets, or their
+                dimensions and cell counts are inconsistent.
         """
-        from shapely.geometry import Point
+        if include_geometry:
+            GeoDataFrame = gpd.GeoDataFrame  # Fail fast with the install command.
+            points = require_module(
+                "shapely", "Returning GeoDataFrame results from HdfResultsMesh"
+            ).points
 
         try:
+            source_name = Path(hdf_path).name
+
+            def empty_result(crs=None) -> gpd.GeoDataFrame:
+                if not include_geometry:
+                    return pd.DataFrame({
+                        "mesh_name": pd.Series(dtype=HdfUtils._TEXT_DTYPE),
+                        "cell_id": pd.Series(dtype="int64"),
+                        "maximum_depth": pd.Series(dtype="float32"),
+                        "is_ghost_cell": pd.Series(dtype="bool"),
+                    })
+                return GeoDataFrame(
+                    {
+                        "mesh_name": pd.Series(dtype="object"),
+                        "cell_id": pd.Series(dtype="int64"),
+                        "maximum_depth": pd.Series(dtype="float32"),
+                        "is_ghost_cell": pd.Series(dtype="bool"),
+                        "geometry": gpd.GeoSeries([], crs=crs),
+                    },
+                    geometry="geometry",
+                    crs=crs,
+                )
+
             dfs = []
             with h5py.File(hdf_path, 'r') as hdf_file:
-                crs = HdfBase.get_projection(hdf_file)
+                crs = HdfBase.get_projection(hdf_file) if include_geometry else None
                 d2_flow_areas = hdf_file.get("Geometry/2D Flow Areas/Attributes")
-                if d2_flow_areas is None:
+                if d2_flow_areas is None or len(d2_flow_areas) == 0:
                     logger.debug("No 2D Flow Areas found in HDF file")
-                    return gpd.GeoDataFrame(
-                        columns=["mesh_name", "cell_id", "maximum_depth", "geometry"],
-                        geometry="geometry",
-                        crs=crs,
-                    )
+                    return empty_result(crs)
+                cell_counts = HdfResultsMesh._physical_cell_counts(hdf_file)
 
-                for d2_flow_area in d2_flow_areas[:]:
+                for d2_flow_area in read_typed(d2_flow_areas, slice(None)):
                     mesh_name = HdfUtils.convert_ras_string(d2_flow_area[0])
 
                     # Read cell centers
                     cc_path = f"Geometry/2D Flow Areas/{mesh_name}/Cells Center Coordinate"
                     cc_ds = hdf_file.get(cc_path)
                     if cc_ds is None:
-                        logger.warning(f"Cell centers not found for mesh '{mesh_name}'")
-                        continue
-                    xy = np.array(cc_ds, dtype=np.float64)
+                        raise ValueError(
+                            f"Cell centers are missing for mesh '{mesh_name}'"
+                        )
+                    # The table needs only the cell count, so it validates the
+                    # stored shape without reading the coordinates.
+                    xy = (
+                        np.asarray(read_typed(cc_ds), dtype=np.float64)
+                        if include_geometry else None
+                    )
+                    xy_shape = xy.shape if include_geometry else tuple(cc_ds.shape)
+                    if len(xy_shape) != 2 or xy_shape[1] != 2:
+                        raise ValueError(
+                            f"Cell-center shape {xy_shape} is not an (N, 2) "
+                            f"coordinate array for mesh '{mesh_name}'"
+                        )
+                    cell_center_count = xy_shape[0]
 
                     # Read depth time series
                     depth_path = (
@@ -1443,7 +2768,21 @@ class HdfResultsMesh:
                     )
                     depth_ds = hdf_file.get(depth_path)
                     if depth_ds is not None:
-                        depths = np.asarray(depth_ds, dtype=np.float32)
+                        if depth_ds.ndim != 2 or depth_ds.shape[1] != cell_center_count:
+                            raise ValueError(
+                                f"Depth shape {depth_ds.shape} does not align "
+                                f"with cell-center count {cell_center_count} for mesh "
+                                f"'{mesh_name}'"
+                            )
+                        max_depth = HdfResultsMesh._get_mesh_temporal_maximum(
+                            depth_ds
+                        )
+                        logger.info(
+                            "Maximum-depth source for mesh '%s' in '%s': "
+                            "stored HEC-RAS HDF 'Depth' time series (read only).",
+                            mesh_name,
+                            source_name,
+                        )
                     else:
                         wse_path = (
                             f"Results/Unsteady/Output/Output Blocks/Base Output/"
@@ -1464,72 +2803,92 @@ class HdfResultsMesh:
                                 "Water Surface plus Cells Minimum Elevation "
                                 "are not both available"
                             )
-                        water_surface = np.asarray(wse_ds, dtype=np.float32)
+
                         minimum_elevation = np.asarray(
-                            minimum_elevation_ds,
+                            read_typed(minimum_elevation_ds),
                             dtype=np.float32,
                         )
+                        if minimum_elevation.ndim != 1:
+                            raise ValueError(
+                                "Cells Minimum Elevation shape "
+                                f"{minimum_elevation.shape} is not one-dimensional "
+                                f"for mesh '{mesh_name}'"
+                            )
+
                         if (
-                            water_surface.ndim != 2
-                            or water_surface.shape[1] != len(minimum_elevation)
+                            wse_ds.ndim != 2
+                            or wse_ds.shape[1] != minimum_elevation.shape[0]
                         ):
                             raise ValueError(
-                                f"Water Surface shape {water_surface.shape} "
-                                "does not align with Cells Minimum Elevation "
-                                f"count {len(minimum_elevation)} for mesh "
+                                f"Water Surface shape {wse_ds.shape} does not "
+                                "align with Cells Minimum Elevation count "
+                                f"{minimum_elevation.shape[0]} for mesh "
                                 f"'{mesh_name}'"
                             )
-                        depths = np.maximum(
-                            water_surface - minimum_elevation[np.newaxis, :],
-                            0.0,
+                        if wse_ds.shape[1] != cell_center_count:
+                            raise ValueError(
+                                f"Depth shape {wse_ds.shape} does not align "
+                                f"with cell-center count {cell_center_count} for mesh "
+                                f"'{mesh_name}'"
+                            )
+
+                        max_depth = HdfResultsMesh._get_mesh_temporal_maximum(
+                            wse_ds,
+                            minimum_elevation=minimum_elevation,
                         )
-                        logger.debug(
-                            "Computed depth from Water Surface and Cells "
-                            "Minimum Elevation for mesh '%s'",
+                        logger.info(
+                            "Maximum-depth source for mesh '%s' in '%s': "
+                            "derived in memory by ras-commander from HEC-RAS "
+                            "HDF 'Water Surface' minus 'Cells Minimum "
+                            "Elevation'; no 'Depth' dataset was created or "
+                            "written.",
                             mesh_name,
+                            source_name,
                         )
 
-                    if depths.ndim != 2 or depths.shape[1] != len(xy):
-                        raise ValueError(
-                            f"Depth shape {depths.shape} does not align with "
-                            f"cell-center count {len(xy)} for mesh '{mesh_name}'"
-                        )
-                    finite_cells = np.any(np.isfinite(depths), axis=0)
-                    max_depth = np.full(depths.shape[1], np.nan, dtype=np.float32)
-                    max_depth[finite_cells] = np.nanmax(
-                        depths[:, finite_cells],
-                        axis=0,
-                    )
+                    if len(max_depth) == 0:
+                        continue
 
-                    geom = [Point(x, y) for x, y in xy]
-                    df = gpd.GeoDataFrame({
+                    columns = {
                         "mesh_name": [mesh_name] * len(max_depth),
                         "cell_id": range(len(max_depth)),
                         "maximum_depth": max_depth,
-                    }, geometry=geom)
+                    }
+                    if include_geometry:
+                        # One vectorized call; Point(x, y) per row builds the same points.
+                        geom = points(xy)
+                        df = GeoDataFrame(columns, geometry=geom)
+                    else:
+                        df = pd.DataFrame(columns)
+                    df = HdfResultsMesh._flag_ghost_cell_rows(
+                        df, mesh_name, cell_counts, include_ghost_cells
+                    )
                     dfs.append(df)
 
             if not dfs:
-                return gpd.GeoDataFrame(
-                    columns=["mesh_name", "cell_id", "maximum_depth", "geometry"],
-                    geometry="geometry",
-                    crs=crs,
-                )
+                return empty_result(crs)
 
-            result = gpd.GeoDataFrame(
+            if not include_geometry:
+                result = pd.concat(dfs, ignore_index=True)
+                result["mesh_name"] = result["mesh_name"].astype(HdfUtils._TEXT_DTYPE)
+                logger.debug(f"Extracted max depth for {len(result)} cells")
+                return result
+
+            result = GeoDataFrame(
                 pd.concat(dfs, ignore_index=True),
                 geometry="geometry",
                 crs=crs,
             )
-            if crs:
-                result.set_crs(crs, inplace=True)
 
             logger.debug(f"Extracted max depth for {len(result)} cells")
             return result
 
+        except OptionalDependencyError:
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error in get_mesh_max_depth: {str(e)}")
-            raise ValueError(f"Failed to get maximum depth: {str(e)}")
+            raise ValueError(f"Failed to get maximum depth: {str(e)}") from e
 
     @staticmethod
     @log_call
@@ -1550,24 +2909,29 @@ class HdfResultsMesh:
         Illinois State Water Survey. See results.py:cells_to_raster().
 
         Reads cell centers and max depth from the HDF file, interpolates onto
-        a regular grid using scipy.interpolate.griddata, and writes a COG with
-        LZW compression and overviews.
+        a regular grid using a SciPy interpolator evaluated in bounded blocks,
+        and writes a COG in windows with LZW compression and overviews. Output
+        values and interpolation queries are bounded by the window size; the
+        input mesh and GDAL write buffers still consume memory.
 
         Args:
             hdf_path (Path): Path to the HDF file.
             output_path (Union[str, Path], optional): Output GeoTIFF path.
                 If None, writes to a temporary file.
             resolution_m (float): Grid cell size in CRS units (default 3.0).
-            crs: Output CRS. If None, uses the CRS from the HDF file.
+            crs (pyproj.CRS or str, optional): Output CRS. If None, uses the CRS from the HDF file.
             method (str): Interpolation method for griddata (default "linear").
             nodata (float): Nodata value for the raster (default -9999.0).
 
         Returns:
             Path: Path to the written GeoTIFF file.
+
+        Raises:
+            ValueError: If no depth rows exist or no rows have both a finite
+                maximum depth and finite point coordinates.
         """
         import rasterio
         from rasterio.transform import from_bounds
-        from scipy.interpolate import griddata as scipy_griddata
 
         gdf = HdfResultsMesh.get_mesh_max_depth(hdf_path)
         if gdf.empty:
@@ -1575,13 +2939,21 @@ class HdfResultsMesh:
 
         xy = np.column_stack([gdf.geometry.x, gdf.geometry.y])
         values = gdf["maximum_depth"].values
+        usable = np.isfinite(values) & np.all(np.isfinite(xy), axis=1)
+        if not np.any(usable):
+            raise ValueError("No usable finite depth points found in HDF file")
+        if not np.all(usable):
+            logger.debug(
+                "Excluded %s of %s maximum-depth rows with non-finite values "
+                "or coordinates before raster interpolation",
+                int(np.count_nonzero(~usable)),
+                len(usable),
+            )
+            xy = xy[usable]
+            values = values[usable]
 
-        if output_path is None:
-            import tempfile
-            tmp = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
-            output_path = Path(tmp.name)
-            tmp.close()
-        else:
+        owns_temporary_output = output_path is None
+        if output_path is not None:
             output_path = Path(output_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1596,29 +2968,32 @@ class HdfResultsMesh:
         rows = max(2, int(np.ceil((y_max - y_min) / resolution_m)) + 1)
         grid_x = np.linspace(x_min, x_max, cols)
         grid_y = np.linspace(y_max, y_min, rows)
-        gx, gy = np.meshgrid(grid_x, grid_y)
-
-        grid_vals = scipy_griddata(
-            points=xy,
-            values=values.astype(np.float64),
-            xi=(gx, gy),
-            method=method,
-            fill_value=nodata,
-        ).astype(np.float32)
-
-        grid_vals = np.where(np.isnan(grid_vals), nodata, grid_vals)
+        interpolator = _build_interpolator(
+            xy, values.astype(np.float64), method, nodata,
+        )
         transform = from_bounds(x_min, y_min, x_max, y_max, cols, rows)
 
-        with rasterio.open(
-            str(output_path), "w",
-            driver="GTiff", height=rows, width=cols, count=1,
-            dtype=np.float32, crs=crs, transform=transform, nodata=nodata,
-            compress="lzw", tiled=True, blockxsize=256, blockysize=256,
-            BIGTIFF="IF_SAFER",
-        ) as dst:
-            dst.write(grid_vals, 1)
-            dst.build_overviews([2, 4, 8, 16], rasterio.enums.Resampling.average)
-            dst.update_tags(ns="rio_overview", resampling="average")
+        if owns_temporary_output:
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+            output_path = Path(tmp.name)
+            tmp.close()
+
+        try:
+            with rasterio.open(
+                str(output_path), "w",
+                driver="GTiff", height=rows, width=cols, count=1,
+                dtype=np.float32, crs=crs, transform=transform, nodata=nodata,
+                compress="lzw", tiled=True, blockxsize=256, blockysize=256,
+                BIGTIFF="IF_SAFER",
+            ) as dst:
+                _write_interpolated_raster(dst, grid_x, grid_y, interpolator, nodata)
+                dst.build_overviews([2, 4, 8, 16], rasterio.enums.Resampling.average)
+                dst.update_tags(ns="rio_overview", resampling="average")
+        except Exception:
+            if owns_temporary_output:
+                output_path.unlink(missing_ok=True)
+            raise
 
         logger.info("Wrote max depth raster (%sx%s px, %sm): %s", rows, cols, resolution_m, output_path.name)
         logger.debug("Max depth raster path: %s", output_path)
@@ -1664,7 +3039,10 @@ class HdfResultsMesh:
                 ``resolution`` is omitted.
             method: Rasterization method. ``nearest`` uses a precomputed cell
                 center nearest-neighbor lookup. ``linear`` and ``cubic`` use
-                scipy grid interpolation.
+                SciPy interpolation evaluated and written in bounded windows.
+                The mesh mask and nearest-cell indices remain in memory. Linear
+                and cubic batches reuse one triangulation within this call;
+                each timestamp retains its own values and cubic gradients.
             nodata: GeoTIFF nodata value.
 
         Returns:
@@ -1740,16 +3118,24 @@ class HdfResultsMesh:
         elif mesh_name not in mesh_names:
             raise ValueError(f"Mesh '{mesh_name}' not found. Available meshes: {mesh_names}")
 
-        cell_points = HdfMesh.get_mesh_cell_points(geom_source)
-        if cell_points.empty:
+        all_points = HdfMesh.get_mesh_cell_points(geom_source)
+        if all_points.empty:
             raise ValueError(f"No 2D mesh cell centers found in {geom_source}")
-        cell_points = cell_points[cell_points["mesh_name"] == mesh_name].copy()
-        if cell_points.empty:
+        all_points = all_points[all_points["mesh_name"] == mesh_name]
+        if all_points.empty:
             raise ValueError(f"No 2D mesh cell centers found for mesh '{mesh_name}'")
+        # The grid extent spans every center, including the ghost centers on
+        # the perimeter. Values come from physical cells only: ghost cells have
+        # no minimum elevation and their depth is not a solution value.
+        physical_counts = HdfResultsMesh._physical_cell_counts_from_path(geom_source)
+        cell_points = all_points.sort_values("cell_id")
+        if mesh_name in physical_counts:
+            cell_points = cell_points[cell_points["cell_id"] < physical_counts[mesh_name]]
+        cell_points = cell_points.copy()
 
         x = cell_points.geometry.x.to_numpy(dtype=float)
         y = cell_points.geometry.y.to_numpy(dtype=float)
-        x_min, y_min, x_max, y_max = cell_points.total_bounds
+        x_min, y_min, x_max, y_max = all_points.total_bounds
         if resolution is None:
             longest_side = max(float(x_max - x_min), float(y_max - y_min))
             resolution = longest_side / float(max_dimension)
@@ -1764,18 +3150,11 @@ class HdfResultsMesh:
         y_res = (y_max - y_min) / rows
         grid_x = np.linspace(x_min + x_res / 2.0, x_max - x_res / 2.0, cols)
         grid_y = np.linspace(y_max - y_res / 2.0, y_min + y_res / 2.0, rows)
-        gx, gy = np.meshgrid(grid_x, grid_y)
-        grid_points = np.column_stack([gx.ravel(), gy.ravel()])
-
-        if method == "nearest":
-            from scipy.spatial import cKDTree
-
-            tree = cKDTree(np.column_stack([x, y]))
-            _, nearest_indices = tree.query(grid_points)
-        else:
-            from scipy.interpolate import griddata as scipy_griddata
-
-            nearest_indices = None
+        points = np.column_stack([x, y])
+        nearest_indices = (
+            _nearest_grid_indices(points, grid_x, grid_y)
+            if method == "nearest" else None
+        )
 
         mesh_areas = HdfMesh.get_mesh_areas(geom_source)
         mesh_areas = mesh_areas[mesh_areas["mesh_name"] == mesh_name] if not mesh_areas.empty else mesh_areas
@@ -1806,14 +3185,20 @@ class HdfResultsMesh:
 
         with h5py.File(hdf_path, "r") as result_hdf, h5py.File(geom_source, "r") as geom_hdf:
             if time_stamp_path in result_hdf:
-                raw_times = result_hdf[time_stamp_path][()]
-                hdf_times = pd.DatetimeIndex(
-                    [_parse_timestamp(value.decode("utf-8")) for value in raw_times]
-                ).round("s")
+                raw_times = read_typed(result_hdf[time_stamp_path])
+                parsed_times = [
+                    _parse_timestamp(value.decode("utf-8")) for value in raw_times
+                ]
+                if parsed_times:
+                    # Preserve irregular source stamps; only out-of-range dates
+                    # require a wider-range, microsecond time axis.
+                    hdf_times = HdfUtils._datetime_index(parsed_times, round_to="s")
+                else:
+                    hdf_times = pd.DatetimeIndex([])
             elif time_path in result_hdf:
                 start_time = HdfBase.get_simulation_start_time(result_hdf)
                 hdf_times = HdfUtils.convert_timesteps_to_datetimes(
-                    np.asarray(result_hdf[time_path][()]),
+                    np.asarray(read_typed(result_hdf[time_path])),
                     start_time,
                     round_to="s",
                 )
@@ -1830,11 +3215,12 @@ class HdfResultsMesh:
                 )
 
             min_elev = (
-                np.asarray(geom_hdf[min_elev_path][()], dtype=np.float32)
+                np.asarray(read_typed(geom_hdf[min_elev_path]), dtype=np.float32)
                 if depth_path not in result_hdf
                 else None
             )
 
+            triangulation = None
             for original_value, target_time in zip(timestamp_values, target_times):
                 exact_matches = np.flatnonzero(hdf_times == target_time)
                 if len(exact_matches):
@@ -1850,10 +3236,12 @@ class HdfResultsMesh:
                     time_index = nearest_position
 
                 if depth_path in result_hdf:
-                    values = np.asarray(result_hdf[depth_path][time_index], dtype=np.float32)
+                    values = np.asarray(read_typed(result_hdf[depth_path], time_index), dtype=np.float32)
                 else:
-                    wse = np.asarray(result_hdf[wse_path][time_index], dtype=np.float32)
+                    wse = np.asarray(read_typed(result_hdf[wse_path], time_index), dtype=np.float32)
                     values = np.maximum(wse - min_elev, 0.0).astype(np.float32)
+                # Physical cells precede ghost cells in result arrays.
+                values = values[: len(cell_points)]
                 values = np.where(np.isfinite(values), values, 0.0).astype(np.float32)
 
                 if len(values) != len(cell_points):
@@ -1862,19 +3250,17 @@ class HdfResultsMesh:
                         f"({len(cell_points)}) for mesh '{mesh_name}'"
                     )
 
-                if method == "nearest":
-                    grid_values = values[nearest_indices].reshape(rows, cols)
-                else:
-                    grid_values = scipy_griddata(
-                        points=np.column_stack([x, y]),
-                        values=values.astype(np.float64),
-                        xi=(gx, gy),
-                        method=method,
-                        fill_value=nodata,
-                    ).astype(np.float32)
-                    grid_values = np.where(np.isnan(grid_values), nodata, grid_values)
+                interpolator = None
+                if method != "nearest":
+                    if len(timestamp_values) > 1 and triangulation is None:
+                        from scipy.spatial import Delaunay
 
-                grid_values = np.where(mesh_mask, grid_values, nodata).astype(np.float32)
+                        triangulation = Delaunay(points)
+                    interpolator = _build_interpolator(
+                        points, values.astype(np.float64), method, nodata,
+                        triangulation=triangulation,
+                    )
+
                 safe_label = _safe_timestamp_label(original_value, target_time)
                 raster_path = output_dir / f"Depth ({safe_label}).hdf.tif"
 
@@ -1892,7 +3278,12 @@ class HdfResultsMesh:
                     compress="lzw",
                     BIGTIFF="IF_SAFER",
                 ) as dst:
-                    dst.write(grid_values, 1)
+                    _write_interpolated_raster(
+                        dst, grid_x, grid_y, interpolator, nodata,
+                        mesh_mask=mesh_mask,
+                        nearest_values=values if method == "nearest" else None,
+                        nearest_indices=nearest_indices,
+                    )
                     dst.update_tags(
                         mesh_name=mesh_name,
                         timestamp=target_time.strftime("%d%b%Y %H:%M:%S"),
@@ -1927,7 +3318,7 @@ class HdfResultsMesh:
         Args:
             plan_number (str): Plan number (e.g., "01").
             profile (str): Profile to map — "Max", "Min", or timestamp string.
-            ras_object: Optional RAS project object.
+            ras_object (RasPrj, optional): Optional RAS project object.
             ras_version (str): Optional HEC-RAS version for RasProcess.exe.
             timeout (int): RasProcess.exe timeout in seconds (default 600).
 
@@ -1990,12 +3381,129 @@ class HdfResultsMesh:
         """
         return f"Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/2D Flow Areas/{mesh_name}/{var_name}"
 
+    @staticmethod
+    def _mesh_series_id_dim(hdf_file: h5py.File, mesh_name: str, dataset: h5py.Dataset) -> str:
+        """Qualify time-only data or a Location/exact legacy schema domain.
+
+        Present Location is authoritative and cannot fall back to a name rule.
+        Missing Location uses only the immutable stable-core table in the
+        canonical namespace. Geometry counts include ghosts; physical-cell
+        filtering occurs after qualification. Cell centers are numeric coordinate
+        pairs; face-point indexes are integer pairs. Time-only series have no domain.
+
+        The stored ``Location`` rule below (main's rule, read through
+        ``fast_hdf.read_attr``) decides the domain in every mode, so an invalid
+        or contradictory ``Location`` is refused with the same ``ValueError``
+        whether or not the native engine is installed. With the native engine,
+        the engine's typed domain of a canonical Base Output series
+        (``fast_hdf.mesh_series_domain``) is a cross-check only: when it
+        qualifies a cell/face domain that differs from the rule's, auto mode keeps
+        the rule's answer and required mode raises ``FastHdfError``. Geometry
+        checks always run.
+        """
+        if not isinstance(dataset, h5py.Dataset) or dataset.ndim not in (1, 2) or dataset.dtype.kind not in "iuf":
+            raise ValueError(f"Unsupported numeric time/element schema: {dataset.name}")
+        time = hdf_file.get(
+            "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Time"
+        )
+        if (not isinstance(time, h5py.Dataset) or time.ndim != 1
+                or time.dtype.kind not in "iuf"):
+            raise ValueError(f"Series rows differ from Base Output Time axis: {dataset.name}")
+        if dataset.shape[0] != len(time):
+            raise MeshSeriesAvailabilityError.from_dataset(dataset, len(time))
+        native = HdfResultsMesh._native_series_domain(dataset)
+        if "Location" in dataset.attrs:
+            location = np.asarray(read_attr(dataset, "Location"))
+            if location.shape not in ((), (1,)):
+                raise ValueError(f"Location requires one stored text value: {dataset.name}")
+            location = location.reshape(-1)[0]
+            if isinstance(location, bytes):
+                try:
+                    location = location.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(f"Invalid stored Location text: {dataset.name}") from exc
+            if not isinstance(location, str) or location not in {"Cells", "Cell", "Faces"}:
+                raise ValueError(f"Invalid or unqualified stored Location: {dataset.name}")
+            if dataset.ndim != 2:
+                raise ValueError(f"Stored Location contradicts time-only schema: {dataset.name}")
+            id_dim = "cell_id" if location in {"Cells", "Cell"} else "face_id"
+        elif dataset.ndim == 1:
+            return "time"
+        else:
+            name = dataset.name.rsplit("/", 1)[-1]
+            canonical_path = "/" + HdfResultsMesh._get_mesh_timeseries_output_path(mesh_name, name)
+            id_dim = _LEGACY_MESH_SERIES_DOMAINS.get(name)
+            if dataset.name != canonical_path or id_dim is None:
+                raise ValueError(f"Missing Location and no qualified legacy schema: {dataset.name}")
+            logger.debug(
+                "Legacy stable-core mesh series schema supplies %s for exact name '%s' at '%s'",
+                id_dim, name, dataset.name,
+            )
+        if (native is not None and native.get("id_dim") in {"cell_id", "face_id"}
+                and native["id_dim"] != id_dim):
+            message = (f"Engine series domain {native['id_dim']!r} contradicts the stored "
+                       f"Location/legacy rule {id_dim!r}: {dataset.name}")
+            if native_required():
+                raise FastHdfError(message)
+            logger.debug("%s; using the stored rule", message)
+        is_cell = id_dim == "cell_id"
+        geometry_name = "Cells Center Coordinate" if is_cell else "Faces FacePoint Indexes"
+        geometry = hdf_file.get(f"Geometry/2D Flow Areas/{mesh_name}/{geometry_name}")
+        if geometry is None or not isinstance(geometry, h5py.Dataset) or geometry.ndim < 1:
+            raise ValueError(f"Geometry count for qualified series domain absent: {dataset.name}")
+        if dataset.shape[1] != len(geometry):
+            raise ValueError(f"Qualified series domain contradicts geometry count: {dataset.name}")
+        if (geometry.ndim != 2 or geometry.shape[1] != 2
+                or geometry.dtype.kind not in ("iuf" if is_cell else "iu")):
+            raise ValueError(
+                f"Unqualified geometry schema for series domain: {geometry.name} "
+                f"(shape={geometry.shape}, dtype={geometry.dtype})"
+            )
+        if is_cell:
+            physical_count = HdfResultsMesh._physical_cell_counts(hdf_file).get(mesh_name)
+            if physical_count is not None and not 0 <= physical_count <= len(geometry):
+                raise ValueError(f"Physical Cell Count contradicts stored geometry: {dataset.name}")
+        return "cell_id" if is_cell else "face_id"
+
+    @staticmethod
+    def _native_series_domain(dataset: h5py.Dataset) -> Optional[Dict[str, Any]]:
+        """Engine domain of a canonical Base Output mesh series, or None.
+
+        None in python mode, for non-canonical paths, and (auto mode) when the
+        engine cannot describe the series; required mode raises FastHdfError.
+        """
+        try:
+            return mesh_series_domain(dataset)
+        except ValueError:
+            # Not a canonical Base Output 2D mesh series path.
+            return None
+
+    @staticmethod
+    def _discover_mesh_series(hdf_file: h5py.File, mesh_name: str) -> Dict[str, str]:
+        """Enumerate actual numeric datasets and report per-entry refusals."""
+        group_path = HdfResultsMesh._get_mesh_timeseries_output_path(mesh_name, "")
+        group = hdf_file.get(group_path)
+        if group is None:
+            return {}
+        variables = {}
+        for name, dataset in group.items():
+            if not isinstance(dataset, h5py.Dataset) or dataset.dtype.kind not in "iuf":
+                continue
+            try:
+                id_dim = HdfResultsMesh._mesh_series_id_dim(hdf_file, mesh_name, dataset)
+                if id_dim != "time":
+                    variables[name] = id_dim
+            except ValueError as exc:
+                logger.warning("Skipping unqualified mesh series '%s': %s", dataset.name, exc)
+        return variables
+
 
     @staticmethod
     def _get_mesh_cells_timeseries_output(hdf_path: h5py.File,
                                          mesh_names: Optional[Union[str, List[str]]] = None,
                                          var: Optional[str] = None,
-                                         truncate: bool = False) -> Dict[str, xr.Dataset]:
+                                         truncate: bool = False,
+                                         include_ghost_cells: bool = False) -> Dict[str, xr.Dataset]:
         """
         Get mesh cells timeseries output for specified meshes and variables.
 
@@ -2004,6 +3512,8 @@ class HdfResultsMesh:
             mesh_names (Optional[Union[str, List[str]]]): Name(s) of the mesh(es). If None, processes all available meshes.
             var (Optional[str]): Name of the variable to retrieve. If None, retrieves all variables.
             truncate (bool): If True, truncates the output to remove trailing zeros.
+            include_ghost_cells (bool): If False, drops ghost-cell columns from
+                cell variables.
 
         Returns:
             Dict[str, xr.Dataset]: **Dictionary of Datasets for multiple meshes**.
@@ -2022,14 +3532,12 @@ class HdfResultsMesh:
         Raises:
             ValueError: If there's an error processing the timeseries output data.
         """
-        TIME_SERIES_OUTPUT_VARS = {
-            "cell": HdfResultsMesh.MESH_CELL_TIME_SERIES_OUTPUT_VARS,
-            "face": HdfResultsMesh.MESH_FACE_TIME_SERIES_OUTPUT_VARS
-        }
-
         try:
             start_time = HdfBase.get_simulation_start_time(hdf_path)
-            time_stamps = HdfBase.get_unsteady_timestamps(hdf_path)
+            time_stamps = HdfUtils._datetime_index(
+                HdfBase.get_unsteady_timestamps(hdf_path)
+            ).to_numpy()
+            cell_counts = HdfResultsMesh._physical_cell_counts(hdf_path)
 
             if mesh_names is None:
                 mesh_names = HdfResultsMesh._get_available_meshes(hdf_path)
@@ -2039,11 +3547,12 @@ class HdfResultsMesh:
             explicit_var = var is not None
             if explicit_var:
                 variables = [var]
-            else:
-                variables = TIME_SERIES_OUTPUT_VARS["cell"] + TIME_SERIES_OUTPUT_VARS["face"]
 
             datasets = {}
             for mesh_name in mesh_names:
+                if not explicit_var:
+                    variables = list(HdfResultsMesh._discover_mesh_series(hdf_path, mesh_name))
+                cell_count = cell_counts.get(mesh_name)
                 data_vars = {}
                 missing_optional_variables = []
                 for variable in variables:
@@ -2062,9 +3571,19 @@ class HdfResultsMesh:
                             continue
 
                         dataset = hdf_path[path]
-                        values = dataset[:]
+                        id_dim = HdfResultsMesh._mesh_series_id_dim(hdf_path, mesh_name, dataset)
+                        if id_dim == "cell_id" and dataset.ndim == 2:
+                            physical_count = HdfResultsMesh._physical_cell_count(
+                                cell_counts, mesh_name, include_ghost_cells
+                            )
+                        else:
+                            physical_count = None
+                        if not include_ghost_cells and physical_count is not None:
+                            values = read_dataset(dataset, (slice(None), slice(None, physical_count)))
+                        else:
+                            values = read_dataset(dataset)
                         units = HdfResultsMesh._decode_hdf_attr(
-                            dataset.attrs.get("Units", "")
+                            read_attr(dataset, "Units", "")
                         )
 
                         if truncate:
@@ -2087,14 +3606,15 @@ class HdfResultsMesh:
                             logger.warning(f"Mismatch between time steps ({len(truncated_time_stamps)}) and data shape ({values.shape}) for variable {variable}")
                             continue
 
-                        # Determine if this is a face-based or cell-based variable
-                        id_dim = "face_id" if variable in TIME_SERIES_OUTPUT_VARS["face"] else "cell_id"
-
-                        data_vars[variable] = xr.DataArray(
+                        data_array = xr.DataArray(
                             data=values,
-                            dims=['time', id_dim],
-                            coords={'time': truncated_time_stamps, id_dim: np.arange(values.shape[1])},
+                            dims=['time', id_dim] if values.ndim == 2 else ['time'],
+                            coords=({'time': truncated_time_stamps, id_dim: np.arange(values.shape[1])}
+                                    if values.ndim == 2 else {'time': truncated_time_stamps}),
                             attrs={'units': units}
+                        )
+                        data_vars[variable] = HdfResultsMesh._flag_ghost_cell_coord(
+                            data_array, cell_count
                         )
                     except KeyError:
                         if explicit_var:
@@ -2105,19 +3625,23 @@ class HdfResultsMesh:
                             )
                         else:
                             missing_optional_variables.append(variable)
+                    except OptionalDependencyError:
+                        raise
                     except Exception as e:
+                        reraise_required(e)
+                        if explicit_var:
+                            raise
                         logger.error(f"Error processing variable '{variable}' for mesh '{mesh_name}': {str(e)}")
 
-                if missing_optional_variables:
-                    logger.debug(
-                        "Mesh '%s' time-series probe found %s variable(s) and skipped %s unavailable variable(s). "
-                        "Available: %s. Missing: %s",
-                        mesh_name,
-                        len(data_vars),
-                        len(missing_optional_variables),
-                        ", ".join(data_vars.keys()) if data_vars else "none",
-                        ", ".join(missing_optional_variables),
-                    )
+                logger.debug(
+                    "Mesh '%s' time-series probe found %s variable(s) and skipped %s unavailable variable(s). "
+                    "Available: %s. Missing: %s",
+                    mesh_name,
+                    len(data_vars),
+                    len(missing_optional_variables),
+                    ", ".join(data_vars.keys()) if data_vars else "none",
+                    ", ".join(missing_optional_variables),
+                )
 
                 if data_vars:
                     datasets[mesh_name] = xr.Dataset(
@@ -2135,7 +3659,10 @@ class HdfResultsMesh:
                         logger.warning(f"No valid data variables found for mesh '{mesh_name}'")
 
             return datasets
+        except (OptionalDependencyError, MeshSeriesAvailabilityError):
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error in _mesh_cells_timeseries_output: {str(e)}")
             raise ValueError(f"Error processing timeseries output data: {e}")
 
@@ -2176,16 +3703,17 @@ class HdfResultsMesh:
                 raise ValueError(f"Path {path} not found in HDF file")
 
             dataset = hdf_path[path]
-            values = dataset[:]
+            id_dim = HdfResultsMesh._mesh_series_id_dim(hdf_path, mesh_name, dataset)
+            values = read_dataset(dataset)
             units = HdfResultsMesh._decode_hdf_attr(
-                dataset.attrs.get("Units", "")
+                read_attr(dataset, "Units", "")
             )
             
             # Get start time and timesteps
             start_time = HdfBase.get_simulation_start_time(hdf_path)
             # Updated to use the new function name from HdfUtils
             timesteps = HdfUtils.convert_timesteps_to_datetimes(
-                np.array(hdf_path["Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Time"][:]),
+                np.array(read_typed(hdf_path["Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series/Time"], slice(None))),
                 start_time
             )
 
@@ -2196,8 +3724,6 @@ class HdfResultsMesh:
                     values = values[start:end]
                     timesteps = timesteps[start:end]
 
-            # Determine if this is a face-based or cell-based variable
-            id_dim = "face_id" if "Face" in var else "cell_id"
             dims = ["time", id_dim] if values.ndim == 2 else ["time"]
             coords = {"time": timesteps}
             if values.ndim == 2:
@@ -2209,7 +3735,10 @@ class HdfResultsMesh:
                 dims=dims,
                 attrs={"units": units, "mesh_name": mesh_name, "variable": var},
             )
+        except (OptionalDependencyError, MeshSeriesAvailabilityError):
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error in get_mesh_timeseries_output: {str(e)}")
             raise ValueError(f"Failed to get timeseries output: {str(e)}")
 
@@ -2229,8 +3758,8 @@ class HdfResultsMesh:
         """
         path = HdfResultsMesh._get_mesh_timeseries_output_path(mesh_name, var)
         group = hdf_path[path]
-        values = group[:]
-        units = HdfResultsMesh._decode_hdf_attr(group.attrs.get("Units"))
+        values = read_dataset(group)
+        units = HdfResultsMesh._decode_hdf_attr(read_attr(group, "Units", None))
         return values, units
 
     @staticmethod
@@ -2259,6 +3788,114 @@ class HdfResultsMesh:
 
 
     @staticmethod
+    def _physical_cell_counts(hdf_file: h5py.File) -> Dict[str, int]:
+        """Return each 2D flow area's physical (non-ghost) cell count by name.
+
+        HEC-RAS cell result arrays have one column per entry in ``Cells Center
+        Coordinate``: the physical cells, followed by ghost cells outside the
+        perimeter. ``Geometry/2D Flow Areas/Attributes`` ``Cell Count`` is the
+        physical count, so cell IDs at or above it are ghost cells.
+        """
+        return HdfMesh._physical_cell_counts(hdf_file)
+
+    @staticmethod
+    def _physical_cell_counts_from_path(hdf_path: Union[str, Path]) -> Dict[str, int]:
+        """Read physical cell counts from an HDF path."""
+        with h5py.File(hdf_path, "r") as hdf_file:
+            return HdfMesh._physical_cell_counts(hdf_file)
+
+    @staticmethod
+    def _physical_cell_count(
+        counts: Dict[str, int],
+        mesh_name: str,
+        include_ghost_cells: bool,
+    ) -> Optional[int]:
+        """Return a mesh's physical cell count, or None when it is not recorded.
+
+        Without ``Cell Count`` ghost cells cannot be identified, so every cell is
+        kept. A ghost-free request logs that once per mesh.
+        """
+        cell_count = counts.get(mesh_name)
+        if cell_count is None and not include_ghost_cells:
+            if mesh_name not in _UNKNOWN_CELL_COUNT_WARNED:
+                _UNKNOWN_CELL_COUNT_WARNED.add(mesh_name)
+                logger.warning(
+                    "Mesh '%s' has no 'Cell Count' in Geometry/2D Flow Areas/"
+                    "Attributes, so ghost cells cannot be identified; all "
+                    "cells are returned.",
+                    mesh_name,
+                )
+        return cell_count
+
+    @staticmethod
+    def _flag_ghost_cell_rows(
+        frame: pd.DataFrame,
+        mesh_name: str,
+        counts: Dict[str, int],
+        include_ghost_cells: bool,
+    ) -> pd.DataFrame:
+        """Add ``is_ghost_cell`` to one mesh's cell rows and optionally drop ghosts."""
+        cell_count = HdfResultsMesh._physical_cell_count(
+            counts, mesh_name, include_ghost_cells
+        )
+        if cell_count is None:
+            frame["is_ghost_cell"] = False
+        else:
+            frame["is_ghost_cell"] = frame["cell_id"].to_numpy() >= cell_count
+        if "geometry" in frame.columns:
+            # Keep geometry as the last column, as in the other mesh results.
+            frame = frame[[c for c in frame.columns if c != "geometry"] + ["geometry"]]
+        if not include_ghost_cells and cell_count is not None:
+            frame = frame.loc[~frame["is_ghost_cell"]].reset_index(drop=True)
+        return frame
+
+    @staticmethod
+    def _flag_ghost_cell_coord(
+        data: Union[xr.DataArray, xr.Dataset],
+        cell_count: Optional[int],
+    ) -> Union[xr.DataArray, xr.Dataset]:
+        """Attach an ``is_ghost_cell`` coordinate along ``cell_id`` when known."""
+        if cell_count is None or "cell_id" not in data.dims:
+            return data
+        return data.assign_coords(
+            is_ghost_cell=("cell_id", data["cell_id"].values >= cell_count)
+        )
+
+    @staticmethod
+    def _physical_spatial_selection(
+        spatial_selection: Selection,
+        cell_count: int,
+    ) -> Selection:
+        """Restrict a cell selection to physical cells.
+
+        Non-negative positions are source ``cell_id`` values, which coincide
+        for physical cells. Negative positions count back from the last
+        physical cell.
+        """
+        if spatial_selection is None:
+            return slice(0, cell_count)
+        if isinstance(spatial_selection, slice):
+            if spatial_selection.step is not None and spatial_selection.step <= 0:
+                return spatial_selection  # HdfResultView reports the error
+            start, stop, step = spatial_selection.indices(cell_count)
+            return slice(start, stop, step)
+        index = operator.index(spatial_selection)
+        if index < 0:
+            index += cell_count
+            if index < 0:
+                raise IndexError(
+                    f"Cell selection {spatial_selection} is outside the "
+                    f"{cell_count} physical cells"
+                )
+            return index
+        if index >= cell_count:
+            raise ValueError(
+                f"Cell {index} is a ghost cell (physical cells are 0-"
+                f"{cell_count - 1}); pass include_ghost_cells=True to read it"
+            )
+        return index
+
+    @staticmethod
     def _get_available_meshes(hdf_path: h5py.File) -> List[str]:
         """
         Get the names of all available meshes in the HDF file.
@@ -2270,12 +3907,127 @@ class HdfResultsMesh:
             List[str]: A list of mesh names.
         """
         return HdfMesh.get_mesh_area_names(hdf_path)
-    
+
+    @staticmethod
+    def _get_mesh_summary_values_output(
+        hdf_file: h5py.File,
+        var: str,
+        round_to: str = "100ms",
+        include_ghost_cells: bool = False,
+        typed: bool = False,
+    ) -> pd.DataFrame:
+        """Read summary values from an open HDF without building geometry.
+
+        Cell rows carry ``is_ghost_cell``; ``include_ghost_cells=False`` drops
+        the ghost rows. Face rows are unaffected. ``typed=True`` returns the
+        typed table layout: ``mesh_name`` as pandas ``str``/``string`` (no object
+        columns); identifiers are ``int64`` and values keep the stored dtype
+        in both layouts.
+        """
+        start_time = HdfBase.get_simulation_start_time(hdf_file)
+        d2_flow_areas = hdf_file.get("Geometry/2D Flow Areas/Attributes")
+        if d2_flow_areas is None:
+            logger.debug("No 2D Flow Areas found in HDF file")
+            return pd.DataFrame()
+        cell_counts = HdfResultsMesh._physical_cell_counts(hdf_file)
+
+        frames = []
+        combined_attrs = {}
+        for d2_flow_area in read_typed(d2_flow_areas, slice(None)):
+            mesh_name = HdfUtils.convert_ras_string(d2_flow_area[0])
+            try:
+                group = HdfResultsMesh.get_mesh_summary_output_group(
+                    hdf_file,
+                    mesh_name,
+                    var,
+                )
+            except ValueError:
+                logger.debug(
+                    "Variable %r not present for mesh %r; skipping",
+                    var,
+                    mesh_name,
+                )
+                continue
+
+            data = read_dataset(group)
+            id_column = "face_id" if "Face" in var else "cell_id"
+            value_column = var.lower().replace(" ", "_")
+            if data.ndim == 2 and data.shape[0] == 2:
+                frame = pd.DataFrame({
+                    "mesh_name": HdfUtils._repeat_text(mesh_name, data.shape[1]),
+                    id_column: range(data.shape[1]),
+                    value_column: data[0, :],
+                    f"{value_column}_time": (
+                        HdfUtils.convert_timesteps_to_datetimes(
+                            data[1, :],
+                            start_time,
+                            time_unit="days",
+                            round_to=round_to,
+                        )
+                    ),
+                })
+            elif data.ndim == 1:
+                frame = pd.DataFrame({
+                    "mesh_name": HdfUtils._repeat_text(mesh_name, len(data)),
+                    id_column: range(len(data)),
+                    value_column: data,
+                })
+            else:
+                raise ValueError(
+                    f"Unexpected data shape for {var} in {mesh_name}: {data.shape}"
+                )
+            if id_column == "cell_id":
+                frame = HdfResultsMesh._flag_ghost_cell_rows(
+                    frame, mesh_name, cell_counts, include_ghost_cells
+                )
+
+            frame.attrs["mesh_name"] = mesh_name
+            for attr_name, attr_value in read_attrs(group).items():
+                if isinstance(attr_value, bytes):
+                    decoded_value = attr_value.decode("utf-8")
+                elif isinstance(attr_value, np.ndarray):
+                    if attr_value.dtype.kind in {"S", "a"}:
+                        decoded_value = [
+                            value.decode("utf-8")
+                            if isinstance(value, bytes)
+                            else value
+                            for value in attr_value
+                        ]
+                    else:
+                        decoded_value = attr_value.tolist()
+                else:
+                    decoded_value = attr_value
+                frame.attrs[attr_name] = decoded_value
+
+            for key, value in frame.attrs.items():
+                if key not in combined_attrs:
+                    combined_attrs[key] = value
+                elif combined_attrs[key] != value:
+                    combined_attrs[key] = (
+                        f"Multiple values: {combined_attrs[key]}, {value}"
+                    )
+            frames.append(frame)
+
+        if not frames:
+            return pd.DataFrame()
+        result = pd.concat(frames, ignore_index=True)
+        if typed:
+            result["mesh_name"] = result["mesh_name"].astype(HdfUtils._TEXT_DTYPE)
+        result.attrs.update(combined_attrs)
+        return result
+
     
     @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
-    def get_mesh_summary_output(hdf_file: h5py.File, var: str, round_to: str = "100ms") -> gpd.GeoDataFrame:
+    def get_mesh_summary_output(
+        hdf_file: h5py.File,
+        var: str,
+        round_to: str = "100ms",
+        include_ghost_cells: bool = False,
+        *,
+        include_geometry: bool = True,
+    ) -> Union[gpd.GeoDataFrame, pd.DataFrame]:
         """
         Get the summary output data for a given variable from the HDF file.
 
@@ -2287,128 +4039,147 @@ class HdfResultsMesh:
             The summary output variable to retrieve.
         round_to : str, optional
             The time unit to round the datetimes to. Default is "100ms".
+        include_ghost_cells : bool, optional
+            Cell results include an ``is_ghost_cell`` column. HEC-RAS writes
+            values for ghost cells outside the mesh perimeter after the
+            physical cells. Default False drops those rows; pass True to
+            keep them.
+        include_geometry : bool, optional, keyword-only
+            Default True is the **convenient** output: a GeoDataFrame with a
+            cell-center point (cell variables) or face line (face variables)
+            on every row. The geometry is built from packed coordinate
+            buffers in one vectorized Shapely call (natively, where the
+            engine proves the layout), but it is still most of the call.
+            False is the **fast** output: the typed table described in
+            Returns, read straight from the stored arrays without building
+            geometry (no GeoPandas/Shapely). Use it when you only need the
+            values, or when you read several results of one model: read the
+            geometry once with :meth:`HdfMesh.get_mesh_cell_faces` or
+            :meth:`HdfMesh.get_mesh_cell_points` and join each table to it on
+            ``["mesh_name", "face_id"]`` or ``["mesh_name", "cell_id"]``.
 
         Returns
         -------
-        gpd.GeoDataFrame
+        gpd.GeoDataFrame or pd.DataFrame
             A GeoDataFrame containing the summary output data with decoded attributes as metadata.
             Returns empty GeoDataFrame if variable is not found.
+
+            With ``include_geometry=False``: a DataFrame with the same rows,
+            order, columns (except ``geometry``), values and ``attrs``.
+            ``mesh_name`` is pandas ``str``/``string``; ``cell_id``/``face_id`` are
+            ``int64`` keys; the value column keeps the stored dtype; the
+            ``*_time`` column is ``datetime64``; ``is_ghost_cell`` is
+            ``bool``. Join geometry on ``(mesh_name, face_id)`` from
+            :meth:`HdfMesh.get_mesh_cell_faces`, or on ``(mesh_name, cell_id)``
+            from :meth:`HdfMesh.get_mesh_cell_points` (``x``/``y`` columns with
+            ``include_geometry=False``). Returns an empty DataFrame if the
+            variable is not found.
+
+        Examples
+        --------
+        Read the face lines once, then join any number of face results:
+
+        >>> faces = HdfMesh.get_mesh_cell_faces(plan_hdf)
+        >>> vmax = HdfResultsMesh.get_mesh_max_face_v(plan_hdf, include_geometry=False)
+        >>> located = faces.merge(vmax, on=["mesh_name", "face_id"])  # GeoDataFrame
         """
+        if not include_geometry:
+            try:
+                return HdfResultsMesh._get_mesh_summary_values_output(
+                    hdf_file, var, round_to, include_ghost_cells, typed=True
+                )
+            except Exception as e:
+                reraise_required(e)
+                logger.error(f"Error processing summary output data: {e}")
+                raise ValueError(f"Error processing summary output data: {e}")
+        GeoDataFrame = gpd.GeoDataFrame  # Fail fast with the install command.
         try:
-            dfs = []
-            start_time = HdfBase.get_simulation_start_time(hdf_file)
-            
-            logger.debug(f"Processing summary output for variable: {var}")
-            d2_flow_areas = hdf_file.get("Geometry/2D Flow Areas/Attributes")
-            if d2_flow_areas is None:
-                logger.debug("No 2D Flow Areas found in HDF file")
-                return gpd.GeoDataFrame()
+            values = HdfResultsMesh._get_mesh_summary_values_output(
+                hdf_file,
+                var,
+                round_to,
+                include_ghost_cells,
+            )
+            if values.empty:
+                return GeoDataFrame()
 
-            for d2_flow_area in d2_flow_areas[:]:
-                mesh_name = HdfUtils.convert_ras_string(d2_flow_area[0])
-                cell_count = d2_flow_area[-1]
-                logger.debug(f"Processing mesh: {mesh_name} with {cell_count} cells")
+            attrs = dict(values.attrs)
+            if "Face" in var:
+                geometry = HdfMesh.get_mesh_cell_faces(hdf_file)
+                id_column = "face_id"
+            else:
+                geometry = HdfMesh.get_mesh_cell_points(hdf_file)
+                id_column = "cell_id"
+            if not geometry.empty:
+                rows = HdfResultsMesh._geometry_rows(values, geometry, id_column)
+                if rows is not None:
+                    # Same rows, values and geometry as the left merge below,
+                    # without hashing the keys.
+                    values = values.reset_index(drop=True)
+                    values["geometry"] = geometry["geometry"].array.take(rows)
+                else:
+                    values = values.merge(
+                        geometry[["mesh_name", id_column, "geometry"]],
+                        on=["mesh_name", id_column],
+                        how="left",
+                    )
+            else:
+                values["geometry"] = None
 
-                try:
-                    group = HdfResultsMesh.get_mesh_summary_output_group(hdf_file, mesh_name, var)
-                except ValueError:
-                    logger.debug(f"Variable '{var}' not present in output file for mesh '{mesh_name}', skipping")
-                    continue
-                
-                data = group[:]
-                logger.debug(f"Data shape for {var} in {mesh_name}: {data.shape}")
-                logger.debug(f"Data type: {data.dtype}")
-                logger.debug(f"Attributes: {dict(group.attrs)}")
-                
-                if data.ndim == 2 and data.shape[0] == 2:
-                    # Handle 2D datasets (e.g. Maximum Water Surface)
-                    row_variables = group.attrs.get('Row Variables', [b'Value', b'Time'])
-                    row_variables = [v.decode('utf-8').strip() if isinstance(v, bytes) else v for v in row_variables]
-                    
-                    df = pd.DataFrame({
-                        "mesh_name": [mesh_name] * data.shape[1],
-                        "cell_id" if "Face" not in var else "face_id": range(data.shape[1]),
-                        f"{var.lower().replace(' ', '_')}": data[0, :],
-                        f"{var.lower().replace(' ', '_')}_time": HdfUtils.convert_timesteps_to_datetimes(
-                            data[1, :], start_time, time_unit="days", round_to=round_to
-                        )
-                    })
-                    
-                elif data.ndim == 1:
-                    # Handle 1D datasets (e.g. Cell Last Iteration)
-                    df = pd.DataFrame({
-                        "mesh_name": [mesh_name] * len(data),
-                        "cell_id" if "Face" not in var else "face_id": range(len(data)),
-                        var.lower().replace(' ', '_'): data
-                    })
-                    
-                else:
-                    raise ValueError(f"Unexpected data shape for {var} in {mesh_name}. "
-                                  f"Got shape {data.shape}")
-                
-                # Add geometry based on variable type
-                if "Face" in var:
-                    face_df = HdfMesh.get_mesh_cell_faces(hdf_file)
-                    if not face_df.empty:
-                        df = df.merge(face_df[['mesh_name', 'face_id', 'geometry']], 
-                                    on=['mesh_name', 'face_id'], 
-                                    how='left')
-                else:
-                    cell_df = HdfMesh.get_mesh_cell_points(hdf_file)
-                    if not cell_df.empty:
-                        df = df.merge(cell_df[['mesh_name', 'cell_id', 'geometry']], 
-                                    on=['mesh_name', 'cell_id'], 
-                                    how='left')
-                
-                # Add group attributes as metadata with proper decoding
-                df.attrs['mesh_name'] = mesh_name
-                for attr_name, attr_value in group.attrs.items():
-                    if isinstance(attr_value, bytes):
-                        # Decode single byte string
-                        decoded_value = attr_value.decode('utf-8')
-                    elif isinstance(attr_value, np.ndarray):
-                        if attr_value.dtype.kind in {'S', 'a'}:  # Array of byte strings
-                            # Decode array of byte strings
-                            decoded_value = [v.decode('utf-8') if isinstance(v, bytes) else v for v in attr_value]
-                        else:
-                            # Convert other numpy arrays to list
-                            decoded_value = attr_value.tolist()
-                    else:
-                        decoded_value = attr_value
-                    df.attrs[attr_name] = decoded_value
-                
-                dfs.append(df)
-            
-            if not dfs:
-                return gpd.GeoDataFrame()
-                
-            result = pd.concat(dfs, ignore_index=True)
-            
-            # Convert to GeoDataFrame
-            gdf = gpd.GeoDataFrame(result, geometry='geometry')
-            
-            # Get CRS from HdfUtils
+            result = GeoDataFrame(values, geometry="geometry")
             crs = HdfBase.get_projection(hdf_file)
             if crs:
-                gdf.set_crs(crs, inplace=True)
-            
-            # Combine attributes from all meshes with decoded values
-            combined_attrs = {}
-            for df in dfs:
-                for key, value in df.attrs.items():
-                    if key not in combined_attrs:
-                        combined_attrs[key] = value
-                    elif combined_attrs[key] != value:
-                        combined_attrs[key] = f"Multiple values: {combined_attrs[key]}, {value}"
-            
-            gdf.attrs.update(combined_attrs)
-            
-            logger.debug(f"Processed {len(gdf)} rows of summary output data")
-            return gdf
+                result.set_crs(HdfUtils._to_crs(crs), inplace=True)
+            result.attrs.update(attrs)
+            logger.debug("Processed %s rows of summary output data", len(result))
+            return result
         
+        except OptionalDependencyError:
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error processing summary output data: {e}")
             raise ValueError(f"Error processing summary output data: {e}")
+
+    @staticmethod
+    def _geometry_rows(values: pd.DataFrame, geometry, id_column: str) -> Optional[np.ndarray]:
+        """Geometry row of every value row, or None to use the key merge.
+
+        A left merge on ``(mesh_name, id)`` keeps the value rows in order and
+        takes the single geometry row with the same key. When the geometry
+        frame is, per mesh, one contiguous block with IDs ``0..n-1`` (as the
+        mesh geometry readers build it), that row is the block start plus the
+        ID. Every value key must be found; anything else returns None.
+        """
+        right_names = geometry["mesh_name"].to_numpy()
+        right_ids = geometry[id_column].to_numpy()
+        left_names = values["mesh_name"].to_numpy()
+        left_ids = values[id_column].to_numpy()
+        if (right_ids.dtype.kind not in "iu" or left_ids.dtype.kind not in "iu"
+                or right_names.dtype != object or left_names.dtype != object
+                or not len(right_names) or not len(left_names)):
+            return None
+        starts = np.flatnonzero(np.r_[True, right_names[1:] != right_names[:-1]])
+        block_names = right_names[starts]
+        if not all(type(name) is str for name in block_names) or len(set(block_names)) != len(block_names):
+            return None
+        sizes = np.diff(np.r_[starts, len(right_names)])
+        expected = np.arange(len(right_ids)) - np.repeat(starts, sizes)
+        if not np.array_equal(right_ids, expected):
+            return None
+        block = {name: index for index, name in enumerate(block_names)}
+        left_starts = np.flatnonzero(np.r_[True, left_names[1:] != left_names[:-1]])
+        left_sizes = np.diff(np.r_[left_starts, len(left_names)])
+        indices = []
+        for name in left_names[left_starts]:
+            if type(name) is not str or name not in block:
+                return None
+            indices.append(block[name])
+        indices = np.repeat(np.asarray(indices, dtype=np.int64), left_sizes)
+        ids = left_ids.astype(np.int64, copy=False)
+        if (ids < 0).any() or (ids >= sizes[indices]).any():
+            return None
+        return starts[indices] + ids
 
     @staticmethod
     def get_mesh_summary_output_group(hdf_file: h5py.File, mesh_name: str, var: str) -> Union[h5py.Group, h5py.Dataset]:
@@ -2416,7 +4187,7 @@ class HdfResultsMesh:
         Return the HDF group for a given mesh and summary output variable.
 
         Args:
-            hdf_path (h5py.File): Open HDF file object.
+            hdf_file (h5py.File): Open HDF file object.
             mesh_name (str): Name of the mesh.
             var (str): Name of the summary output variable.
 
@@ -2458,7 +4229,17 @@ class HdfResultsMesh:
                     - face_id: Face IDs (for per-face variables)
 
                 Coordinates:
-                    Metadata from HDF attributes (BC types, locations, etc.)
+                    Metadata from HDF attributes (BC types, locations, etc.).
+                    Ordinary metadata retains its legacy lowercase spelling,
+                    including spaces. HEC-RAS ``Flow`` and ``Stage`` attributes
+                    are exposed as ``flow_units`` and ``stage_units`` so they
+                    cannot replace the same-named hydrograph variables. ``2D
+                    Area`` remains available as legacy ``2d area`` and also as
+                    the additive ``area_2d`` alias. Canonical names are assigned
+                    before ordinary metadata, independent of HDF attribute
+                    order. A metadata name that conflicts with a data variable,
+                    structural coordinate, or canonical alias receives a
+                    deterministic ``bc_`` prefix.
 
                 When to use: Boundary condition analysis across model.
                 All BCs combined in single Dataset for easy comparison.
@@ -2478,12 +4259,12 @@ class HdfResultsMesh:
                 bc_base_path = f"{base_path}/Boundary Conditions"
                 
                 if bc_base_path not in hdf_file:
-                    logger.warning(f"No boundary conditions found in HDF file")
+                    logger.warning("No boundary conditions found in HDF file")
                     return xr.Dataset()
                 
                 # Get timestamps
                 start_time = HdfBase.get_simulation_start_time(hdf_file)
-                time_data = hdf_file[f"{base_path}/Time"][:]
+                time_data = read_typed(hdf_file[f"{base_path}/Time"], slice(None))
                 timestamps = HdfUtils.convert_timesteps_to_datetimes(time_data, start_time)
                 
                 # Get all boundary condition names (excluding those with " - Flow per Face" or " - Stage per Face" suffix)
@@ -2491,7 +4272,7 @@ class HdfResultsMesh:
                         if " - Flow per Face" not in name and " - Stage per Face" not in name]
                 
                 if not bc_names:
-                    logger.warning(f"No boundary conditions found in HDF file")
+                    logger.warning("No boundary conditions found in HDF file")
                     return xr.Dataset()
                 
                 # Initialize arrays for main stage and flow data
@@ -2516,8 +4297,8 @@ class HdfResultsMesh:
                     
                     try:
                         # Extract main boundary data
-                        bc_data = hdf_file[bc_path][:]
-                        bc_attrs = dict(hdf_file[bc_path].attrs)
+                        bc_data = read_typed(hdf_file[bc_path], slice(None))
+                        bc_attrs = read_attrs(hdf_file[bc_path])
                         
                         # Store metadata
                         bc_metadata[bc_name] = {
@@ -2541,8 +4322,8 @@ class HdfResultsMesh:
                         # Extract Flow per Face data
                         flow_face_path = f"{bc_path} - Flow per Face"
                         if flow_face_path in hdf_file:
-                            flow_face_data = hdf_file[flow_face_path][:]
-                            flow_face_attrs = dict(hdf_file[flow_face_path].attrs)
+                            flow_face_data = read_typed(hdf_file[flow_face_path], slice(None))
+                            flow_face_attrs = read_attrs(hdf_file[flow_face_path])
                             
                             # Get face IDs
                             face_ids = flow_face_attrs.get('Faces', [])
@@ -2563,8 +4344,8 @@ class HdfResultsMesh:
                         # Extract Stage per Face data
                         stage_face_path = f"{bc_path} - Stage per Face"
                         if stage_face_path in hdf_file:
-                            stage_face_data = hdf_file[stage_face_path][:]
-                            stage_face_attrs = dict(hdf_file[stage_face_path].attrs)
+                            stage_face_data = read_typed(hdf_file[stage_face_path], slice(None))
+                            stage_face_attrs = read_attrs(hdf_file[stage_face_path])
                             
                             # Get face IDs
                             face_ids = stage_face_attrs.get('Faces', [])
@@ -2582,7 +4363,10 @@ class HdfResultsMesh:
                                 }
                             }
                     
+                    except OptionalDependencyError:
+                        raise
                     except Exception as e:
+                        reraise_required(e)
                         logger.warning(f"Error processing boundary condition '{bc_name}': {str(e)}")
                         continue
                 
@@ -2614,28 +4398,88 @@ class HdfResultsMesh:
                     }
                 )
                 
-                # Add metadata as coordinates
-                coordinate_names = {
-                    "flow": "flow_units",
-                    "stage": "stage_units",
-                    "2d area": "area_2d",
+                # Give canonical HEC-RAS metadata fixed ownership before
+                # allocating ordinary attributes. This makes the result
+                # independent of the HDF attribute iteration order.
+                canonical_names = {
+                    "Stage": "stage_units",
+                    "Flow": "flow_units",
+                    "2D Area": "area_2d",
                 }
-                for key in bc_metadata[bc_names[0]]:
-                    if key != 'Columns':  # Skip Columns attribute as it's used for Stage/Flow
-                        try:
-                            values = [bc_metadata[bc].get(key, '') for bc in bc_names]
-                            normalized_key = str(key).strip().lower()
-                            coordinate_name = coordinate_names.get(
-                                normalized_key,
-                                normalized_key.replace(" ", "_"),
-                            )
-                            if coordinate_name in ds.data_vars:
-                                coordinate_name = f"bc_{coordinate_name}"
+                reserved_names = {
+                    "stage",
+                    "flow",
+                    "flow_per_face",
+                    "stage_per_face",
+                    "time",
+                    "bc_name",
+                    "face_id",
+                    "stage_units",
+                    "flow_units",
+                    "area_2d",
+                }
+
+                metadata_keys = [
+                    key
+                    for key in bc_metadata[bc_names[0]]
+                    if key != "Columns"
+                ]
+
+                for key, coordinate_name in canonical_names.items():
+                    if key not in metadata_keys:
+                        continue
+                    try:
+                        values = [
+                            bc_metadata[bc].get(key, "") for bc in bc_names
+                        ]
+                        ds = ds.assign_coords(
+                            {coordinate_name: ("bc_name", values)}
+                        )
+                        if key == "2D Area":
                             ds = ds.assign_coords(
-                                {coordinate_name: ('bc_name', values)}
+                                {"2d area": ("bc_name", values)}
                             )
-                        except Exception as e:
-                            logger.debug(f"Could not add metadata coordinate '{key}': {str(e)}")
+                    except OptionalDependencyError:
+                        raise
+                    except Exception as e:
+                        reraise_required(e)
+                        logger.debug(
+                            "Could not add canonical metadata coordinate "
+                            f"'{key}': {str(e)}"
+                        )
+
+                ordinary_keys = [
+                    key for key in metadata_keys if key not in canonical_names
+                ]
+                ordinary_keys.sort(
+                    key=lambda key: (
+                        str(key).lower() not in reserved_names,
+                        str(key).lower(),
+                        str(key),
+                    )
+                )
+                for key in ordinary_keys:
+                    try:
+                        values = [
+                            bc_metadata[bc].get(key, "") for bc in bc_names
+                        ]
+                        coordinate_name = str(key).lower()
+                        while (
+                            coordinate_name in reserved_names
+                            or coordinate_name in ds.variables
+                        ):
+                            coordinate_name = f"bc_{coordinate_name}"
+                        ds = ds.assign_coords(
+                            {coordinate_name: ("bc_name", values)}
+                        )
+                    except OptionalDependencyError:
+                        raise
+                    except Exception as e:
+                        reraise_required(e)
+                        logger.debug(
+                            f"Could not add metadata coordinate '{key}': "
+                            f"{str(e)}"
+                        )
                 
                 # Add face-specific data variables if available
                 if face_data['flow_per_face']:
@@ -2703,6 +4547,9 @@ class HdfResultsMesh:
                 
                 return ds
                 
+        except OptionalDependencyError:
+            raise
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error getting all boundary conditions timeseries: {str(e)}")
             return xr.Dataset()

@@ -1,0 +1,2705 @@
+"""Prepare contained, pure-2D breakout geometries without authoring boundaries.
+
+The workflow is deliberately split into four auditable stages:
+
+1. qualify a proposed child polygon against an existing pure-2D plan;
+2. clone the plan, geometry, and unsteady file inside an isolated project;
+3. trim mesh-owned geometry and regenerate the cloned mesh; and
+4. review parent-face flux locations without changing the cloned boundaries.
+
+Boundary-condition interpretation is intentionally out of scope.  The cloned
+unsteady file is byte-identical to its source, existing geometry BC lines are
+left untouched, and the flux review returns evidence rather than authored
+``Flow Hydrograph``, ``Stage Hydrograph``, or ``Normal Depth`` records.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+import tempfile
+from dataclasses import dataclass, field
+from itertools import pairwise
+from pathlib import Path
+from typing import Any, Optional, Sequence, Union
+
+import geopandas as gpd
+import h5py
+import numpy as np
+import pandas as pd
+from pyproj import CRS
+from shapely import get_coordinates, intersects_xy, make_valid
+from shapely.geometry import (
+    GeometryCollection,
+    LineString,
+    MultiLineString,
+    MultiPolygon,
+    Point,
+    Polygon,
+)
+from shapely.geometry.base import BaseGeometry
+from shapely.geometry.polygon import orient
+from shapely.ops import linemerge, unary_union
+
+from .Decorators import log_call
+from .fast_hdf import read_attr, read_typed
+from .geom.GeomLateral import GeomLateral
+from .geom.GeomMesh import GeomMesh
+from .geom.GeomParser import GeomParser
+from .geom.GeomReferenceFeatures import GeomReferenceFeatures
+from .geom.GeomStorage import GeomStorage
+from .hdf.HdfBase import HdfBase
+from .hdf.HdfBndry import HdfBndry
+from .hdf.HdfMesh import HdfMesh
+from .hdf.HdfStruc import HdfStruc
+from .hdf.HdfUtils import HdfUtils
+from .LoggingConfig import get_logger
+from .RasGeo import RasGeo
+from .RasMap import RasMap
+from .RasPlan import RasPlan
+from .RasPrj import RasPrj
+from .RasUtils import RasUtils
+
+logger = get_logger(__name__)
+
+BoundaryInput = Union[
+    str,
+    Path,
+    BaseGeometry,
+    gpd.GeoSeries,
+    gpd.GeoDataFrame,
+]
+
+FEATURE_ACTION_COLUMNS = [
+    "feature_type",
+    "feature_id",
+    "name",
+    "action",
+    "reason",
+    "source_measure",
+    "retained_measure",
+    "retained_fraction",
+    "gate_group_count",
+    "geometry",
+]
+
+BOUNDARY_FACE_COLUMNS = [
+    "mesh_name",
+    "face_id",
+    "cell_0",
+    "cell_1",
+    "inside_cell",
+    "outside_cell",
+    "normal_x",
+    "normal_y",
+    "face_length",
+    "orientation_multiplier",
+    "boundary_station",
+    "geometry",
+]
+
+_UNSUPPORTED_STRUCTURE_COLUMNS = (
+    "num_cross_sections",
+    "num_inline_structures",
+    "num_bridges",
+    "num_culverts",
+    "num_weirs",
+    "num_gates",
+    "num_lateral_structures",
+    "num_sa_2d_connections",
+)
+
+
+@dataclass(frozen=True)
+class Breakout2DSpec:
+    """Inputs for pure-2D preparation in an owner or contributing-parent union.
+
+    ``contributing_geometry_hdfs`` adds geometry-only parent perimeters to the
+    containment check, in the owner's CRS and horizontal units. It does not
+    import their features, terrain, roughness or boundary conditions. The
+    caller must qualify those inputs separately before using a union child.
+    Preflight reads these HDFs without modifying them.
+
+    ``allow_extended_connection_support=True`` explicitly enables complete gate
+    GIS support and the additional recognized metadata/template records during
+    preflight and clone rechecks. It defaults to False. Native attachments still
+    require separate evidence after preprocessing.
+
+    ``max_breakline_perimeter_crossings`` drops, instead of clipping, any
+    source breakline that crosses the mesh trim boundary (the child perimeter
+    eroded by one base cell) more than this many times. Crossings are real
+    inside/outside transitions along the source line; running along or
+    touching the boundary is not a crossing, and self-intersections do not
+    count. Recommended: ``2`` for breakouts that re-mesh on the parent's grid
+    (``prepare_cloned_geometry(anchor_grid_to_parent=True)``). A line that ends
+    inside (1) or passes straight through (2) is clipped as usual; a line that
+    weaves across the boundary (3 or more) is dropped, because its clipped
+    pieces create problem cells at the boundary. ``None`` (default, kept for
+    backward compatibility) clips every line. Dropped lines carry the reason
+    code ``exceeds_child_perimeter_crossing_limit`` in ``feature_actions``.
+    """
+
+    source_plan: Union[str, int]
+    source_2d_area: str
+    child_boundary: BoundaryInput
+    breakout_id: str
+    child_boundary_crs: Optional[Any] = None
+    containment_tolerance: float = 0.0
+    boundary_match_tolerance: Optional[float] = None
+    allow_multipart: bool = False
+    allow_holes: bool = False
+    contributing_geometry_hdfs: tuple[str | Path, ...] = ()
+    allow_extended_connection_support: bool = False
+    max_breakline_perimeter_crossings: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.contributing_geometry_hdfs, (str, Path)):
+            raise TypeError("contributing_geometry_hdfs must be a sequence of paths")
+        object.__setattr__(
+            self,
+            "contributing_geometry_hdfs",
+            tuple(Path(path) for path in self.contributing_geometry_hdfs),
+        )
+        object.__setattr__(
+            self,
+            "source_plan",
+            RasUtils.normalize_ras_number(self.source_plan),
+        )
+        if not str(self.source_2d_area).strip():
+            raise ValueError("source_2d_area must not be empty")
+        if not str(self.breakout_id).strip():
+            raise ValueError("breakout_id must not be empty")
+        for name in ("containment_tolerance", "boundary_match_tolerance"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            numeric = float(value)
+            if not math.isfinite(numeric) or numeric < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        limit = self.max_breakline_perimeter_crossings
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 0
+        ):
+            raise ValueError(
+                "max_breakline_perimeter_crossings must be None or a non-negative int"
+            )
+
+
+@dataclass
+class Breakout2DPreflight:
+    """Read-only source inventory and spatial decisions for one child domain."""
+
+    spec: Breakout2DSpec
+    source_plan_path: Path
+    source_plan_hdf: Optional[Path]
+    source_geometry_number: str
+    source_geometry_path: Path
+    source_geometry_hdf: Path
+    source_unsteady_number: str
+    source_unsteady_path: Path
+    base_cell_size: float
+    parent_boundary: gpd.GeoDataFrame
+    child_boundary: gpd.GeoDataFrame
+    boundary_segments: gpd.GeoDataFrame
+    feature_actions: gpd.GeoDataFrame
+    existing_boundaries: pd.DataFrame
+    checks: pd.DataFrame
+    source_features: dict[str, gpd.GeoDataFrame]
+    connection_data: pd.DataFrame = field(default_factory=pd.DataFrame)
+    contributing_geometry_identities: list[dict[str, str]] = field(default_factory=list)
+
+    @property
+    def is_ready(self) -> bool:
+        """Return whether every blocking preflight check passed."""
+        if self.checks.empty:
+            return False
+        failed = self.checks[
+            self.checks["blocking"].astype(bool) & ~self.checks["passed"].astype(bool)
+        ]
+        return failed.empty
+
+    @property
+    def blocking_issues(self) -> list[str]:
+        """Return human-readable failed blocking checks."""
+        if self.checks.empty:
+            return ["No checks were produced"]
+        failed = self.checks[
+            self.checks["blocking"].astype(bool) & ~self.checks["passed"].astype(bool)
+        ]
+        return failed["message"].astype(str).tolist()
+
+    @log_call
+    def to_manifest(self) -> dict[str, Any]:
+        """Return compact JSON-serializable review evidence."""
+        actions = (
+            self.feature_actions.groupby(["feature_type", "action"])
+            .size()
+            .reset_index(name="count")
+            .to_dict(orient="records")
+        )
+        child = self.child_boundary.geometry.iloc[0]
+        manifest = {
+            "schema": "ras-commander/breakout-2d-preflight/1.0",
+            "breakout_id": self.spec.breakout_id,
+            "ready": self.is_ready,
+            "source": {
+                "plan": self.spec.source_plan,
+                "plan_file": str(self.source_plan_path),
+                "geometry": self.source_geometry_number,
+                "geometry_file": str(self.source_geometry_path),
+                "unsteady": self.source_unsteady_number,
+                "unsteady_file": str(self.source_unsteady_path),
+                "flow_area": self.spec.source_2d_area,
+                "base_cell_size": self.base_cell_size,
+            },
+            "child": {
+                "crs": str(self.child_boundary.crs),
+                "area": float(child.area),
+                "bounds": [float(value) for value in child.bounds],
+                "geometry_sha256": _geometry_hash(child),
+            },
+            "checks": self.checks.to_dict(orient="records"),
+            "feature_action_summary": actions,
+            "existing_boundary_count": int(len(self.existing_boundaries)),
+        }
+        if self.spec.contributing_geometry_hdfs:
+            manifest["contributing_geometry_hdfs"] = [
+                dict(item) for item in self.contributing_geometry_identities
+            ]
+        if self.spec.allow_extended_connection_support:
+            manifest["allow_extended_connection_support"] = True
+        return manifest
+
+
+@dataclass(frozen=True)
+class Breakout2DCloneResult:
+    """Plan-component clones and verified associations."""
+
+    source_plan: str
+    source_geometry: str
+    source_unsteady: str
+    plan_number: str
+    geometry_number: str
+    unsteady_number: str
+    plan_path: Path
+    geometry_path: Path
+    geometry_hdf: Path
+    unsteady_path: Path
+    source_unsteady_sha256: str
+    cloned_unsteady_sha256: str
+
+    @property
+    def boundaries_unchanged(self) -> bool:
+        """Return whether the complete unsteady control file is byte-identical."""
+        return self.source_unsteady_sha256 == self.cloned_unsteady_sha256
+
+
+@dataclass
+class Breakout2DPreparationResult:
+    """Artifacts and checks from trimming and remeshing a cloned geometry."""
+
+    clone: Breakout2DCloneResult
+    feature_actions: gpd.GeoDataFrame
+    refresh_result: Any
+    mesh_result: Any
+    containment_result: Any
+    property_tables_computed: bool
+    retained_breakline_count: int
+    retained_reference_line_count: int
+    retained_refinement_region_count: int
+    unsteady_sha256_after: str
+    connection_attachments: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(
+            columns=HdfStruc.CONNECTION_ATTACHMENT_COLUMNS
+        )
+    )
+    breakline_containment_repairs: list[dict[str, Any]] = field(default_factory=list)
+    meteorology: dict[str, Any] = field(default_factory=dict)
+    computation_points_result: Any = None
+
+    @property
+    def boundaries_unchanged(self) -> bool:
+        """Return whether preparation left the cloned unsteady file untouched."""
+        return self.unsteady_sha256_after == self.clone.cloned_unsteady_sha256
+
+
+@dataclass
+class Breakout2DFluxReview:
+    """Read-only parent-face flux evidence at the proposed child perimeter."""
+
+    faces: gpd.GeoDataFrame
+    zones: gpd.GeoDataFrame
+    face_flow_outward: pd.DataFrame
+    source: str
+    units: str
+
+
+class RasBreakout2D:
+    """Static entry points for contained, pure-2D breakout preparation."""
+
+    @staticmethod
+    @log_call
+    def normalize_child_boundary(
+        child_boundary: BoundaryInput,
+        parent_crs: Any,
+        *,
+        child_boundary_crs: Optional[Any] = None,
+        breakout_id: str = "breakout",
+        allow_multipart: bool = False,
+        allow_holes: bool = False,
+    ) -> gpd.GeoDataFrame:
+        """Normalize one child polygon into the parent geometry CRS."""
+        frame = _boundary_frame(child_boundary, child_boundary_crs)
+        if frame.crs is None:
+            raise ValueError(
+                "Child boundary CRS is required; set it on the spatial input "
+                "or pass child_boundary_crs"
+            )
+        if parent_crs is None:
+            raise ValueError("Parent 2D flow-area CRS is unavailable")
+        frame = frame.to_crs(parent_crs)
+        geometry = _union_geometry(frame)
+        if geometry.is_empty or geometry.geom_type not in {
+            "Polygon",
+            "MultiPolygon",
+        }:
+            raise ValueError("child_boundary must resolve to polygon geometry")
+        repaired = not geometry.is_valid
+        geometry = _polygonal_geometry(make_valid(geometry))
+        geometry = _orient_polygonal(geometry)
+        if isinstance(geometry, MultiPolygon) and not allow_multipart:
+            raise ValueError("Multipart child boundaries are not qualified")
+        hole_count = _hole_count(geometry)
+        if hole_count and not allow_holes:
+            raise ValueError("Child boundaries with interior holes are not qualified")
+        return gpd.GeoDataFrame(
+            {
+                "breakout_id": [str(breakout_id)],
+                "topology_repaired": [bool(repaired)],
+                "hole_count": [int(hole_count)],
+                "geometry": [geometry],
+            },
+            geometry="geometry",
+            crs=parent_crs,
+        )
+
+    @staticmethod
+    @log_call
+    def classify_boundary_segments(
+        parent_boundary: Union[BaseGeometry, gpd.GeoSeries, gpd.GeoDataFrame],
+        child_boundary: Union[BaseGeometry, gpd.GeoSeries, gpd.GeoDataFrame],
+        *,
+        tolerance: float = 0.0,
+        crs: Optional[Any] = None,
+    ) -> gpd.GeoDataFrame:
+        """Partition the child perimeter into inherited and artificial cuts."""
+        tolerance = float(tolerance)
+        if not math.isfinite(tolerance) or tolerance < 0:
+            raise ValueError("tolerance must be finite and non-negative")
+        parent = _single_geometry(parent_boundary)
+        child = _single_geometry(child_boundary)
+        if not isinstance(child, Polygon):
+            raise ValueError("Boundary partition currently requires one child Polygon")
+        boundary_zone = (
+            parent.boundary
+            if tolerance == 0
+            else parent.boundary.buffer(
+                tolerance,
+                cap_style="flat",
+                join_style="mitre",
+            )
+        )
+        records: list[dict[str, Any]] = []
+        for segment_type, geometry in (
+            ("inherited", child.boundary.intersection(boundary_zone)),
+            ("artificial_cut", child.boundary.difference(boundary_zone)),
+        ):
+            for part in _line_parts(geometry):
+                if part.length <= 0:
+                    continue
+                midpoint = part.interpolate(0.5, normalized=True)
+                records.append(
+                    {
+                        "segment_type": segment_type,
+                        "station": float(child.exterior.project(midpoint)),
+                        "length": float(part.length),
+                        "geometry": part,
+                    }
+                )
+        records.sort(key=lambda item: (item["station"], item["segment_type"]))
+        counters = {"inherited": 0, "artificial_cut": 0}
+        for record in records:
+            counters[record["segment_type"]] += 1
+            prefix = "INHERITED" if record["segment_type"] == "inherited" else "CUT"
+            record["segment_id"] = f"{prefix}-{counters[record['segment_type']]:03d}"
+        return gpd.GeoDataFrame(records, geometry="geometry", crs=crs)
+
+    @staticmethod
+    @log_call
+    def preflight(
+        spec: Breakout2DSpec,
+        *,
+        ras_object: RasPrj,
+    ) -> Breakout2DPreflight:
+        """Inventory and spatially qualify a breakout without modifying files."""
+        if not isinstance(spec, Breakout2DSpec):
+            raise TypeError("spec must be a Breakout2DSpec")
+        ras_object.check_initialized()
+        plan = _select_plan_row(ras_object, str(spec.source_plan))
+        geometry_number = str(plan["geometry_number"]).zfill(2)
+        unsteady_number = str(plan["unsteady_number"]).zfill(2)
+        geometry = _select_geometry_row(ras_object, geometry_number)
+        source_geometry_path = Path(geometry["full_path"])
+        source_geometry_hdf = Path(geometry["hdf_path"])
+        if not source_geometry_hdf.is_file():
+            raise FileNotFoundError(f"Geometry HDF is required: {source_geometry_hdf}")
+        source_unsteady_path = Path(
+            RasPlan.get_unsteady_path(unsteady_number, ras_object=ras_object)
+        )
+        source_plan_path = Path(plan["full_path"])
+        source_plan_hdf = _optional_path(plan.get("HDF_Results_Path"))
+
+        mesh_areas = HdfMesh.get_mesh_areas(source_geometry_hdf)
+        selected = mesh_areas[
+            mesh_areas["mesh_name"].astype(str) == str(spec.source_2d_area)
+        ]
+        if len(selected) != 1:
+            available = sorted(
+                mesh_areas.get("mesh_name", pd.Series(dtype=str)).astype(str)
+            )
+            raise ValueError(
+                f"2D flow area {spec.source_2d_area!r} is not unique; "
+                f"available={available}"
+            )
+        parent = _polygonal_geometry(make_valid(selected.geometry.iloc[0]))
+        parent_boundary = gpd.GeoDataFrame(
+            {"mesh_name": [spec.source_2d_area], "geometry": [parent]},
+            geometry="geometry",
+            crs=selected.crs,
+        )
+        child_boundary = RasBreakout2D.normalize_child_boundary(
+            spec.child_boundary,
+            parent_boundary.crs,
+            child_boundary_crs=spec.child_boundary_crs,
+            breakout_id=spec.breakout_id,
+            allow_multipart=spec.allow_multipart,
+            allow_holes=spec.allow_holes,
+        )
+        child = child_boundary.geometry.iloc[0]
+        base_cell_size = _base_cell_size(
+            source_geometry_path,
+            spec.source_2d_area,
+        )
+        # Leave a tiny numeric guard beyond the required one-cell offset.
+        # HEC-RAS serializes geometry through text and HDF representations;
+        # endpoint roundoff at the exact buffer boundary can otherwise make a
+        # correctly clipped line fail the strict HDF ``covers`` predicate.
+        mesh_trim_distance = base_cell_size + max(1e-6, base_cell_size * 1e-8)
+        mesh_trim_boundary = child.buffer(-mesh_trim_distance)
+        if mesh_trim_boundary.is_empty:
+            raise ValueError(
+                f"One-cell inward trim ({mesh_trim_distance:g}) empties the child domain"
+            )
+        match_tolerance = (
+            spec.containment_tolerance
+            if spec.boundary_match_tolerance is None
+            else spec.boundary_match_tolerance
+        )
+        boundary_segments = RasBreakout2D.classify_boundary_segments(
+            parent,
+            child,
+            tolerance=float(match_tolerance),
+            crs=parent_boundary.crs,
+        )
+        source_features = _read_spatial_features(
+            source_geometry_hdf,
+            spec.source_2d_area,
+        )
+        existing_boundaries = _selected_boundaries(
+            ras_object,
+            unsteady_number,
+        )
+        feature_actions = _build_feature_actions(
+            parent_boundary,
+            child,
+            source_features,
+            existing_boundaries,
+            mesh_trim_boundary,
+            max_breakline_perimeter_crossings=spec.max_breakline_perimeter_crossings,
+        )
+        connection_actions = _classify_outside_connections(
+            source_geometry_path, child, float(spec.containment_tolerance),
+            spec.allow_extended_connection_support,
+        )
+        if connection_actions:
+            feature_actions = gpd.GeoDataFrame(
+                pd.concat(
+                    [feature_actions, pd.DataFrame(connection_actions)],
+                    ignore_index=True,
+                ),
+                geometry="geometry",
+                crs=parent_boundary.crs,
+            )
+        feature_actions["gate_group_count"] = feature_actions.get(
+            "gate_group_count", pd.Series(0, index=feature_actions.index)
+        ).fillna(0).astype(int)
+        feature_actions = feature_actions[FEATURE_ACTION_COLUMNS]
+        contributing_geometry_identities = []
+        containment_parent = _contributing_parent_union(
+            spec, parent_boundary, identities=contributing_geometry_identities
+        )
+        checks = _build_checks(
+            spec,
+            plan,
+            geometry,
+            parent,
+            child,
+            boundary_segments,
+            feature_actions,
+            mesh_area_count=len(mesh_areas),
+            containment_parent=containment_parent,
+        )
+        result = Breakout2DPreflight(
+            spec=spec,
+            source_plan_path=source_plan_path,
+            source_plan_hdf=source_plan_hdf,
+            source_geometry_number=geometry_number,
+            source_geometry_path=source_geometry_path,
+            source_geometry_hdf=source_geometry_hdf,
+            source_unsteady_number=unsteady_number,
+            source_unsteady_path=source_unsteady_path,
+            base_cell_size=base_cell_size,
+            parent_boundary=parent_boundary,
+            contributing_geometry_identities=contributing_geometry_identities,
+            child_boundary=child_boundary,
+            boundary_segments=boundary_segments,
+            feature_actions=feature_actions,
+            existing_boundaries=existing_boundaries,
+            checks=checks,
+            source_features=source_features,
+            connection_data=GeomLateral.get_connection_data(source_geometry_path),
+        )
+        logger.info(
+            "2D breakout preflight %s: ready=%s, features=%d",
+            spec.breakout_id,
+            result.is_ready,
+            len(feature_actions),
+        )
+        return result
+
+    @staticmethod
+    @log_call
+    def clone_plan_components(
+        preflight: Breakout2DPreflight,
+        *,
+        ras_object: RasPrj,
+        plan_title: Optional[str] = None,
+        plan_short_id: Optional[str] = None,
+        geometry_title: Optional[str] = None,
+        set_current_plan: bool = True,
+    ) -> Breakout2DCloneResult:
+        """Clone and associate the plan, geometry, and unsteady control file.
+
+        The caller must initialize ``ras_object`` on an isolated task-local
+        project.  The complete unsteady file is copied without a title rewrite
+        and verified byte-for-byte before this method returns.
+        """
+        if not preflight.is_ready:
+            raise ValueError(
+                "Breakout preflight failed: " + "; ".join(preflight.blocking_issues)
+            )
+        ras_object.check_initialized()
+        _verify_contributing_geometry_snapshots(preflight)
+        _verify_working_source_snapshot(preflight, ras_object)
+        source_unsteady_hash = _sha256_file(preflight.source_unsteady_path)
+
+        geometry_number = RasGeo.clone_geom(
+            preflight.source_geometry_number,
+            new_title=geometry_title,
+            ras_object=ras_object,
+        )
+        RasMap.clone_geometry_layer(
+            preflight.source_geometry_number,
+            geometry_number,
+            name=geometry_title,
+            ras_object=ras_object,
+        )
+        unsteady_number = RasPlan.clone_unsteady(
+            preflight.source_unsteady_number,
+            new_title=None,
+            ras_object=ras_object,
+        )
+        unsteady_path = Path(
+            RasPlan.get_unsteady_path(unsteady_number, ras_object=ras_object)
+        )
+        cloned_unsteady_hash = _sha256_file(unsteady_path)
+        if cloned_unsteady_hash != source_unsteady_hash:
+            raise RuntimeError(
+                "Cloned unsteady file is not byte-identical to the source; "
+                "boundary preservation cannot be proved"
+            )
+
+        plan_number = RasPlan.clone_plan(
+            preflight.spec.source_plan,
+            new_plan_shortid=plan_short_id,
+            new_title=plan_title,
+            geometry=geometry_number,
+            unsteady_flow=unsteady_number,
+            ras_object=ras_object,
+        )
+        plan = _select_plan_row(ras_object, plan_number)
+        observed_geometry = str(plan["geometry_number"]).zfill(2)
+        observed_unsteady = str(plan["unsteady_number"]).zfill(2)
+        if observed_geometry != str(geometry_number).zfill(2):
+            raise RuntimeError("Cloned plan geometry association failed readback")
+        if observed_unsteady != str(unsteady_number).zfill(2):
+            raise RuntimeError("Cloned plan unsteady association failed readback")
+        if set_current_plan:
+            ras_object.set_current_plan(plan_number)
+
+        geometry_path = Path(
+            RasPlan.get_geom_path(geometry_number, ras_object=ras_object)
+        )
+        return Breakout2DCloneResult(
+            source_plan=str(preflight.spec.source_plan),
+            source_geometry=preflight.source_geometry_number,
+            source_unsteady=preflight.source_unsteady_number,
+            plan_number=str(plan_number).zfill(2),
+            geometry_number=str(geometry_number).zfill(2),
+            unsteady_number=str(unsteady_number).zfill(2),
+            plan_path=Path(plan["full_path"]),
+            geometry_path=geometry_path,
+            geometry_hdf=geometry_path.with_suffix(geometry_path.suffix + ".hdf"),
+            unsteady_path=unsteady_path,
+            source_unsteady_sha256=source_unsteady_hash,
+            cloned_unsteady_sha256=cloned_unsteady_hash,
+        )
+
+    @staticmethod
+    @log_call
+    def prepare_cloned_geometry(
+        preflight: Breakout2DPreflight,
+        clone: Breakout2DCloneResult,
+        *,
+        ras_object: RasPrj,
+        refresh_hdf: bool = True,
+        refresh_method: str = "rasmapper",
+        remesh: bool = True,
+        compute_property_tables: bool = False,
+        timeout: int = 600,
+        max_mesh_iterations: int = 8,
+        disable_meteorology: bool = False,
+        require_complete_products: bool = False,
+        anchor_grid_to_parent: bool = False,
+        computation_points: Optional[np.ndarray] = None,
+        repair_computation_points: bool = False,
+        parent_cell_ids: Optional[Sequence[int]] = None,
+        native_worker_threads: Optional[int] = 1,
+    ) -> Breakout2DPreparationResult:
+        """Trim mesh-owned features and remesh only the cloned geometry.
+
+        Geometry BC lines are not edited. The cloned unsteady file is preserved
+        unless ``disable_meteorology=True``: after verifying the clone, inherited
+        meteorology and its source references are removed before native refresh.
+        Boundary hydrographs and infiltration remain unchanged. Mutation evidence
+        is returned in ``meteorology``; ``boundaries_unchanged`` still reports
+        whole-file byte equality and is False when meteorology text changes. Planned refinement regions are applied to the cloned HDF
+        before perimeter and breakline text edits, while the inherited text
+        and HDF still match. ``refresh_hdf`` performs the exact text-to-HDF
+        import. With ``refresh_method="rasmapper"`` (default) it runs through the
+        owned RAS Mapper workflow.  With ``refresh_method="rasexe"`` it runs
+        headless: computation points are first regenerated inside the new
+        perimeter (the parent's points would otherwise be imported), and
+        ``Ras.exe`` rebuilds the cloned geometry HDF through
+        :meth:`GeomPreprocessor.run_geometry_preprocessor` in geometry-only
+        mode.  That pass also computes property tables, so the cloned HDF
+        must first carry a terrain association the child can resolve (set it
+        with :meth:`RasMap.set_geometry_association`).
+        RAS Mapper's text import replaces the HDF, so its HDF-only refinement
+        regions are reapplied after import. ``remesh`` then regenerates
+        computation cells through
+        :class:`GeomMesh`; no option launches a hydraulic simulation.
+
+        If native containment fails only for breaklines, a single recorded
+        retry may clip numerical endpoint deficits against the exact compiled
+        one-cell inward buffer. Each line must remain one positive LineString
+        and move at most 0.01 source horizontal units. Identities and mesh
+        controls remain fixed. The cloned geometry carries a planned/applied/
+        validated repair JSON sidecar; successful results also return the
+        records in ``breakline_containment_repairs``. Larger deficits, dropped
+        or split lines, and structure violations remain blocking.
+
+        Args:
+            preflight: A passing :meth:`preflight` result.
+            clone: The :meth:`clone_plan_components` result for that preflight.
+            ras_object: The initialized isolated working project.
+            refresh_hdf: Rebuild the cloned geometry HDF from text.  Required
+                when connections are retained or removed.
+            refresh_method: ``"rasmapper"`` (GUI workflow) or ``"rasexe"``
+                (headless geometry preprocessor; needs a terrain association
+                on the cloned HDF).  Ignored when ``refresh_hdf`` is False.
+            remesh: Regenerate computation cells with :meth:`GeomMesh.generate`.
+            compute_property_tables: Compute 2D property tables afterwards.
+                Requires a terrain association on the geometry.
+            timeout: Seconds allowed for the text-to-HDF import.
+            native_worker_threads: Positive managed geometry worker-pool limit
+                for headless refreshes, including a containment repair retry.
+                Defaults to one; None retains inherited pool settings. This
+                execution control does not change hydraulic solver cores.
+            max_mesh_iterations: Mesh auto-fix iterations.
+            computation_points: Optional N-by-2 XY coordinates in the source
+                geometry CRS/units, for a cookie-cut bootstrap. Requires
+                refresh_hdf=True, refresh_method="rasexe", remesh=False and
+                anchor_grid_to_parent=False. Points are written unchanged through
+                GeomMesh.write_computation_points unless repair_computation_points
+                is enabled; native compilation and QA still follow. Writing
+                supplied points does not establish parent face identity.
+            repair_computation_points: Opt in to the bounded supplied-seed
+                MaxFaces/perimeter recipe before headless compilation. Requires
+                computation_points. The returned computation_points_result's
+                seed_repair records its plan and readback; default False leaves
+                supplied points and perimeter unchanged. Native completion and
+                hydraulic review remain required after repair.
+            parent_cell_ids: Explicit physical cell IDs from the source geometry
+                HDF. Retain their exact cell/face topology through
+                :meth:`GeomMesh.plan_cell_subset` and
+                :meth:`GeomMesh.apply_cell_subset` before native completion.
+                Requires refresh_hdf=True, refresh_method="rasexe", remesh=False,
+                anchor_grid_to_parent=False, and computation_points=None.
+                The selected union must match the planned child perimeter in
+                its source CRS/units; holes and disconnected selections block.
+            disable_meteorology: Disable and remove inherited meteorological
+                sources for an owned boundary-only child before preprocessing.
+                Defaults to False for existing precipitation-driven workflows.
+            require_complete_products: Require the qualified completion contract
+                for every native refresh, including numeric-repair retries and
+                mesh repairs. Defaults to False for upstream compatibility.
+            anchor_grid_to_parent: Lay the child's regular computation-point
+                grid on the parent area's lattice
+                (:meth:`GeomMesh.get_grid_anchor` of the source geometry HDF)
+                instead of the child's own bounding box, so interior cells
+                away from breakline and region changes coincide with the
+                parent's. Requires ``remesh`` and the parent's base spacing.
+                Defaults to False. Evidence is in ``mesh_result.grid_anchor``.
+                Recommended with
+                ``Breakout2DSpec(max_breakline_perimeter_crossings=2)``.
+
+        Returns:
+            Breakout2DPreparationResult: Evidence for each preparation step.
+
+        Raises:
+            ValueError: If preflight did not pass, the clone's unsteady inputs
+                changed, ``refresh_method`` is unknown, or outside connection
+                removal is requested without an HDF refresh.
+            RuntimeError: If the HDF refresh, remeshing or property tables fail.
+        """
+        if refresh_method not in ("rasmapper", "rasexe"):
+            raise ValueError("refresh_method must be 'rasmapper' or 'rasexe'")
+        if native_worker_threads is not None and (
+            type(native_worker_threads) is not int or native_worker_threads < 1
+        ):
+            raise ValueError("native_worker_threads must be a positive integer or None")
+        if parent_cell_ids is not None:
+            if (
+                not refresh_hdf
+                or refresh_method != "rasexe"
+                or remesh
+                or anchor_grid_to_parent
+                or computation_points is not None
+            ):
+                raise ValueError(
+                    "parent_cell_ids requires refresh_hdf=True, refresh_method='rasexe', "
+                    "remesh=False, anchor_grid_to_parent=False and computation_points=None"
+                )
+            ids = np.asarray(parent_cell_ids)
+            if (
+                ids.ndim != 1
+                or not ids.size
+                or ids.dtype.kind not in "iu"
+                or np.any(ids < 0)
+                or len(np.unique(ids)) != len(ids)
+            ):
+                raise ValueError(
+                    "parent_cell_ids must be unique nonnegative integer IDs"
+                )
+        if repair_computation_points and computation_points is None:
+            raise ValueError("repair_computation_points requires computation_points")
+        if computation_points is not None and (
+            not refresh_hdf
+            or refresh_method != "rasexe"
+            or remesh
+            or anchor_grid_to_parent
+        ):
+            raise ValueError(
+                "computation_points requires refresh_hdf=True, refresh_method='rasexe', "
+                "remesh=False and anchor_grid_to_parent=False"
+            )
+        if not preflight.is_ready:
+            raise ValueError("preflight must pass before geometry preparation")
+        if computation_points is not None:
+            from .geom.GeomMesh import _validated_computation_points
+
+            computation_points = _validated_computation_points(
+                computation_points, preflight.child_boundary.geometry.iloc[0]
+            )
+        _verify_contributing_geometry_snapshots(preflight)
+        if not clone.boundaries_unchanged:
+            raise ValueError("clone does not prove byte-identical unsteady inputs")
+        if _sha256_file(clone.unsteady_path) != clone.cloned_unsteady_sha256:
+            raise RuntimeError("Cloned unsteady file changed before preparation")
+        if not isinstance(disable_meteorology, bool):
+            raise TypeError("disable_meteorology must be a bool")
+        if not isinstance(anchor_grid_to_parent, bool):
+            raise TypeError("anchor_grid_to_parent must be a bool")
+        if anchor_grid_to_parent and not remesh:
+            raise ValueError("anchor_grid_to_parent requires remesh=True")
+        grid_anchor = (
+            GeomMesh.get_grid_anchor(
+                preflight.source_geometry_hdf,
+                mesh_name=preflight.spec.source_2d_area,
+            )
+            if anchor_grid_to_parent
+            else None
+        )
+
+        unsupported_points = preflight.feature_actions[
+            (preflight.feature_actions["feature_type"] == "reference_point")
+            & (preflight.feature_actions["action"] != "keep")
+        ]
+        if not unsupported_points.empty:
+            raise NotImplementedError(
+                "Reference-point trimming is not yet implemented; remove or "
+                "relocate those features in a separate reviewed change"
+            )
+
+        meteorology = {}
+        if disable_meteorology:
+            from .RasUnsteady import RasUnsteady
+
+            meteorology = RasUnsteady.disable_meteorology(
+                clone.unsteady_path,
+                remove_source_references=True,
+                ras_object=ras_object,
+            )
+        prepared_unsteady_hash = _sha256_file(clone.unsteady_path)
+        child = preflight.child_boundary.geometry.iloc[0]
+        approved_connections = preflight.feature_actions[
+            preflight.feature_actions["feature_type"] == "sa_2d_connection"
+        ]
+        if not approved_connections.empty:
+            if not refresh_hdf:
+                raise ValueError(
+                    "Connection retention/removal requires exact native HDF refresh"
+                )
+            current_connections = _classify_outside_connections(
+                clone.geometry_path, child, float(preflight.spec.containment_tolerance),
+                getattr(preflight.spec, "allow_extended_connection_support", False),
+            )
+            approved_names = set(approved_connections["name"])
+            if (
+                not approved_connections["action"].isin(["keep", "drop"]).all()
+                or {item["name"] for item in current_connections} != approved_names
+                or {item["name"]: item["action"] for item in current_connections}
+                != dict(
+                    zip(approved_connections["name"], approved_connections["action"])
+                )
+            ):
+                raise ValueError(
+                    "Cloned connection inventory no longer matches approved decisions"
+                )
+            cloned_data = GeomLateral.get_connection_data(clone.geometry_path)
+            if dict(zip(cloned_data["Name"], cloned_data["RawBlock"])) != dict(
+                zip(
+                    preflight.connection_data["Name"],
+                    preflight.connection_data["RawBlock"],
+                )
+            ):
+                raise ValueError("Cloned connection records changed since preflight")
+        breakline_specs = _retained_breakline_specs(preflight)
+        reference_line_specs = _retained_reference_line_specs(preflight)
+        refinement_specs = _retained_refinement_specs(preflight)
+
+        # Refinements live only in HDF. Apply them while the clone's inherited
+        # text/HDF are still current, before headless refresh builds any mesh.
+        source_refinement_names = [
+            item["name"]
+            for item in GeomMesh.get_refinement_regions(
+                clone.geometry_number,
+                ras_object=ras_object,
+            )
+        ]
+        GeomMesh.replace_refinement_regions(
+            clone.geometry_number,
+            refinement_specs,
+            expected_existing_names=source_refinement_names,
+            ras_object=ras_object,
+        )
+
+        _prepare_geometry_text(
+            preflight,
+            clone,
+            child,
+            approved_connections,
+            breakline_specs,
+            reference_line_specs,
+        )
+
+        refresh_result = None
+        points = None
+        mesh_result = None
+        if refresh_hdf and refresh_method == "rasexe":
+            from .geom.GeomPreprocessor import GeomPreprocessor
+
+            if parent_cell_ids is not None:
+                subset_plan = GeomMesh.plan_cell_subset(
+                    preflight.source_geometry_hdf,
+                    clone.geometry_path,
+                    parent_cell_ids,
+                    preflight.spec.source_2d_area,
+                    ras_object=ras_object,
+                )
+                mesh_result = GeomMesh.apply_cell_subset(
+                    subset_plan,
+                    timeout=timeout,
+                    ras_object=ras_object,
+                )
+                points = mesh_result
+            elif computation_points is None:
+                points = GeomMesh.generate_computation_points(
+                    clone.geometry_number,
+                    mesh_name=preflight.spec.source_2d_area,
+                    ras_object=ras_object,
+                )
+            elif repair_computation_points:
+                repair_plan = GeomMesh.plan_computation_point_repair(
+                    clone.geometry_number,
+                    computation_points,
+                    mesh_name=preflight.spec.source_2d_area,
+                    ras_object=ras_object,
+                    allow_extended_connection_support=preflight.spec.allow_extended_connection_support,
+                )
+                points = GeomMesh.apply_computation_point_repair(repair_plan)
+            else:
+                points = GeomMesh.write_computation_points(
+                    clone.geometry_number,
+                    computation_points,
+                    mesh_name=preflight.spec.source_2d_area,
+                    ras_object=ras_object,
+                )
+            # Operation completion establishes generated points; native mesh
+            # compilation and verification follow below.
+            if not points.ok or not points.cell_count:
+                raise RuntimeError(
+                    f"Computation-point regeneration failed: {points.error_message}"
+                )
+            try:
+                refresh_result = GeomPreprocessor.run_geometry_preprocessor(
+                    clone.plan_number,
+                    ras_object=ras_object,
+                    max_wait=timeout,
+                    force=True,
+                    clear_geompre=True,
+                    geometry_only=True,
+                    require_complete_products=require_complete_products,
+                    native_worker_threads=native_worker_threads,
+                )
+            except Exception as exc:
+                raise RuntimeError("Headless geometry HDF refresh failed") from exc
+            if not refresh_result.success or not clone.geometry_hdf.is_file():
+                error = refresh_result.error or refresh_result.first_error_line
+                raise RuntimeError(
+                    f"Headless geometry HDF refresh failed: {error or 'unknown error'}"
+                ) from (error if isinstance(error, BaseException) else None)
+        elif refresh_hdf:
+            from .gui.workflows import MeshRegenerationWorkflow
+
+            try:
+                refresh_result = (
+                    MeshRegenerationWorkflow.refresh_geometry_hdf_from_text(
+                        geom_number=clone.geometry_number,
+                        flow_area_name=preflight.spec.source_2d_area,
+                        ras_object=ras_object,
+                        timeout=timeout,
+                    )
+                )
+            except Exception as exc:
+                raise RuntimeError("Exact geometry HDF refresh failed") from exc
+            if not refresh_result.success:
+                raise RuntimeError(
+                    f"Exact geometry HDF refresh failed: {refresh_result.error}"
+                ) from (
+                    refresh_result.error
+                    if isinstance(refresh_result.error, BaseException)
+                    else None
+                )
+            # Exact RAS Mapper import discards the inherited HDF, including
+            # refinements (which have no text representation). Restore the
+            # plan before meshing without a second refresh.
+            GeomMesh.replace_refinement_regions(
+                clone.geometry_number,
+                refinement_specs,
+                expected_existing_names=[],
+                ras_object=ras_object,
+            )
+
+        containment_result = None
+        breakline_containment_repairs = []
+        if remesh:
+            mesh_result = GeomMesh.generate(
+                clone.geometry_number,
+                mesh_name=preflight.spec.source_2d_area,
+                ras_object=ras_object,
+                max_iterations=max_mesh_iterations,
+                require_complete_products=require_complete_products,
+                grid_anchor=grid_anchor,
+            )
+            violations = getattr(
+                getattr(mesh_result, "domain_containment", None), "violations", []
+            )
+            if (
+                not mesh_result.ok
+                and violations
+                and all(
+                    item.feature_type == "breakline"
+                    and item.reason == "outside_one_cell_inward_buffer"
+                    for item in violations
+                )
+            ):
+                # Bootstrap can reverse the ring and round line endpoints. GEOS
+                # erosion at nearly collinear corners is orientation-sensitive.
+                # Repair only measured numeric endpoint deficits, never waive
+                # the exact compiled-perimeter containment requirement.
+                from .geom.GeomMesh import _hdf_flow_area_perimeter
+                from .geom.GeomPreprocessor import GeomPreprocessor
+                from .geom.GeomStorage import GeomStorage
+
+                perimeter = Polygon(
+                    _hdf_flow_area_perimeter(
+                        clone.geometry_hdf, preflight.spec.source_2d_area
+                    )
+                )
+                repaired_specs, repair = _plan_numeric_breakline_containment(
+                    perimeter,
+                    breakline_specs,
+                    {item.feature_name for item in violations},
+                    preflight.base_cell_size,
+                )
+                text_before = _sha256_file(clone.geometry_path)
+                hdf_before = _sha256_file(clone.geometry_hdf)
+                repair.update(
+                    status="planned",
+                    geometry_text_sha256_before=text_before,
+                    geometry_hdf_sha256_before=hdf_before,
+                )
+                repair_path = clone.geometry_path.with_name(
+                    clone.geometry_path.name + ".breakline_containment_repair.json"
+                )
+                repair_path.write_text(
+                    json.dumps(repair, indent=2) + "\n", encoding="utf-8"
+                )
+                if text_before != _sha256_file(
+                    clone.geometry_path
+                ) or hdf_before != _sha256_file(clone.geometry_hdf):
+                    raise RuntimeError(
+                        "Geometry changed after numeric breakline repair planning"
+                    )
+                GeomStorage.replace_breaklines(
+                    clone.geometry_path,
+                    preflight.spec.source_2d_area,
+                    repaired_specs,
+                    expected_existing_names=[item["name"] for item in breakline_specs],
+                )
+                points = GeomMesh.generate_computation_points(
+                    clone.geometry_number,
+                    mesh_name=preflight.spec.source_2d_area,
+                    ras_object=ras_object,
+                )
+                if not points.ok or not points.cell_count:
+                    raise RuntimeError(
+                        "Numeric breakline repair could not regenerate computation points"
+                    )
+                retry = GeomPreprocessor.run_geometry_preprocessor(
+                    clone.plan_number,
+                    ras_object=ras_object,
+                    max_wait=timeout,
+                    force=True,
+                    clear_geompre=True,
+                    geometry_only=True,
+                    require_complete_products=require_complete_products,
+                    native_worker_threads=native_worker_threads,
+                )
+                repair.update(
+                    status="applied", native_preprocess_success=bool(retry.success)
+                )
+                repair_path.write_text(
+                    json.dumps(repair, indent=2) + "\n", encoding="utf-8"
+                )
+                if not retry.success:
+                    raise RuntimeError(
+                        "Numeric breakline repair failed native preprocessing"
+                    )
+                mesh_result = GeomMesh.generate(
+                    clone.geometry_number,
+                    mesh_name=preflight.spec.source_2d_area,
+                    ras_object=ras_object,
+                    max_iterations=max_mesh_iterations,
+                    require_complete_products=require_complete_products,
+                    grid_anchor=grid_anchor,
+                )
+                repair.update(
+                    status="validated" if mesh_result.ok else "failed",
+                    native_mesh_success=bool(mesh_result.ok),
+                    geometry_text_sha256_after=_sha256_file(clone.geometry_path),
+                    geometry_hdf_sha256_after=_sha256_file(clone.geometry_hdf),
+                )
+                repair_path.write_text(
+                    json.dumps(repair, indent=2) + "\n", encoding="utf-8"
+                )
+                breakline_containment_repairs.append(repair)
+                breakline_specs = repaired_specs
+            if not mesh_result.ok:
+                raise RuntimeError(
+                    f"2D mesh regeneration failed: {mesh_result.error_message}"
+                )
+            containment_result = GeomMesh.audit_domain_containment(
+                clone.geometry_number,
+                mesh_name=preflight.spec.source_2d_area,
+                ras_object=ras_object,
+            )
+            if not containment_result.ok:
+                raise ValueError(
+                    "Trimmed mesh-owned features failed containment: "
+                    f"{containment_result.violations}"
+                )
+
+        property_tables = False
+        if compute_property_tables:
+            property_tables = GeomMesh.compute_property_tables(
+                clone.geometry_number,
+                mesh_name=preflight.spec.source_2d_area,
+                ras_object=ras_object,
+            )
+            if not property_tables:
+                raise RuntimeError("2D property-table computation returned False")
+
+        if repair_computation_points:
+            from .geom._seed_repair import _audit_text_features
+            from .geom.GeomMesh import _hdf_flow_area_perimeter
+
+            containment_result = GeomMesh.audit_domain_containment(
+                clone.geometry_number,
+                mesh_name=preflight.spec.source_2d_area,
+                ras_object=ras_object,
+            )
+            if not containment_result.ok:
+                raise ValueError("Repaired supplied-seed mesh features fail containment: "
+                                 f"{containment_result.violations}")
+            feature_audit = _audit_text_features(
+                clone.geometry_path,
+                preflight.spec.source_2d_area,
+                Polygon(_hdf_flow_area_perimeter(clone.geometry_hdf, preflight.spec.source_2d_area)),
+                preflight.spec.allow_extended_connection_support,
+            )
+            points.seed_repair["post_preprocess_containment"] = containment_result.to_dict()
+            points.seed_repair["post_preprocess_feature_audit"] = feature_audit
+        if parent_cell_ids is not None:
+            # Ras.exe may silently regenerate topology from unchanged seeds and
+            # perimeter. Recheck exact planned arrays after every native phase.
+            mesh_result.cell_subset["post_preprocess_validation"] = (
+                GeomMesh.validate_cell_subset(subset_plan, ras_object=ras_object)
+            )
+        final_unsteady_hash = _sha256_file(clone.unsteady_path)
+        if final_unsteady_hash != prepared_unsteady_hash:
+            raise RuntimeError("Geometry preparation modified the cloned unsteady file")
+        retained_connections = GeomLateral.get_connection_data(clone.geometry_path)
+        expected_connections = (
+            preflight.connection_data[
+                preflight.connection_data["Name"].isin(
+                    approved_connections.loc[
+                        approved_connections["action"] == "keep", "name"
+                    ]
+                )
+            ]
+            if not preflight.connection_data.empty
+            else preflight.connection_data
+        )
+        if dict(
+            zip(retained_connections["Name"], retained_connections["RawBlock"])
+        ) != dict(
+            zip(
+                expected_connections.get("Name", []),
+                expected_connections.get("RawBlock", []),
+            )
+        ):
+            raise RuntimeError(
+                "Retained connection records changed during geometry preparation"
+            )
+        attachments = (
+            HdfStruc.get_connection_attachments(
+                clone.geometry_hdf,
+                connections_df=retained_connections,
+                ras_object=ras_object,
+            )
+            if not retained_connections.empty
+            else pd.DataFrame(columns=HdfStruc.CONNECTION_ATTACHMENT_COLUMNS)
+        )
+        return Breakout2DPreparationResult(
+            clone=clone,
+            feature_actions=preflight.feature_actions.copy(),
+            connection_attachments=attachments,
+            refresh_result=refresh_result,
+            mesh_result=mesh_result,
+            containment_result=containment_result,
+            property_tables_computed=bool(property_tables),
+            retained_breakline_count=len(breakline_specs),
+            retained_reference_line_count=len(reference_line_specs),
+            retained_refinement_region_count=len(refinement_specs),
+            unsteady_sha256_after=final_unsteady_hash,
+            breakline_containment_repairs=breakline_containment_repairs,
+            meteorology=meteorology,
+            computation_points_result=points,
+        )
+
+    @staticmethod
+    @log_call
+    def select_parent_boundary_faces(
+        geometry_hdf: Union[str, Path],
+        mesh_name: str,
+        child_boundary: Union[BaseGeometry, gpd.GeoSeries, gpd.GeoDataFrame],
+    ) -> gpd.GeoDataFrame:
+        """Select parent faces separating retained and discarded active cell centers.
+
+        Partition numeric topology first, constructing geometries only for the
+        selected faces. Ghost cells are excluded when active cell counts exist.
+        """
+        geometry_path = Path(geometry_hdf)
+        if not geometry_path.is_file():
+            raise FileNotFoundError(f"Geometry HDF not found: {geometry_path}")
+        child = _single_geometry(child_boundary)
+        if not isinstance(child, Polygon):
+            raise ValueError("Boundary-face review requires one child Polygon")
+        child = orient(child, sign=1.0)
+
+        base = f"Geometry/2D Flow Areas/{mesh_name}"
+        with h5py.File(geometry_path, "r") as hdf:
+            if base not in hdf:
+                raise ValueError(f"Mesh faces/cells are unavailable for {mesh_name!r}")
+            centers = np.asarray(read_typed(hdf[f"{base}/Cells Center Coordinate"]))
+            cell_count = len(centers)
+            attributes = hdf.get("Geometry/2D Flow Areas/Attributes")
+            if attributes is not None and "Cell Count" in (
+                attributes.dtype.names or ()
+            ):
+                rows = read_typed(attributes)
+                cell_count = next(
+                    int(row["Cell Count"])
+                    for row in rows
+                    if HdfUtils.convert_ras_string(row["Name"]) == str(mesh_name)
+                )
+            elif "Geometry/2D Flow Areas/Cell Info" in hdf:
+                counts = dict(HdfBase.get_2d_flow_area_names_and_counts(geometry_path))
+                cell_count = int(counts[str(mesh_name)])
+            if not 0 < cell_count <= len(centers):
+                raise ValueError(f"Invalid active cell count for {mesh_name!r}")
+            centers = centers[:cell_count]
+            face_cells = np.asarray(read_typed(hdf[f"{base}/Faces Cell Indexes"]), dtype=int)
+            normals = np.asarray(
+                read_typed(hdf[f"{base}/Faces NormalUnitVector and Length"]),
+                dtype=float,
+            )
+        inside = intersects_xy(child, centers[:, 0], centers[:, 1])
+        valid = (
+            (face_cells[:, 0] >= 0)
+            & (face_cells[:, 1] >= 0)
+            & (face_cells[:, 0] < cell_count)
+            & (face_cells[:, 1] < cell_count)
+        )
+        retained_0 = np.zeros(len(face_cells), dtype=bool)
+        retained_1 = np.zeros(len(face_cells), dtype=bool)
+        retained_0[valid] = inside[face_cells[valid, 0]]
+        retained_1[valid] = inside[face_cells[valid, 1]]
+        selected_ids = np.flatnonzero(valid & (retained_0 ^ retained_1))
+        if selected_ids.size == 0:
+            raise ValueError("No parent faces cross the proposed child partition")
+
+        with h5py.File(geometry_path, "r") as hdf:
+            # Numeric topology is compact even for multi-million-cell meshes;
+            # avoid expensive HDF fancy indexing of thousands of sparse rows.
+            point_indexes = read_typed(hdf[f"{base}/Faces FacePoint Indexes"])[selected_ids]
+            point_coords = read_typed(hdf[f"{base}/FacePoints Coordinate"])
+            perimeter_info = read_typed(hdf[f"{base}/Faces Perimeter Info"])[selected_ids]
+            perimeter_values = read_typed(hdf[f"{base}/Faces Perimeter Values"])
+            crs = HdfBase.get_projection(hdf)
+
+        records: list[dict[str, Any]] = []
+        for row, face_id in enumerate(selected_ids.tolist()):
+            cell_0, cell_1 = face_cells[face_id, :2].astype(int).tolist()
+            inside_cell, outside_cell = (
+                (cell_0, cell_1) if retained_0[face_id] else (cell_1, cell_0)
+            )
+            outward_x, outward_y = centers[outside_cell] - centers[inside_cell]
+            normal_x = float(normals[face_id, 0])
+            normal_y = float(normals[face_id, 1])
+            dot = normal_x * outward_x + normal_y * outward_y
+            if not math.isfinite(dot) or math.isclose(dot, 0.0, abs_tol=1e-12):
+                raise ValueError(f"Face {face_id} normal cannot be oriented")
+            point_a, point_b = point_indexes[row]
+            start, count = perimeter_info[row]
+            geometry = LineString(
+                [
+                    point_coords[point_a],
+                    *perimeter_values[start : start + count],
+                    point_coords[point_b],
+                ]
+            )
+            records.append(
+                {
+                    "mesh_name": str(mesh_name),
+                    "face_id": int(face_id),
+                    "cell_0": int(cell_0),
+                    "cell_1": int(cell_1),
+                    "inside_cell": int(inside_cell),
+                    "outside_cell": int(outside_cell),
+                    "normal_x": normal_x,
+                    "normal_y": normal_y,
+                    "face_length": (
+                        float(normals[face_id, 2])
+                        if normals.shape[1] >= 3 and normals[face_id, 2] > 0
+                        else float(geometry.length)
+                    ),
+                    "orientation_multiplier": 1.0 if dot > 0 else -1.0,
+                    "boundary_station": float(
+                        child.exterior.project(
+                            geometry.interpolate(0.5, normalized=True)
+                        )
+                    ),
+                    "geometry": geometry,
+                }
+            )
+        records.sort(key=lambda item: (item["boundary_station"], item["face_id"]))
+        return gpd.GeoDataFrame(
+            records,
+            columns=BOUNDARY_FACE_COLUMNS,
+            geometry="geometry",
+            crs=crs,
+        )
+
+    @staticmethod
+    @log_call
+    def review_parent_boundary_flux(
+        preflight: Breakout2DPreflight,
+        *,
+        minimum_peak_flow: float = 100.0,
+        minimum_volume_fraction: float = 0.001,
+        gap_multiplier: float = 3.0,
+        prefer_native: bool = True,
+    ) -> Breakout2DFluxReview:
+        """Summarize parent flux locations without assigning child BC types."""
+        if preflight.source_plan_hdf is None or not preflight.source_plan_hdf.is_file():
+            raise FileNotFoundError("A completed parent plan HDF is required")
+        if minimum_peak_flow < 0:
+            raise ValueError("minimum_peak_flow must be non-negative")
+        if not 0 <= minimum_volume_fraction <= 1:
+            raise ValueError("minimum_volume_fraction must be between zero and one")
+        if gap_multiplier <= 0:
+            raise ValueError("gap_multiplier must be positive")
+        faces = RasBreakout2D.select_parent_boundary_faces(
+            preflight.source_geometry_hdf,
+            preflight.spec.source_2d_area,
+            preflight.child_boundary,
+        )
+        native, source, units = _read_boundary_face_flow(
+            preflight.source_plan_hdf,
+            preflight.source_geometry_hdf,
+            preflight.spec.source_2d_area,
+            faces,
+            prefer_native=prefer_native,
+        )
+        multipliers = (
+            faces.set_index("face_id")
+            .loc[native.columns, "orientation_multiplier"]
+            .to_numpy(dtype=float)
+        )
+        outward = native.multiply(multipliers, axis="columns")
+        outward.attrs.update(native.attrs)
+        outward.attrs["sign_convention"] = "positive leaves child; negative enters"
+        reviewed_faces = _summarize_face_flux(
+            faces,
+            outward,
+            minimum_peak_flow=float(minimum_peak_flow),
+            minimum_volume_fraction=float(minimum_volume_fraction),
+        )
+        zones = _combine_flux_locations(
+            reviewed_faces,
+            outward,
+            gap_multiplier=float(gap_multiplier),
+        )
+        return Breakout2DFluxReview(
+            faces=reviewed_faces,
+            zones=zones,
+            face_flow_outward=outward,
+            source=source,
+            units=units,
+        )
+
+
+def _boundary_frame(
+    value: BoundaryInput, explicit_crs: Optional[Any]
+) -> gpd.GeoDataFrame:
+    if isinstance(value, gpd.GeoDataFrame):
+        frame = value.copy()
+    elif isinstance(value, gpd.GeoSeries):
+        frame = gpd.GeoDataFrame(geometry=value.copy(), crs=value.crs)
+    elif isinstance(value, BaseGeometry):
+        frame = gpd.GeoDataFrame(geometry=[value], crs=explicit_crs)
+    elif isinstance(value, (str, Path)):
+        path = Path(value)
+        if not path.is_file():
+            raise FileNotFoundError(f"Child boundary file not found: {path}")
+        frame = gpd.read_file(path)
+    else:
+        raise TypeError("Unsupported child boundary input")
+    if frame.empty:
+        raise ValueError("Child boundary contains no features")
+    if explicit_crs is not None:
+        if frame.crs is None:
+            frame = frame.set_crs(explicit_crs)
+        elif CRS.from_user_input(frame.crs) != CRS.from_user_input(explicit_crs):
+            raise ValueError("child_boundary_crs conflicts with the input CRS")
+    return frame
+
+
+def _union_geometry(frame: gpd.GeoDataFrame) -> BaseGeometry:
+    nonempty = frame.geometry[frame.geometry.notna() & ~frame.geometry.is_empty]
+    if nonempty.empty:
+        return GeometryCollection()
+    return (
+        nonempty.union_all() if hasattr(nonempty, "union_all") else nonempty.unary_union
+    )
+
+
+def _single_geometry(
+    value: Union[BaseGeometry, gpd.GeoSeries, gpd.GeoDataFrame],
+) -> BaseGeometry:
+    if isinstance(value, BaseGeometry):
+        return value
+    if isinstance(value, gpd.GeoSeries):
+        return _union_geometry(gpd.GeoDataFrame(geometry=value, crs=value.crs))
+    if isinstance(value, gpd.GeoDataFrame):
+        return _union_geometry(value)
+    raise TypeError("Expected a Shapely geometry, GeoSeries, or GeoDataFrame")
+
+
+def _polygonal_geometry(geometry: BaseGeometry) -> Union[Polygon, MultiPolygon]:
+    if isinstance(geometry, (Polygon, MultiPolygon)):
+        return geometry
+    if isinstance(geometry, GeometryCollection):
+        polygons: list[Polygon] = []
+        for part in geometry.geoms:
+            if isinstance(part, Polygon):
+                polygons.append(part)
+            elif isinstance(part, MultiPolygon):
+                polygons.extend(part.geoms)
+        if len(polygons) == 1:
+            return polygons[0]
+        if polygons:
+            return MultiPolygon(polygons)
+    raise ValueError(f"Expected polygonal geometry; got {geometry.geom_type}")
+
+
+def _orient_polygonal(geometry: Union[Polygon, MultiPolygon]):
+    if isinstance(geometry, Polygon):
+        return orient(geometry, sign=1.0)
+    return MultiPolygon([orient(part, sign=1.0) for part in geometry.geoms])
+
+
+def _hole_count(geometry: Union[Polygon, MultiPolygon]) -> int:
+    if isinstance(geometry, Polygon):
+        return len(geometry.interiors)
+    return sum(len(part.interiors) for part in geometry.geoms)
+
+
+def _line_parts(geometry: BaseGeometry) -> list[LineString]:
+    if geometry.is_empty:
+        return []
+    if isinstance(geometry, LineString):
+        return [geometry]
+    if isinstance(geometry, (MultiLineString, GeometryCollection)):
+        parts: list[LineString] = []
+        for part in geometry.geoms:
+            parts.extend(_line_parts(part))
+        return parts
+    return []
+
+
+def _optional_path(value: Any) -> Optional[Path]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return Path(text) if text else None
+
+
+def _select_plan_row(ras_object: RasPrj, plan_number: str) -> pd.Series:
+    ras_object.plan_df = ras_object.get_plan_entries()
+    rows = ras_object.plan_df[
+        ras_object.plan_df["plan_number"].astype(str).str.zfill(2)
+        == str(plan_number).zfill(2)
+    ]
+    if len(rows) != 1:
+        raise ValueError(f"Plan {plan_number} is not uniquely registered")
+    return rows.iloc[0]
+
+
+def _select_geometry_row(ras_object: RasPrj, geometry_number: str) -> pd.Series:
+    ras_object.geom_df = ras_object.get_geom_entries()
+    rows = ras_object.geom_df[
+        ras_object.geom_df["geom_number"].astype(str).str.zfill(2)
+        == str(geometry_number).zfill(2)
+    ]
+    if len(rows) != 1:
+        raise ValueError(f"Geometry {geometry_number} is not uniquely registered")
+    return rows.iloc[0]
+
+
+def _verify_working_source_snapshot(
+    preflight: Breakout2DPreflight,
+    ras_object: RasPrj,
+) -> None:
+    """Require an isolated working copy of the exact qualified source files."""
+    working_root = Path(ras_object.project_folder)
+    source_root = preflight.source_plan_path.parent
+    if working_root.resolve() == source_root.resolve():
+        raise ValueError(
+            "clone_plan_components requires an isolated working project copy"
+        )
+    project_name = str(ras_object.project_name)
+    pairs = [
+        (
+            working_root / f"{project_name}.p{preflight.spec.source_plan}",
+            preflight.source_plan_path,
+            "plan",
+        ),
+        (
+            working_root / f"{project_name}.g{preflight.source_geometry_number}",
+            preflight.source_geometry_path,
+            "geometry",
+        ),
+        (
+            working_root / f"{project_name}.g{preflight.source_geometry_number}.hdf",
+            preflight.source_geometry_hdf,
+            "geometry HDF",
+        ),
+        (
+            working_root / f"{project_name}.u{preflight.source_unsteady_number}",
+            preflight.source_unsteady_path,
+            "unsteady",
+        ),
+    ]
+    for working_path, qualified_path, label in pairs:
+        if not working_path.is_file():
+            raise FileNotFoundError(
+                f"Working {label} source is missing: {working_path}"
+            )
+        if _sha256_file(working_path) != _sha256_file(qualified_path):
+            raise ValueError(
+                f"Working {label} source does not match the qualified source: "
+                f"{working_path.name}"
+            )
+
+
+def _selected_boundaries(ras_object: RasPrj, unsteady_number: str) -> pd.DataFrame:
+    boundaries = getattr(ras_object, "boundaries_df", pd.DataFrame())
+    if boundaries is None or boundaries.empty:
+        return pd.DataFrame()
+    if "unsteady_number" not in boundaries.columns:
+        return boundaries.copy()
+    selected = boundaries[
+        boundaries["unsteady_number"].astype(str).str.zfill(2)
+        == str(unsteady_number).zfill(2)
+    ].copy()
+    sort_columns = [
+        column
+        for column in ("boundary_condition_number", "bc_line_name")
+        if column in selected.columns
+    ]
+    return selected.sort_values(sort_columns).reset_index(drop=True)
+
+
+def _read_spatial_features(
+    geometry_hdf: Path,
+    mesh_name: str,
+) -> dict[str, gpd.GeoDataFrame]:
+    return {
+        "bc_line": HdfBndry.get_bc_lines(geometry_hdf),
+        "breakline": HdfBndry.get_breaklines(geometry_hdf),
+        "refinement_region": HdfBndry.get_refinement_regions(geometry_hdf),
+        "reference_line": HdfBndry.get_reference_lines(
+            geometry_hdf,
+            mesh_name=mesh_name,
+        ),
+        "reference_point": HdfBndry.get_reference_points(
+            geometry_hdf,
+            mesh_name=mesh_name,
+        ),
+    }
+
+
+def _build_feature_actions(
+    parent_boundary: gpd.GeoDataFrame,
+    child: BaseGeometry,
+    source_features: dict[str, gpd.GeoDataFrame],
+    existing_boundaries: pd.DataFrame,
+    mesh_trim_boundary: BaseGeometry,
+    max_breakline_perimeter_crossings: Optional[int] = None,
+) -> gpd.GeoDataFrame:
+    records = [
+        _action_record(
+            "mesh_area",
+            "0",
+            str(parent_boundary.iloc[0]["mesh_name"]),
+            "replace",
+            "replace_parent_perimeter_and_regenerate_mesh",
+            parent_boundary.geometry.iloc[0],
+            child,
+        )
+    ]
+    id_columns = {
+        "bc_line": "bc_line_id",
+        "breakline": "bl_id",
+        "refinement_region": "rr_id",
+        "reference_line": "refline_id",
+        "reference_point": "refpoint_id",
+    }
+    for feature_type, frame in source_features.items():
+        if frame is None or frame.empty:
+            continue
+        if frame.crs is not None and parent_boundary.crs is not None:
+            frame = frame.to_crs(parent_boundary.crs)
+        for index, row in frame.iterrows():
+            geometry = row.geometry
+            repaired_refinement = False
+            if feature_type == "refinement_region" and geometry is not None and not geometry.is_valid:
+                from .geom.GeomMeshRepair import GeomMeshRepair
+                geometry, _repair = GeomMeshRepair.repair_refinement_polygon(geometry)
+                repaired_refinement = True
+            feature_id = str(row.get(id_columns[feature_type], index))
+            name = str(row.get("Name", f"{feature_type}_{feature_id}"))
+            if feature_type == "bc_line":
+                retained, action, reason = (
+                    geometry,
+                    "preserve",
+                    "boundary_condition_scope_deferred",
+                )
+            elif (
+                feature_type == "breakline"
+                and max_breakline_perimeter_crossings is not None
+                and geometry is not None
+                and not geometry.is_empty
+                and _boundary_crossings(geometry, mesh_trim_boundary)
+                > max_breakline_perimeter_crossings
+            ):
+                retained, action, reason = (
+                    None,
+                    "drop",
+                    "exceeds_child_perimeter_crossing_limit",
+                )
+            elif feature_type in {"breakline", "refinement_region"}:
+                retained, action, reason = _clip_action(
+                    geometry,
+                    mesh_trim_boundary,
+                )
+                if action == "clip":
+                    reason = "trimmed_to_one_cell_inward_buffer"
+                if repaired_refinement:
+                    reason = "repaired_source_refinement_geometry:" + reason
+            else:
+                retained, action, reason = _clip_action(geometry, child)
+            records.append(
+                _action_record(
+                    feature_type,
+                    feature_id,
+                    name,
+                    action,
+                    reason,
+                    geometry,
+                    retained,
+                )
+            )
+    for index, row in existing_boundaries.iterrows():
+        name = str(row.get("bc_line_name", f"boundary_{index + 1}"))
+        records.append(
+            _action_record(
+                "unsteady_boundary",
+                str(row.get("boundary_condition_number", index + 1)),
+                name,
+                "preserve",
+                "cloned_byte_identical_boundary_scope_deferred",
+                None,
+                None,
+            )
+        )
+    records.sort(
+        key=lambda item: (
+            item["feature_type"],
+            item["feature_id"],
+            item["name"],
+        )
+    )
+    return gpd.GeoDataFrame(
+        records,
+        columns=FEATURE_ACTION_COLUMNS,
+        geometry="geometry",
+        crs=parent_boundary.crs,
+    )
+
+
+def _clip_action(
+    geometry: Optional[BaseGeometry],
+    child: BaseGeometry,
+) -> tuple[Optional[BaseGeometry], str, str]:
+    if geometry is None or geometry.is_empty:
+        return None, "drop", "empty_source_geometry"
+    if child.covers(geometry):
+        return geometry, "keep", "fully_within_child_boundary"
+    retained = geometry.intersection(child)
+    if retained.is_empty or _geometry_measure(retained) <= 0:
+        return None, "drop", "outside_child_boundary"
+    return retained, "clip", "partially_intersects_child_boundary"
+
+
+def _boundary_crossings(geometry: BaseGeometry, boundary: BaseGeometry) -> int:
+    """Count how many times a line passes between the inside and outside of ``boundary``.
+
+    The source line is walked vertex to vertex. Each straight segment is split
+    where it meets the boundary edge, and each piece is classified as inside,
+    outside or on the edge. Pieces on the edge (overlap or touch) are not a
+    side, so running along the edge or touching it and turning back is not a
+    crossing. A crossing is a change between inside and outside along the
+    walk. Self-intersections of the line do not matter. A line wholly inside
+    counts 0, a line with one end outside 1, a line passing through 2, and a
+    line weaving along the edge more than 2. A closed line counts the change
+    across its closing vertex, so its count does not depend on the start vertex.
+    Parts of a multipart line are summed.
+    """
+    if boundary is None or boundary.is_empty:
+        return 0
+    edge = boundary.boundary
+    tolerance = 1e-9 * max(1.0, *(abs(value) for value in boundary.bounds))
+    total = 0
+    for line in _line_parts(geometry):
+        coords = line.coords
+        sides: list[bool] = []
+        for start, end in pairwise(coords):
+            segment = LineString([start, end])
+            if segment.length <= tolerance:
+                continue
+            breaks = {0.0, 1.0}
+            for xy in get_coordinates(segment.intersection(edge)):
+                fraction = segment.project(Point(xy), normalized=True)
+                breaks.add(min(1.0, max(0.0, float(fraction))))
+            for low, high in pairwise(sorted(breaks)):
+                if (high - low) * segment.length <= tolerance:
+                    continue
+                middle = segment.interpolate((low + high) / 2, normalized=True)
+                if edge.distance(middle) <= tolerance:
+                    continue
+                inside = bool(boundary.contains(middle))
+                if not sides or sides[-1] != inside:
+                    sides.append(inside)
+        crossings = max(0, len(sides) - 1)
+        if line.is_closed and len(sides) > 1 and sides[0] != sides[-1]:
+            # A closed line wraps around: count the change across its closing vertex too,
+            # so the count does not depend on which vertex the ring starts at.
+            crossings += 1
+        total += crossings
+    return total
+
+
+def _geometry_measure(geometry: Optional[BaseGeometry]) -> float:
+    if geometry is None or geometry.is_empty:
+        return 0.0
+    if geometry.geom_type in {"Polygon", "MultiPolygon"}:
+        return float(geometry.area)
+    if geometry.geom_type in {"Point", "MultiPoint"}:
+        return 1.0
+    return float(geometry.length)
+
+
+def _action_record(
+    feature_type: str,
+    feature_id: str,
+    name: str,
+    action: str,
+    reason: str,
+    source_geometry: Optional[BaseGeometry],
+    retained_geometry: Optional[BaseGeometry],
+) -> dict[str, Any]:
+    source_measure = _geometry_measure(source_geometry)
+    retained_measure = _geometry_measure(retained_geometry)
+    return {
+        "feature_type": feature_type,
+        "feature_id": feature_id,
+        "name": name,
+        "action": action,
+        "reason": reason,
+        "source_measure": source_measure,
+        "retained_measure": retained_measure,
+        "retained_fraction": (
+            retained_measure / source_measure if source_measure > 0 else 0.0
+        ),
+        "geometry": retained_geometry,
+    }
+
+
+def _prepare_geometry_text(
+    preflight: Breakout2DPreflight,
+    clone: Breakout2DCloneResult,
+    child: BaseGeometry,
+    approved_connections: pd.DataFrame,
+    breakline_specs: list[dict[str, Any]],
+    reference_line_specs: list[dict[str, Any]],
+) -> None:
+    """Stage native text edits, preserving complete controls before atomic commit."""
+    original_geometry = clone.geometry_path.read_bytes()
+    retained_text = GeomLateral.get_connection_data(clone.geometry_path)
+    dropped_names = set(
+        approved_connections.loc[approved_connections["action"] == "drop", "name"]
+    )
+    retained_text = retained_text[~retained_text["Name"].isin(dropped_names)]
+    with tempfile.TemporaryDirectory(
+        prefix=".sa2d-breakout-", dir=clone.geometry_path.parent
+    ) as folder:
+        staged_geometry = Path(folder) / clone.geometry_path.name
+        staged_geometry.write_bytes(original_geometry)
+        GeomStorage.set_2d_flow_area_perimeter(
+            staged_geometry,
+            preflight.spec.source_2d_area,
+            geometry=child,
+        )
+        # Guard the text collection with the source text inventory. The spatial
+        # HDF reader omits degenerate polylines and is not a complete text
+        # inventory; comparing its names with text produces false drift errors.
+        source_breakline_names = [
+            name
+            for _fid, name, *_spacing in GeomMesh.get_breakline_spacing(
+                preflight.source_geometry_path
+            )
+        ]
+        GeomStorage.replace_breaklines(
+            staged_geometry,
+            preflight.spec.source_2d_area,
+            breakline_specs,
+            expected_existing_names=source_breakline_names,
+        )
+        source_reference_lines = GeomReferenceFeatures.get_reference_lines(
+            staged_geometry
+        )
+        source_reference_names = [
+            row["name"]
+            for row in source_reference_lines
+            if row.get("storage_area") == preflight.spec.source_2d_area
+        ]
+        GeomReferenceFeatures.replace_reference_lines(
+            staged_geometry,
+            preflight.spec.source_2d_area,
+            reference_line_specs,
+            expected_existing_names=source_reference_names,
+        )
+
+        # Restore exact raw records after conventional perimeter/feature writers.
+        GeomLateral.write_connection_data(
+            staged_geometry, retained_text, create_backup=False
+        )
+        if clone.geometry_path.read_bytes() != original_geometry:
+            raise RuntimeError("Cloned geometry changed during staged preparation")
+        GeomParser.create_backup(clone.geometry_path)
+        staged_geometry.replace(clone.geometry_path)
+
+
+def _classify_outside_connections(
+    geometry_path: Path,
+    child: BaseGeometry,
+    tolerance: float,
+    allow_extended_support: bool = False,
+) -> list[dict[str, Any]]:
+    """Report complete-footprint keep/drop/block decisions for every control."""
+    records = []
+    decisions = GeomLateral.classify_connections(
+        geometry_path, child, tolerance=tolerance,
+        allow_extended_support=allow_extended_support,
+    )
+    for index, row in decisions.iterrows():
+        footprint = row["geometry"]
+        if not isinstance(footprint, BaseGeometry):
+            footprint = None
+        action = row["action"]
+        record = _action_record(
+            "sa_2d_connection",
+            str(index),
+            row["Name"],
+            action,
+            row["reason"],
+            footprint,
+            footprint if action == "keep" else None,
+        )
+        record["geometry"] = footprint
+        record["gate_group_count"] = int(row.get("gate_group_count", 0))
+        records.append(record)
+    return records
+
+
+def _contributing_parent_union(
+    spec: Breakout2DSpec,
+    parent_boundary: gpd.GeoDataFrame,
+    *,
+    identities: list[dict[str, str]] | None = None,
+) -> BaseGeometry | None:
+    """Read complete contributor perimeters; never substitute a requested extent."""
+    if not spec.contributing_geometry_hdfs:
+        return None
+    if parent_boundary.crs is None:
+        raise ValueError("Owner geometry must declare a CRS for union containment")
+    perimeters = [parent_boundary.geometry.iloc[0]]
+    seen = set()
+    for value in spec.contributing_geometry_hdfs:
+        path = Path(value)
+        if not re.search(r"\.g\d{2}\.hdf$", path.name, re.IGNORECASE):
+            raise ValueError(
+                "Contributors must be geometry .gNN.hdf files, never plan results"
+            )
+        resolved = path.resolve()
+        if resolved in seen:
+            raise ValueError("Contributing geometry HDF paths must be unique")
+        seen.add(resolved)
+        before = _sha256_file(path) if identities is not None else None
+        areas = HdfMesh.get_mesh_areas(path)
+        if len(areas) != 1:
+            raise ValueError(
+                "Each contributing geometry must have exactly one 2D flow area"
+            )
+        if areas.crs != parent_boundary.crs:
+            raise ValueError(
+                "Contributing geometry CRS must equal the owner geometry CRS"
+            )
+        perimeter = areas.geometry.iloc[0]
+        if (
+            perimeter.is_empty
+            or not perimeter.is_valid
+            or perimeter.geom_type not in ("Polygon", "MultiPolygon")
+        ):
+            raise ValueError(
+                "Contributing 2D perimeter must be a valid nonempty polygon"
+            )
+        perimeters.append(perimeter)
+        if identities is not None:
+            if _sha256_file(path) != before:
+                raise RuntimeError("Contributing geometry changed during preflight")
+            identities.append({"path": str(path), "sha256": before})
+    return unary_union(perimeters)
+
+
+def _verify_contributing_geometry_snapshots(preflight: Breakout2DPreflight) -> None:
+    """Refuse mutation when the geometry that supplied containment has changed."""
+    if not getattr(preflight.spec, "contributing_geometry_hdfs", ()):
+        return
+    if len(preflight.contributing_geometry_identities) != len(
+        preflight.spec.contributing_geometry_hdfs
+    ):
+        raise ValueError("Union preflight lacks contributing geometry identities")
+    for identity in preflight.contributing_geometry_identities:
+        if _sha256_file(Path(identity["path"])) != identity["sha256"]:
+            raise ValueError("Contributing geometry changed since preflight")
+
+
+def _build_checks(
+    spec: Breakout2DSpec,
+    plan: pd.Series,
+    geometry: pd.Series,
+    parent: BaseGeometry,
+    child: BaseGeometry,
+    boundary_segments: gpd.GeoDataFrame,
+    feature_actions: gpd.GeoDataFrame,
+    *,
+    mesh_area_count: int,
+    containment_parent: BaseGeometry | None = None,
+) -> pd.DataFrame:
+    unsupported = {
+        column: _int_or_zero(geometry.get(column))
+        for column in _UNSUPPORTED_STRUCTURE_COLUMNS
+    }
+    connection_actions = feature_actions[
+        feature_actions["feature_type"] == "sa_2d_connection"
+    ]
+    outside_connections_verified = (
+        len(connection_actions) == unsupported["num_sa_2d_connections"]
+        and connection_actions["action"].isin(["keep", "drop"]).all()
+        and connection_actions["name"].is_unique
+    )
+    other_structures_absent = all(
+        count == (
+            int(connection_actions.get("gate_group_count", pd.Series(dtype=int)).sum())
+            if (
+                column == "num_gates"
+                and spec.allow_extended_connection_support
+                and outside_connections_verified
+            ) else 0
+        )
+        for column, count in unsupported.items()
+        if column != "num_sa_2d_connections"
+    )
+    pure_2d = bool(
+        plan.get("geometry_type") == "2D"
+        and plan.get("plan_type") == "unsteady_2d"
+        and _bool_value(plan.get("plan_classification_valid"))
+    )
+    containment = parent if containment_parent is None else containment_parent
+    buffered_parent = containment.buffer(float(spec.containment_tolerance))
+    partition_length = float(
+        boundary_segments.get("length", pd.Series(dtype=float)).sum()
+    )
+    perimeter_length = float(child.boundary.length)
+    reference_points_need_trim = feature_actions[
+        (feature_actions["feature_type"] == "reference_point")
+        & (feature_actions["action"] != "keep")
+    ]
+    rows = [
+        _check(
+            "pure_2d_plan",
+            pure_2d,
+            "Source plan must be classified as valid unsteady pure 2D",
+        ),
+        _check(
+            "single_2d_flow_area",
+            int(mesh_area_count) == 1,
+            "Initial breakout preparation requires exactly one 2D flow area",
+            details={"mesh_area_count": int(mesh_area_count)},
+        ),
+        _check(
+            "unsupported_structures_absent",
+            other_structures_absent and outside_connections_verified,
+            "Connections require complete-footprint keep/drop decisions; other structures remain unsupported",
+            details={
+                **unsupported,
+                "verified_external_connections": int(
+                    connection_actions["action"].eq("drop").sum()
+                ),
+                "retained_connections": int(
+                    connection_actions["action"].eq("keep").sum()
+                ),
+            },
+        ),
+        _check(
+            "child_within_parent"
+            if containment_parent is None
+            else "child_within_parent_union",
+            bool(buffered_parent.covers(child)),
+            "Child boundary must be contained by the parent 2D area"
+            if containment_parent is None
+            else "Child boundary must be contained by the contributing parent union",
+            details={
+                "outside_parent_area": float(child.difference(parent).area),
+                "tolerance": float(spec.containment_tolerance),
+                **(
+                    {
+                        "outside_parent_union_area": float(
+                            child.difference(containment).area
+                        )
+                    }
+                    if containment_parent is not None
+                    else {}
+                ),
+            },
+        ),
+        _check(
+            "boundary_partition_closes",
+            abs(partition_length - perimeter_length)
+            <= max(perimeter_length, 1.0) * 1e-9,
+            "Inherited and artificial segments must close the child perimeter",
+            details={
+                "partition_length": partition_length,
+                "perimeter_length": perimeter_length,
+            },
+        ),
+        _check(
+            "reference_points_do_not_require_trim",
+            reference_points_need_trim.empty,
+            "Reference points requiring trim are outside the initial implementation",
+        ),
+    ]
+    return pd.DataFrame(rows)
+
+
+def _check(
+    check_id: str,
+    passed: bool,
+    message: str,
+    *,
+    blocking: bool = True,
+    details: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    return {
+        "check_id": check_id,
+        "passed": bool(passed),
+        "blocking": bool(blocking),
+        "message": message,
+        "details": details or {},
+    }
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return 0 if pd.isna(value) else int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bool_value(value: Any) -> bool:
+    try:
+        return False if pd.isna(value) else bool(value)
+    except (TypeError, ValueError):
+        return False
+
+
+def _source_names(frame: Optional[gpd.GeoDataFrame], column: str) -> list[str]:
+    if frame is None or frame.empty or column not in frame.columns:
+        return []
+    return frame[column].astype(str).tolist()
+
+
+def _base_cell_size(geometry_path: Path, mesh_name: str) -> float:
+    settings = GeomStorage.get_2d_flow_area_settings(geometry_path)
+    selected = settings[settings["name"].astype(str) == str(mesh_name)]
+    if len(selected) != 1:
+        raise ValueError(f"Base cell size is unavailable for {mesh_name!r}")
+    raw = selected.iloc[0]["point_generation_data"]
+    parts = str(raw).split(",")
+    if len(parts) < 3:
+        raise ValueError(f"Malformed point-generation data for {mesh_name!r}: {raw!r}")
+    try:
+        spacing = float(parts[2])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Base cell size is unavailable for {mesh_name!r}: {raw!r}"
+        ) from exc
+    if not math.isfinite(spacing) or spacing <= 0:
+        raise ValueError(f"Base cell size must be positive for {mesh_name!r}")
+    return spacing
+
+
+def _action_lookup(preflight: Breakout2DPreflight, feature_type: str) -> pd.DataFrame:
+    return preflight.feature_actions[
+        preflight.feature_actions["feature_type"] == feature_type
+    ].set_index("feature_id", drop=False)
+
+
+def _unique_part_name(base: str, part_index: int, part_count: int) -> str:
+    if part_count == 1:
+        return base[:32]
+    suffix = f"_BRK{part_index:02d}"
+    return f"{base[: 32 - len(suffix)]}{suffix}"
+
+
+def _deduplicate_ras_name(candidate: str, used: set[str]) -> str:
+    """Return a deterministic unique HEC-RAS name of at most 32 characters."""
+    normalized = candidate[:32]
+    if normalized.casefold() not in used:
+        used.add(normalized.casefold())
+        return normalized
+    sequence = 2
+    while True:
+        suffix = f"_{sequence:02d}"
+        revised = f"{normalized[: 32 - len(suffix)]}{suffix}"
+        if revised.casefold() not in used:
+            used.add(revised.casefold())
+            return revised
+        sequence += 1
+
+
+def _plan_numeric_breakline_containment(
+    perimeter: BaseGeometry,
+    specs: list[dict[str, Any]],
+    failed_names: set[str],
+    cell_size: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Plan bounded clipping or vertex projection against the exact ring, without mutation."""
+    if not math.isfinite(cell_size) or cell_size <= 0:
+        raise ValueError(
+            "Numeric breakline repair requires positive finite cell spacing"
+        )
+    limit = 0.01  # source horizontal units; independent of the strict containment gate
+    margin = max(1e-6, cell_size * 1e-8)
+    admissible = perimeter.buffer(-cell_size)
+    guarded = perimeter.buffer(-(cell_size + margin)).intersection(admissible)
+    if guarded.is_empty or not guarded.is_valid:
+        raise ValueError("Numeric breakline repair requires a valid inward buffer")
+    if len({item["name"] for item in specs}) != len(specs) or not failed_names.issubset(
+        {item["name"] for item in specs}
+    ):
+        raise ValueError("Numeric breakline repair identities are ambiguous")
+    output, repairs = [], []
+    for fid, item in enumerate(specs):
+        revised = dict(item)
+        if item["name"] in failed_names:
+            source = LineString(item["coords"])
+            clipped = source.intersection(guarded)
+            displacement = source.hausdorff_distance(clipped)
+            method = "endpoint_clip"
+            if (
+                clipped.geom_type != "LineString"
+                or clipped.is_empty
+                or not clipped.is_valid
+                or clipped.length <= 0
+            ):
+                raise ValueError(
+                    "Numeric breakline repair cannot drop or split a retained line"
+                )
+            if math.isfinite(displacement) and displacement > limit:
+                # At an acute intersection, a microscopic normal deficit can
+                # remove a long endpoint. Preserve that endpoint by projecting
+                # only exterior vertices into the guarded polygon instead.
+                from shapely.geometry import Point
+                from shapely.ops import nearest_points
+
+                interior = guarded.buffer(-margin)
+                if interior.is_empty:
+                    raise ValueError(
+                        "Breakline containment deficit exceeds numeric repair bounds"
+                    )
+                coordinates = []
+                for xy in source.coords:
+                    point = Point(xy)
+                    if not guarded.covers(point):
+                        point = nearest_points(interior, point)[0]
+                    coordinates.append(tuple(point.coords[0]))
+                projected = LineString(coordinates)
+                projected_displacement = source.hausdorff_distance(projected)
+                if (
+                    not interior.is_empty
+                    and projected.is_valid
+                    and projected.length > 0
+                    and guarded.covers(projected)
+                    and math.isfinite(projected_displacement)
+                    and projected_displacement <= limit
+                ):
+                    clipped = projected
+                    displacement = projected_displacement
+                    method = "bounded_vertex_projection"
+            if (
+                not math.isfinite(displacement)
+                or displacement > limit
+                or not admissible.covers(clipped)
+            ):
+                raise ValueError(
+                    "Breakline containment deficit exceeds numeric repair bounds"
+                )
+            revised["coords"] = list(clipped.coords)
+            repairs.append(
+                {
+                    "child_fid": fid,
+                    "name": item["name"],
+                    "before_wkb_sha256": _geometry_hash(source),
+                    "after_wkb_sha256": _geometry_hash(clipped),
+                    "before_length": source.length,
+                    "after_length": clipped.length,
+                    "removed_length": source.length - clipped.length,
+                    "geometry_displacement": displacement,
+                    "method": method,
+                }
+            )
+        output.append(revised)
+    return output, {
+        "schema": "ras-numeric-breakline-containment-repair/v1",
+        "reason_code": (
+            "NUMERIC_BREAKLINE_CONTAINMENT_VERTEX_REPAIR"
+            if any(r["method"] == "bounded_vertex_projection" for r in repairs)
+            else "NUMERIC_BREAKLINE_CONTAINMENT_CLIP"
+        ),
+        "horizontal_units": "source_horizontal_units",
+        "maximum_geometry_displacement": limit,
+        "one_cell_inward_distance": cell_size,
+        "additional_inward_margin": margin,
+        "compiled_perimeter_wkb_sha256": _geometry_hash(perimeter),
+        "perimeter_unchanged": True,
+        "native_controls_unchanged": True,
+        "repairs": repairs,
+    }
+
+
+def _retained_breakline_specs(preflight: Breakout2DPreflight) -> list[dict[str, Any]]:
+    frame = preflight.source_features.get("breakline")
+    if frame is None or frame.empty:
+        return []
+    actions = _action_lookup(preflight, "breakline")
+    specs: list[dict[str, Any]] = []
+    used: set[str] = set()
+    for index, row in frame.iterrows():
+        feature_id = str(row.get("bl_id", index))
+        if feature_id not in actions.index:
+            continue
+        geometry = actions.loc[feature_id, "geometry"]
+        if geometry is None or geometry.is_empty:
+            continue
+        parts = sorted(_line_parts(geometry), key=lambda part: (-part.length, part.wkt))
+        for part_index, part in enumerate(parts, start=1):
+            name = _deduplicate_ras_name(
+                _unique_part_name(
+                    str(row.get("Name", "")),
+                    part_index,
+                    len(parts),
+                ),
+                used,
+            )
+            specs.append(
+                {
+                    "name": name,
+                    "coords": list(part.coords),
+                    "cell_size_near": _optional_positive(row.get("cell_spacing_near")),
+                    "cell_size_far": _optional_positive(row.get("cell_spacing_far")),
+                    "near_repeats": _int_or_zero(row.get("near_repeats")),
+                    "protection_radius": _int_or_zero(row.get("protection_radius")),
+                }
+            )
+    return specs
+
+
+def _optional_positive(value: Any) -> Optional[float]:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) and numeric > 0 else None
+
+
+def _retained_reference_line_specs(
+    preflight: Breakout2DPreflight,
+) -> list[dict[str, Any]]:
+    actions = _action_lookup(preflight, "reference_line")
+    specs: list[dict[str, Any]] = []
+    used: set[str] = set()
+    for row in actions.itertuples(index=False):
+        if row.action not in {"keep", "clip"} or row.geometry is None:
+            continue
+        parts = _line_parts(row.geometry)
+        for part_index, part in enumerate(parts, start=1):
+            name = _deduplicate_ras_name(
+                _unique_part_name(str(row.name), part_index, len(parts)),
+                used,
+            )
+            specs.append({"name": name, "coordinates": list(part.coords)})
+    return specs
+
+
+def _retained_refinement_specs(preflight: Breakout2DPreflight) -> list[dict[str, Any]]:
+    frame = preflight.source_features.get("refinement_region")
+    if frame is None or frame.empty:
+        return []
+    controls = {
+        int(item["fid"]): item
+        for item in GeomMesh.get_refinement_regions(preflight.source_geometry_path)
+    }
+    actions = _action_lookup(preflight, "refinement_region")
+    specs: list[dict[str, Any]] = []
+    used: set[str] = set()
+    for index, row in frame.iterrows():
+        fid = int(row.get("rr_id", index))
+        feature_id = str(fid)
+        if feature_id not in actions.index:
+            continue
+        geometry = actions.loc[feature_id, "geometry"]
+        if geometry is None or geometry.is_empty:
+            continue
+        control = controls.get(fid)
+        if control is None:
+            raise ValueError(
+                f"Refinement-region controls are unavailable for FID {fid}"
+            )
+        polygons = [geometry] if isinstance(geometry, Polygon) else list(geometry.geoms)
+        for part_index, polygon in enumerate(polygons, start=1):
+            name = _deduplicate_ras_name(
+                _unique_part_name(
+                    str(row.get("Name", "")),
+                    part_index,
+                    len(polygons),
+                ),
+                used,
+            )
+            specs.append(
+                {
+                    "name": name,
+                    "polygon": polygon,
+                    "spacing_dx": float(control["spacing_dx"]),
+                    "spacing_dy": float(control["spacing_dy"]),
+                }
+            )
+    return specs
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _geometry_hash(geometry: BaseGeometry) -> str:
+    return hashlib.sha256(geometry.wkb).hexdigest()
+
+
+def _decode_hdf_text(value: Any) -> str:
+    if isinstance(value, (bytes, np.bytes_)):
+        return value.decode("utf-8", errors="replace").strip()
+    if isinstance(value, np.ndarray) and value.size == 1:
+        return _decode_hdf_text(value.reshape(-1)[0])
+    return str(value).strip()
+
+
+def _result_time_index(hdf: h5py.File) -> pd.Index:
+    base = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series"
+    values = np.asarray(read_typed(hdf[f"{base}/Time"]), dtype=float)
+    try:
+        start = HdfBase.get_simulation_start_time(hdf)
+        return HdfUtils.convert_timesteps_to_datetimes(values, start)
+    except (ValueError, TypeError, KeyError):
+        return pd.Index(pd.to_timedelta(values, unit="D"), name="time")
+
+
+def _read_hdf_columns(dataset: h5py.Dataset, ids: np.ndarray) -> np.ndarray:
+    requested = np.asarray(ids, dtype=int)
+    order = np.argsort(requested)
+    sorted_values = np.asarray(read_typed(dataset, (slice(None), requested[order])), dtype=float)
+    return sorted_values[:, np.argsort(order)]
+
+
+def _read_boundary_face_flow(
+    plan_hdf: Path,
+    geometry_hdf: Path,
+    mesh_name: str,
+    faces: gpd.GeoDataFrame,
+    *,
+    prefer_native: bool,
+) -> tuple[pd.DataFrame, str, str]:
+    face_ids = faces["face_id"].to_numpy(dtype=int)
+    result_base = (
+        "Results/Unsteady/Output/Output Blocks/Base Output/"
+        f"Unsteady Time Series/2D Flow Areas/{mesh_name}"
+    )
+    native_path = f"{result_base}/Face Flow"
+    velocity_path = f"{result_base}/Face Velocity"
+    water_surface_path = f"{result_base}/Water Surface"
+    with h5py.File(plan_hdf, "r") as result_hdf:
+        index = _result_time_index(result_hdf)
+        if prefer_native and native_path in result_hdf:
+            values = _read_hdf_columns(result_hdf[native_path], face_ids)
+            units = _decode_hdf_text(read_attr(result_hdf[native_path], "Units", ""))
+            return (
+                pd.DataFrame(values, index=index, columns=face_ids),
+                "native_face_flow",
+                units,
+            )
+        for required in (velocity_path, water_surface_path):
+            if required not in result_hdf:
+                raise ValueError(
+                    "Face Flow is absent and reconstruction inputs are incomplete: "
+                    f"missing {required}"
+                )
+        velocity = _read_hdf_columns(result_hdf[velocity_path], face_ids)
+        cell_ids = np.unique(faces[["cell_0", "cell_1"]].to_numpy(dtype=int).ravel())
+        cell_wse = _read_hdf_columns(result_hdf[water_surface_path], cell_ids)
+        position = {int(cell_id): index for index, cell_id in enumerate(cell_ids)}
+        stage = np.empty_like(velocity)
+        for column, row in enumerate(faces.itertuples(index=False)):
+            stage[:, column] = np.fmax(
+                cell_wse[:, position[int(row.cell_0)]],
+                cell_wse[:, position[int(row.cell_1)]],
+            )
+        velocity_units = _decode_hdf_text(
+            read_attr(result_hdf[velocity_path], "Units", "")
+        )
+
+    geometry_base = f"Geometry/2D Flow Areas/{mesh_name}"
+    with h5py.File(geometry_hdf, "r") as geometry:
+        info = geometry[f"{geometry_base}/Faces Area Elevation Info"]
+        tables = geometry[f"{geometry_base}/Faces Area Elevation Values"]
+        area = np.zeros_like(stage)
+        for column, row in enumerate(faces.itertuples(index=False)):
+            start, count = np.asarray(read_typed(info, (int(row.face_id), slice(None, 2))), dtype=int)
+            table = np.asarray(read_typed(tables, slice(start, start + count)), dtype=float)
+            elevations = table[:, 0]
+            areas = table[:, 1]
+            interpolated = np.interp(
+                stage[:, column],
+                elevations,
+                areas,
+                left=0.0,
+                right=float(areas[-1]),
+            )
+            above = np.isfinite(stage[:, column]) & (stage[:, column] > elevations[-1])
+            interpolated[above] += (stage[above, column] - elevations[-1]) * float(
+                row.face_length
+            )
+            interpolated[~np.isfinite(stage[:, column])] = 0.0
+            area[:, column] = interpolated
+    units = "m3/s" if "m/s" in velocity_units.lower() else "ft3/s"
+    return (
+        pd.DataFrame(velocity * area, index=index, columns=face_ids),
+        "reconstructed_face_velocity_stage_area",
+        units,
+    )
+
+
+def _time_seconds(index: pd.Index) -> np.ndarray:
+    if isinstance(index, (pd.DatetimeIndex, pd.TimedeltaIndex)):
+        return np.asarray((index - index[0]).total_seconds(), dtype=float)
+    return np.arange(len(index), dtype=float)
+
+
+def _summarize_face_flux(
+    faces: gpd.GeoDataFrame,
+    outward: pd.DataFrame,
+    *,
+    minimum_peak_flow: float,
+    minimum_volume_fraction: float,
+) -> gpd.GeoDataFrame:
+    seconds = _time_seconds(outward.index)
+    records: list[dict[str, Any]] = []
+    volumes: dict[int, float] = {}
+    for face_id in outward.columns:
+        values = np.nan_to_num(outward[face_id].to_numpy(dtype=float), nan=0.0)
+        volumes[int(face_id)] = float(np.trapezoid(np.abs(values), x=seconds))
+    total = sum(volumes.values())
+    indexed = faces.set_index("face_id", drop=False)
+    for face_id in outward.columns:
+        values = np.nan_to_num(outward[face_id].to_numpy(dtype=float), nan=0.0)
+        row = indexed.loc[int(face_id)].to_dict()
+        outward_volume = float(np.trapezoid(np.maximum(values, 0), x=seconds))
+        inward_volume = float(np.trapezoid(np.maximum(-values, 0), x=seconds))
+        fraction = volumes[int(face_id)] / total if total > 0 else 0.0
+        peak_index = int(np.argmax(np.abs(values)))
+        peak_flow = float(values[peak_index])
+        direction = "outflow" if outward_volume >= inward_volume else "inflow"
+        arrow_sign = 1.0 if direction == "outflow" else -1.0
+        multiplier = float(row["orientation_multiplier"]) * arrow_sign
+        row.update(
+            peak_flow=peak_flow,
+            peak_abs_flow=float(abs(peak_flow)),
+            peak_inflow=float(abs(min(values.min(), 0.0))),
+            peak_outflow=float(max(values.max(), 0.0)),
+            absolute_volume=volumes[int(face_id)],
+            absolute_volume_fraction=fraction,
+            dominant_direction=direction,
+            significant=bool(
+                abs(peak_flow) >= minimum_peak_flow
+                and fraction >= minimum_volume_fraction
+            ),
+            arrow_dx=float(row["normal_x"]) * multiplier,
+            arrow_dy=float(row["normal_y"]) * multiplier,
+        )
+        records.append(row)
+    return gpd.GeoDataFrame(records, geometry="geometry", crs=faces.crs)
+
+
+def _combine_flux_locations(
+    faces: gpd.GeoDataFrame,
+    outward: pd.DataFrame,
+    *,
+    gap_multiplier: float,
+) -> gpd.GeoDataFrame:
+    significant = faces[faces["significant"].astype(bool)].sort_values(
+        ["boundary_station", "face_id"]
+    )
+    columns = [
+        "zone_id",
+        "dominant_direction",
+        "face_count",
+        "face_ids",
+        "peak_flow",
+        "peak_abs_flow",
+        "absolute_volume_fraction",
+        "arrow_dx",
+        "arrow_dy",
+        "geometry",
+    ]
+    if significant.empty:
+        return gpd.GeoDataFrame(columns=columns, geometry="geometry", crs=faces.crs)
+    characteristic = float(np.median(significant["face_length"].to_numpy(dtype=float)))
+    gap_limit = max(characteristic * gap_multiplier, 1e-9)
+    groups: list[list[int]] = []
+    current: list[int] = []
+    previous_station: Optional[float] = None
+    previous_direction: Optional[str] = None
+    for row in significant.itertuples(index=False):
+        station = float(row.boundary_station)
+        if current and (
+            station - float(previous_station) > gap_limit
+            or row.dominant_direction != previous_direction
+        ):
+            groups.append(current)
+            current = []
+        current.append(int(row.face_id))
+        previous_station = station
+        previous_direction = str(row.dominant_direction)
+    if current:
+        groups.append(current)
+
+    seconds = _time_seconds(outward.index)
+    total_volume = float(faces["absolute_volume"].sum())
+    indexed = faces.set_index("face_id", drop=False)
+    records: list[dict[str, Any]] = []
+    for zone_index, face_ids in enumerate(groups, start=1):
+        values = outward[face_ids].sum(axis=1).to_numpy(dtype=float)
+        peak_index = int(np.argmax(np.abs(values)))
+        peak_flow = float(values[peak_index])
+        outward_volume = float(np.trapezoid(np.maximum(values, 0), x=seconds))
+        inward_volume = float(np.trapezoid(np.maximum(-values, 0), x=seconds))
+        direction = "outflow" if outward_volume >= inward_volume else "inflow"
+        zone_faces = indexed.loc[face_ids]
+        sign = 1.0 if direction == "outflow" else -1.0
+        dx = float(
+            np.mean(
+                zone_faces["normal_x"].to_numpy(dtype=float)
+                * zone_faces["orientation_multiplier"].to_numpy(dtype=float)
+                * sign
+            )
+        )
+        dy = float(
+            np.mean(
+                zone_faces["normal_y"].to_numpy(dtype=float)
+                * zone_faces["orientation_multiplier"].to_numpy(dtype=float)
+                * sign
+            )
+        )
+        magnitude = math.hypot(dx, dy) or 1.0
+        unioned = unary_union(zone_faces.geometry.tolist())
+        merged = unioned if isinstance(unioned, LineString) else linemerge(unioned)
+        records.append(
+            {
+                "zone_id": f"FLUX-{zone_index:03d}",
+                "dominant_direction": direction,
+                "face_count": len(face_ids),
+                "face_ids": json.dumps(face_ids),
+                "peak_flow": peak_flow,
+                "peak_abs_flow": abs(peak_flow),
+                "absolute_volume_fraction": (
+                    float(np.trapezoid(np.abs(values), x=seconds)) / total_volume
+                    if total_volume > 0
+                    else 0.0
+                ),
+                "arrow_dx": dx / magnitude,
+                "arrow_dy": dy / magnitude,
+                "geometry": merged,
+            }
+        )
+    return gpd.GeoDataFrame(
+        records,
+        columns=columns,
+        geometry="geometry",
+        crs=faces.crs,
+    )

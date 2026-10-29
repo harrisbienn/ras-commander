@@ -1,11 +1,12 @@
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import pandas as pd
+import pytest
 
-from ras_commander.RasUtils import RasUtils
-from ras_commander.RasPrj import get_ras_exe
 from ras_commander.geom.GeomPreprocessor import GeomPreprocessor
+from ras_commander.RasPrj import get_ras_exe
+from ras_commander.RasUtils import RasUtils
 
 
 class _FakeRasProject:
@@ -54,6 +55,46 @@ def test_get_ras_exe_keeps_compact_66_mapped_to_66(monkeypatch):
     assert get_ras_exe("66") == str(fake_66)
 
 
+def test_get_ras_exe_maps_610_plan_version_to_61_release(monkeypatch):
+    fake_61 = Path(r"C:\Program Files (x86)\HEC\HEC-RAS\6.1\Ras.exe")
+
+    monkeypatch.setattr(
+        RasUtils,
+        "discover_ras_versions",
+        staticmethod(lambda: {"6.1": fake_61}),
+    )
+
+    assert get_ras_exe("6.10") == str(fake_61)
+    assert get_ras_exe("6.1.0") == str(fake_61)
+
+
+def test_get_ras_exe_maps_compact_701_to_exact_patch_release(monkeypatch):
+    fake_701 = Path(r"C:\Program Files (x86)\HEC\HEC-RAS\7.0.1\Ras.exe")
+
+    monkeypatch.setattr(
+        RasUtils,
+        "discover_ras_versions",
+        staticmethod(lambda: {"7.0.1": fake_701}),
+    )
+
+    assert get_ras_exe("701") == str(fake_701)
+
+
+def test_get_ras_exe_maps_future_71_terms_to_release_folder(monkeypatch):
+    fake_71 = Path(r"C:\Program Files (x86)\HEC\HEC-RAS\7.1\Ras.exe")
+
+    monkeypatch.setattr(
+        RasUtils,
+        "discover_ras_versions",
+        staticmethod(lambda: {"7.1": fake_71}),
+    )
+
+    assert get_ras_exe("7.1") == str(fake_71)
+    assert get_ras_exe("7.1.0") == str(fake_71)
+    assert get_ras_exe("7.10") == str(fake_71)
+    assert get_ras_exe("71") == str(fake_71)
+
+
 def test_discover_ras_versions_scans_standard_66_folder(monkeypatch):
     monkeypatch.setitem(sys.modules, "winreg", None)
     fake_exe = Path(r"C:\Program Files (x86)\HEC\HEC-RAS\6.6\Ras.exe")
@@ -76,6 +117,32 @@ def test_discover_ras_versions_scans_standard_66_folder(monkeypatch):
 
     assert discovered["6.6"] == fake_exe
     assert "7.0" not in discovered
+
+
+@pytest.mark.parametrize("version", ["7.0.1", "7.1"])
+def test_discover_ras_versions_scans_future_and_current_7x_folders(
+    monkeypatch, version
+):
+    monkeypatch.setitem(sys.modules, "winreg", None)
+    fake_exe = Path(rf"C:\Program Files (x86)\HEC\HEC-RAS\{version}\Ras.exe")
+
+    def fake_exists(self):
+        normalized = str(self).replace("\\", "/")
+        return normalized in {
+            "C:/Program Files (x86)/HEC/HEC-RAS",
+            "C:/Program Files/HEC/HEC-RAS",
+        }
+
+    def fake_is_file(self):
+        return Path(self).as_posix() == fake_exe.as_posix()
+
+    monkeypatch.setattr(Path, "exists", fake_exists)
+    monkeypatch.setattr(Path, "is_file", fake_is_file)
+    monkeypatch.setattr(Path, "glob", lambda self, pattern: [])
+
+    discovered = RasUtils.discover_ras_versions()
+
+    assert discovered[version] == fake_exe
 
 
 def test_discover_ras_versions_normalizes_compact_66_folder(monkeypatch):
@@ -123,10 +190,10 @@ def test_normalize_ras_number_accepts_prefixed_strings_and_filenames():
     assert RasUtils.normalize_ras_number("Model.u12") == "12"
 
 
-def test_clear_geompre_files_uses_geometry_number_from_plan_df(tmp_path):
+def test_clear_geompre_files_uses_geometry_number_from_plan_file(tmp_path):
     project = _FakeRasProject(tmp_path)
     plan_path = tmp_path / "TestProject.p17"
-    plan_path.write_text("Plan Title=Legacy Test\n")
+    plan_path.write_text("Plan Title=Legacy Test\nGeom File=g05\n")
 
     geom_preprocessor = tmp_path / "TestProject.c05"
     geom_preprocessor.write_text("preprocessor\n")

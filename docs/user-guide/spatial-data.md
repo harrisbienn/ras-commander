@@ -1,10 +1,105 @@
 # Working with Spatial Data and RASMapper
 
+For station profiles and hydrographs across many lines, use
+[2D profiles and reference workflows](2d-profile-and-reference-workflows.md).
+It distinguishes mapped postprocessing from solver-recorded reference output
+and explains how terrain, time selection, and the requested variable affect
+the extraction route.
+
 RAS Commander provides comprehensive tools for working with HEC-RAS spatial datasets, including terrain, land cover, infiltration layers, and automated map generation. This guide covers accessing RASMapper configuration data and modifying spatial parameters for model calibration.
 
 ## Overview
 
-When you initialize a RAS project, the library automatically parses the RASMapper file (`.rasmap`) and populates the `rasmap_df` DataFrame with paths to all spatial datasets. This provides programmatic access to terrain models, land cover layers, soil data, and more.
+When you initialize a RAS project, the library looks for the RASMapper file
+(`.rasmap`) and populates the single-row `rasmap_df` DataFrame. The row contains
+spatial paths when parsing succeeds and explicit provenance when the file is
+missing, malformed, or only partly readable.
+
+## Authoritative Extents for Raster Inputs
+
+Raster and acquisition workflows that accept an analysis/model extent use one
+shared validation contract. You can pass:
+
+- a non-empty, valid Shapely `Polygon`;
+- a `MultiPolygon` only when removing empty parts leaves exactly one polygon;
+- a GeoSeries or GeoDataFrame with exactly one effective polygonal part;
+- a legacy `(minx, miny, maxx, maxy)` tuple/list;
+- a bounds dict or object using `left/bottom/right/top`,
+  `xmin/ymin/xmax/ymax`, or `minx/miny/maxx/maxy`; or
+- `RasMapperLib.Extent`.
+
+True multipart geometry is ambiguous for lower-level raster/native APIs and
+fails closed. Empty, invalid, `Point`, `LineString`, `GeometryCollection`, and
+other non-polygon geometries also raise `ValueError`; ras-commander does not
+silently repair or replace the authoritative geometry.
+
+`buffer_distance` defaults to `0.0`, preserving existing raster bounds. The
+buffer is applied before bounds are derived and uses the units of the supplied
+geometry:
+
+- `RasMap.add_landcover_layer()` and `RasMap.add_soils_layer()` expect the
+  geometry and buffer in the project CRS.
+- `Usgs3depAws` acquisition methods and `PrecipAorc` methods expect WGS84, so
+  their buffer distance is in decimal degrees. The exception is
+  `Usgs3depAws.build_terrain_raster()`, which takes the model geometry or an
+  AOI in the caller-supplied project CRS and an absolute buffer distance
+  (default 100 US survey feet).
+
+No CRS transformation is inferred from a Shapely geometry. Reproject a
+GeoSeries/GeoDataFrame to the workflow's documented CRS before passing it.
+Legacy bounds inputs remain supported.
+
+```python
+from ras_commander import RasMap
+
+# basin_polygon is already in the HEC-RAS project CRS.
+landcover_hdf = RasMap.add_landcover_layer(
+    ras_project_path=project_path,
+    source_path=landcover_source,
+    classification_table=classification_table,
+    cell_size=30.0,
+    restrict_to_extent=basin_polygon,
+    buffer_distance=300.0,
+)
+
+soils_hdf = RasMap.add_soils_layer(
+    ras_project_path=project_path,
+    gssurgo_path=gssurgo_path,
+    cell_size=30.0,
+    restrict_to_extent=basin_polygon,
+    buffer_distance=300.0,
+)
+```
+
+### Extent API Audit
+
+| Workflow | Extent behavior |
+|----------|-----------------|
+| `RasMap.add_landcover_layer()` | Normalizes polygon or legacy bounds, applies a project-CRS buffer, then derives raster bounds. |
+| `RasMap.add_soils_layer()` | Uses the same normalization and buffer contract as land cover. |
+| `Usgs3depAws.query_tiles_api()`, `find_tiles_for_bbox()`, `list_projects_for_bbox()`, `download_tiles()`, `select_projects_for_coverage()` | Use the shared contract for WGS84 terrain acquisition; polygon intersection is preserved where the tile workflow supports it. `download_tiles(project_selection="coverage")` covers the normalized extent with the newest project available per sub-area instead of the single newest project. |
+| `Usgs3depAws.build_terrain_raster()` | Builds the AOI in the project CRS from the model footprint unioned with the full cross-section cut lines, applies an absolute buffer, and requires zero nodata pixels inside that buffered polygon in the single output raster. The default cell size is the smallest integer multiple of the dominant source resolution that is at least 5 project units. |
+| `Usgs3depAws.plan_terrain_tiles()`, `prefetch_terrain_tiles()` | `plan_terrain_tiles()` computes the same project-CRS AOI as `build_terrain_raster()` and records it as WKT in the plan; `build_terrain_raster(tile_plan=...)` reuses that AOI instead of recomputing it, so offline builds need neither geometry parsing nor network access. |
+| `PrecipAorc.download()`, `check_availability()`, `get_storm_catalog()`, `create_storm_plans()` | Normalize a WGS84 polygon/legacy extent and optional degree buffer before precipitation subsetting. |
+| `RasMap.add_infiltration_layer()` | Registration/combination only. Its raster extent comes from the prepared land-cover and soils inputs, so no artificial extent parameter is added. |
+| `RasMap.add_terrain_layer()` | Registration only for an existing terrain HDF; terrain acquisition owns the analysis extent. |
+| `RasUnsteady.set_gridded_precipitation()` and `configure_gridded_dss_precipitation()` | Registration only for an existing NetCDF/DSS input; precipitation preparation owns the analysis extent. |
+
+### Downstream Spring Creek Validation
+
+Before treating the Commander change as consumable downstream:
+
+1. Update the reviewed ras-commander pin or capability evidence to a release or
+   commit containing this extent contract.
+2. Run the fresh Spring Creek HEC-RAS 6.6 workflow with the authoritative basin
+   polygon passed unchanged to land-cover and soils preparation.
+3. Confirm the derived raster bounds include the explicit purpose-specific
+   buffer and that legacy bounds calls still produce their prior extents.
+4. Rebuild/associate infiltration inputs and prove the final Manning's n and
+   curve-number arrays are populated, aligned to the 2D mesh, and solver-ready.
+
+Do not unblock the downstream adoption solely from source changes; use a
+released or otherwise reviewed, consumable ras-commander revision.
 
 ## Understanding rasmap_df
 
@@ -34,8 +129,15 @@ The `rasmap_df` typically contains paths to:
 ### Accessing Specific Data Paths
 
 ```python
-# rasmap_df is a compact project summary. Several columns contain lists.
+# rasmap_df is always one row. Check provenance before reading path values.
 summary = ras.rasmap_df.iloc[0]
+
+if summary["rasmap_status"] == "failed":
+    raise RuntimeError(summary["rasmap_error"])
+if summary["rasmap_status"] == "absent":
+    raise FileNotFoundError(summary["rasmap_path"])
+if summary["rasmap_field_errors"]:
+    print("Some fields could not be extracted:", summary["rasmap_field_errors"])
 
 terrain_paths = summary["terrain_hdf_path"]
 landcover_paths = summary["landcover_hdf_path"]
@@ -96,6 +198,35 @@ print(landcover_layers[[
 
 HEC-RAS stores layer availability in the `.rasmap` file, but compiled geometry and plan/result HDF files also carry `/Geometry` attributes that record which terrain, land-cover, infiltration, and sediment bed-material layers are associated with a geometry.
 
+### Project-Wide Inventory and Validation
+
+Inspect the live compiled-HDF state across every geometry rather than copying
+association columns into `geom_df` or `plan_df`, where they could become stale:
+
+```python
+from ras_commander import RasMap
+
+inventory = RasMap.list_geometry_associations(ras_object=ras)
+print(inventory[[
+    "geom_number",
+    "plan_numbers",
+    "terrain_hdf_path",
+    "landcover_hdf_path",
+    "landcover_path_exists",
+]])
+
+preflight = RasMap.validate_geometry_associations(
+    geom_number="04",
+    required_layers=("terrain", "landcover"),
+    require_existing_paths=True,
+    ras_object=ras,
+)
+```
+
+The validator reads each `.g##.hdf` directly. A land-cover layer visible in
+`.rasmap` does not satisfy the gate unless the geometry HDF contains a valid
+`Land Cover Filename` association.
+
 Use `RasMap.get_hdf_geometry_association()` for read-only QA/QC:
 
 ```python
@@ -128,7 +259,9 @@ Common returned keys include:
 
 ### Writing Geometry Associations
 
-Use `RasMap.associate_geometry_layers()` to write HEC-style `/Geometry` association attributes to an existing compiled geometry HDF.
+Use `RasMap.set_geometry_association()` when the exact association paths are
+known. Omitted layer arguments preserve their existing associations and that
+preservation is verified after the native HEC-RAS call.
 
 ```python
 from pathlib import Path
@@ -139,8 +272,7 @@ geometry_hdf = project_path / "MyModel.g01.hdf"
 terrain_hdf = project_path / "Terrain" / "ExistingTerrain.hdf"
 landcover_hdf = project_path / "Land Classification" / "LandCover.hdf"
 
-RasMap.associate_geometry_layers(
-    project_path,
+RasMap.set_geometry_association(
     geometry_hdf,
     terrain_hdf_path=terrain_hdf,
     landcover_hdf_path=landcover_hdf,
@@ -152,10 +284,15 @@ print(updated["landcover_hdf_path"])
 ```
 
 !!! warning "Existing compiled geometry HDF required"
-    `RasMap.associate_geometry_layers()` updates attributes on an existing `.g##.hdf`. It does not compile a plain-text `.g##` file into HDF and does not create missing geometry datasets. Treat true `.g##` to `.g##.hdf` generation as HEC-RAS/Ras.exe behavior unless a native endpoint is explicitly available.
+    Association setters update an existing `.g##.hdf`. They do not compile a plain-text `.g##` file into HDF and do not create missing geometry datasets. Treat true `.g##` to `.g##.hdf` generation as HEC-RAS/Ras.exe behavior unless a native endpoint is explicitly available.
 
-!!! tip "Layer name resolution"
-    When possible, ras-commander resolves `Terrain Layername`, `Land Cover Layername`, and `Infiltration Layername` from the `.rasmap` catalog. If the layer cannot be found in `.rasmap`, it falls back to the file stem.
+`RasMap.associate_geometry_layers()` remains a project-path convenience
+wrapper. Pass exact paths in new workflows. If more than one registered layer
+matches an omitted classification argument, implicit selection warns because
+the first registered layer is not a reliable hydraulic choice.
+
+!!! warning "Successful property tables are not proof of Manning propagation"
+    HEC-RAS may complete property tables and a plan computation with no land-cover association, emit no useful runtime message, and populate `Cells Center Manning's n` with the 2D area's scalar default. Inspect the temporary plan HDF before compute and the final plan HDF afterward. Manual review in RAS Mapper remains advisable.
 
 ### Native RasProcess Reference Validator
 
@@ -561,7 +698,10 @@ HEC-RAS can generate stored maps (raster outputs like depth and water surface el
 
 ### Headless Generation with RasProcess (Recommended)
 
-The `RasProcess` class uses the undocumented RasProcess.exe CLI tool bundled with HEC-RAS to generate stored maps without opening the GUI. This is faster and more reliable for batch processing.
+The canonical `RasMap.store_all_maps()` facade and its `RasProcess` engine use
+ras-commander's packaged RAS Mapper helper and the mapping libraries installed
+with HEC-RAS. They generate stored maps without opening the GUI and support the
+same aggregate path on Windows and Wine.
 
 ```python
 from ras_commander import RasCmdr, RasProcess
@@ -610,6 +750,84 @@ results = RasProcess.store_maps(plan_number="01", profile="Min")
 timestamps = RasProcess.get_plan_timestamps("01")
 results = RasProcess.store_maps(plan_number="01", profile=timestamps[10])
 ```
+
+For several unsteady output times, use the timestamp-aware wrapper. Froude and
+bed-shear-stress maps follow the same routing as the core map types:
+
+```python
+selected = [timestamps[len(timestamps) // 2], timestamps[-1]]
+results_by_time = RasProcess.store_maps_at_timesteps(
+    plan_number="01",
+    timesteps=selected,
+    wse=False,
+    depth=False,
+    velocity=False,
+    froude=True,
+    shear_stress=True,
+)
+```
+
+The plan must contain the results needed by RAS Mapper. Configure detailed
+outputs such as `Cell Velocity` and `Face Shear Stress` with
+`RasPlan.set_hdf_output_variables()`, compute the plan, and confirm the final
+plan HDF before exporting. The fully executed
+[Froude and shear-stress timestep example](https://github.com/gpt-cmdr/ras-commander/blob/main/examples/963_froude_shear_timestep_maps.ipynb)
+demonstrates configuration, computation, HDF inspection, georeferencing checks,
+and visual review on the Muncie RasExamples project.
+
+!!! warning "Manual hydraulic review remains necessary"
+    Stored-map generation proves that RAS Mapper could produce a raster; it
+    does not establish hydraulic reasonableness. Review computation messages,
+    units, wet/dry fronts, structures, localized extreme Froude values, mesh
+    transitions, and the native results before accepting the maps.
+
+#### All Steady Profiles in One Launch
+
+For a steady plan, use the canonical `steady_profiles` mode. It resolves names
+and zero-based indexes from the result HDF, writes every selected layer to the
+temporary `.rasmap` in one transaction, and launches aggregate `StoreAllMaps`
+once for the plan. `map_types` accepts `wse`, `depth`, `velocity`, `froude`,
+`shear_stress`, `depth_x_velocity`, `depth_x_velocity_sq`, and `flow`.
+
+```python
+from ras_commander import RasMap
+
+summary = RasMap.store_all_maps(
+    "01",
+    mode="steady_profiles",
+    profiles=None,                 # every HDF profile, in HDF order
+    map_types=("depth",),
+    inundation_boundary=True,      # one polygon for the final selected profile
+    output_path="steady_maps",
+)
+```
+
+`map_types` is exact: `map_types=("depth",)` generates Depth rasters only.
+Pass `inundation_boundary=True` (or list `"inundation_boundary"` in
+`map_types`) to add the boundary polygon; `inundation_boundary=False` omits it.
+With neither `map_types` nor any product flag, steady mode keeps its historic
+default of Depth plus one boundary polygon.
+
+The final selected profile is not assumed to be hydraulically highest for an
+arbitrary model. ras2fim constructs ascending discharge ladders, so its final
+profile is the highest ladder step. Exact names and zero-based indexes can be
+mixed when a subset or custom order is needed.
+
+The lower-level
+`RasProcess.store_maps_at_steady_profiles()` returns one DataFrame row per
+logical profile/product. It records the VRT or SHP primary path, all TIFF tiles
+or shapefile sidecars, and performance metadata including configuration time,
+helper time, helper launch count, and generated file count. The original
+`.rasmap` is restored after success or failure.
+
+Each row has a `status` of `generated` or `missing`. If StoreAllMaps omits a
+requested product, every generated product is still moved to `output_path`
+and kept, and `StoredMapProductsIncompleteError` (a `RuntimeError`) is raised
+with the per-product frame in `error.frame`; pass `raise_on_missing=False` to
+receive the frame instead. `RasMap.store_all_maps` reports such a plan with
+`success=False` plus the preserved `files`, `stored_maps`, and `missing`.
+RASMapper names boundary polygons with the specified depth appended, for
+example `Inundation Boundary (flow_075 Value_0).shp`.
 
 #### Batch Processing All Plans
 
@@ -729,6 +947,29 @@ MyRasModel/
     └── Velocity (Max).tif
 ```
 
+### Projects on Network Shares
+
+Stored maps work for projects reached over a network filesystem (an SMB/UNC
+share on Windows, an NFS mount inside a container, or a Wine drive backed by
+one). The project, terrain, and output paths are used exactly as given.
+
+The mapping helper itself is never executed from a network location. .NET
+Framework refuses to load the HEC-RAS mapping runtime for an assembly that runs
+from a remote path:
+
+```
+ERROR loading RasMapperLib: Could not load file or assembly
+'file:///C:\Program Files (x86)\HEC\HEC-RAS\6.6\RasMapperLib.dll' or one of
+its dependencies. Operation is not supported. (Exception from HRESULT: 0x80131515)
+```
+
+ras-commander copies `RasStoreMapHelper.exe` to local storage before launching
+it whenever the packaged or staged helper is on a network filesystem, and ships
+`RasStoreMapHelper.exe.config` (which enables `loadFromRemoteSources`) beside
+every copy as a second line of defense. Set
+`RAS_COMMANDER_MAP_HELPER_STAGE_DIR` to choose the staging directory; a remote
+value is skipped in favor of a local one.
+
 ## Raster BenefitArea
 
 `RasProcess.store_maps()` can treat a pre/post plan pair as a custom BenefitArea
@@ -781,8 +1022,8 @@ Set `include_wse=True` in `BenefitAreaConfig` (or pass `wse=True` to
 `store_maps()`) to retain pre/post WSE maps. Set `minimum_region_pixels=None` to
 skip the four-connected component filter. `polygon_output=True` creates exact
 raster-edge polygons; an explicit `.gpkg`, `.shp`, `.geojson`, `.parquet`, or
-`.geoparquet` path is also accepted. Install
-`ras-commander[geoparquet]` before requesting either GeoParquet suffix.
+`.geoparquet` path is also accepted. The required core `pyarrow` dependency
+supports both GeoParquet suffixes.
 
 This raster workflow is distinct from `HdfBenefitAreas`, which reads maximum
 WSE at 2D mesh cells and returns benefit/rise GeoDataFrames rather than a
@@ -877,13 +1118,13 @@ Calibrating Manning's n roughness coefficients is a common modeling task. RAS Co
 ### Reading Current Manning's n Values
 
 ```python
-from ras_commander import RasGeo, RasPlan
+from ras_commander import GeomLandCover, GeomPreprocessor, RasCmdr, RasPlan
 
 # Get geometry file path for the plan
 geom_path = RasPlan.get_geom_path("01")
 
 # Extract current Manning's n values
-mannings_df = RasGeo.get_mannings_baseoverrides(geom_path)
+mannings_df = GeomLandCover.get_base_mannings_n(geom_path)
 print(mannings_df)
 ```
 
@@ -906,7 +1147,7 @@ mannings_df.loc[
 ] = 0.15
 
 # Write modified values back to geometry file
-RasGeo.set_mannings_baseoverrides(geom_path, mannings_df)
+GeomLandCover.set_base_mannings_n(geom_path, mannings_df)
 ```
 
 ### Clearing Geometry Preprocessor Files
@@ -916,7 +1157,7 @@ RasGeo.set_mannings_baseoverrides(geom_path, mannings_df)
 
 ```python
 # Clear preprocessed geometry files
-RasGeo.clear_geompre_files()
+GeomPreprocessor.clear_geompre_files()
 
 # Now re-run the simulation with updated Manning's n
 RasCmdr.compute_plan("01")
@@ -931,12 +1172,12 @@ calibration_factors = [0.8, 1.0, 1.2, 1.4]
 for factor in calibration_factors:
     # Modify Manning's n
     geom_path = RasPlan.get_geom_path("01")
-    mannings_df = RasGeo.get_mannings_baseoverrides(geom_path)
+    mannings_df = GeomLandCover.get_base_mannings_n(geom_path)
     mannings_df['Base Manning\'s n Value'] *= factor
-    RasGeo.set_mannings_baseoverrides(geom_path, mannings_df)
+    GeomLandCover.set_base_mannings_n(geom_path, mannings_df)
 
     # Clear preprocessor and run
-    RasGeo.clear_geompre_files()
+    GeomPreprocessor.clear_geompre_files()
     RasCmdr.compute_plan("01", dest_folder=f"run_n_factor_{factor}")
 
     # Extract and compare results
@@ -945,74 +1186,134 @@ for factor in calibration_factors:
 
 ## Infiltration Data Handling
 
-For 2D unsteady flow models with infiltration, RAS Commander provides the `HdfInfiltration` class to read and modify infiltration parameters stored in HDF files.
+For 2D unsteady flow models with infiltration, distinguish three attribution
+surfaces: the geometry-wide Base Overrides fallback, named geometry-region
+tables, and the separate infiltration sidecar. Geometry overrides take
+precedence. Ras Commander reads these artifacts with `h5py`, but delegates all
+authoring to the native RASMapper API.
 
-### Reading Infiltration Parameters
-
-```python
-from ras_commander import HdfInfiltration, ras
-
-# Get infiltration HDF path from rasmap_df
-infiltration_path = ras.rasmap_df['infiltration_hdf_path'][0][0]
-
-# Extract current infiltration parameters
-infil_df = HdfInfiltration.get_infiltration_baseoverrides(infiltration_path)
-print(infil_df)
-```
-
-The DataFrame typically contains columns like:
-
-- `Land Cover Class` - Land cover type
-- `Maximum Deficit` - Maximum infiltration deficit (in)
-- `Initial Deficit` - Initial infiltration deficit (in)
-- `Potential Percolation Rate` - Percolation rate (in/hr)
-- `Hydraulic Conductivity` - Soil hydraulic conductivity (in/hr)
-
-### Scaling Infiltration Parameters
+### Geometry Base Overrides
 
 ```python
-# Define scale factors for each parameter
+from ras_commander import HdfInfiltration, RasCurrency, ras
+
+geom_hdf = RasCurrency.get_geom_hdf_path("01", ras)
+infil_df = HdfInfiltration.get_infiltration_baseoverrides(geom_hdf)
+
+# Active values are scaled; the native -9999 "no override" sentinel is kept.
 scale_factors = {
-    'Maximum Deficit': 1.2,        # Increase by 20%
-    'Initial Deficit': 1.0,         # No change
-    'Potential Percolation Rate': 0.8  # Decrease by 20%
+    "Curve Number": 1.02,
+    "Minimum Infiltration Rate": 0.8,
 }
 
-# Apply scaling and get updated DataFrame
-updated_df = HdfInfiltration.scale_infiltration_data(
-    infiltration_path,
+updated_df = HdfInfiltration.scale_infiltration_base_overrides(
+    geom_hdf,
     infil_df,
-    scale_factors
+    scale_factors,
+    hecras_version="7.0",
 )
-
-# The scaled values are automatically written to the HDF file
 ```
+
+The Base Overrides table applies to all cells after classification; a copied
+region polygon does not constrain it. The geometry writer is qualified for
+HEC-RAS 6.x and 7.0.x and creates a durable pre-edit backup. If a geometry has
+no override regions, call `create_infiltration_override_regions()` first; it
+copies the existing native Manning-region polygons and lets RASMapper author
+the full schema.
+
+### Named Geometry-Region Overrides
+
+Use a region table for spatially bounded parameter values:
+
+```python
+regional_df = HdfInfiltration.set_infiltration_region_overrides(
+    geom_hdf,
+    infil_df,
+    region_name="Main Channel",
+    hecras_version="7.0",
+)
+```
+
+The setter uses HEC-RAS's public `GetParameterTable` /
+`SetParameterTable` surface and verifies that the geometry-wide Base Overrides,
+other region tables, names, and polygons remain unchanged. Regions containing
+holes fail closed because HEC-RAS 6.0–7.0.1 loses interior-ring topology in
+the native parameter-resampling conversion; use explicit non-overlapping,
+hole-free polygons instead.
+
+### Infiltration Sidecar
+
+The map and parameter readers accept an explicit sidecar path or resolve the
+first configured infiltration sidecar from an initialized project:
+
+```python
+raster_map = HdfInfiltration.get_infiltration_map(ras_object=ras)
+parameters = HdfInfiltration.get_infiltration_parameters(
+    mukey="100",
+    ras_object=ras,
+)
+```
+
+The implicit lookup checks `rasmap_status` and `rasmap_field_errors`. It raises
+`ValueError` with map/path context when the map is absent or failed, the target
+field could not be extracted, or no matching layer is configured. A valid
+sibling path remains usable after another declaration fails. Supplying the HDF
+path explicitly bypasses the project lookup.
+
+The four raster-statistics helpers use the same resolver but retain their
+legacy recovery contract: a lookup problem is logged and returned as an empty
+DataFrame. This applies to `get_soils_raster_stats()`,
+`get_soil_raster_stats()`, `get_infiltration_stats()`, and
+`get_landcover_raster_stats()`.
+
+Edit a sidecar explicitly when the geometry has no active Base Overrides:
+
+```python
+summary = ras.rasmap_df.iloc[0]
+if summary["rasmap_status"] not in {"parsed", "parsed_with_errors"}:
+    raise ValueError(
+        f"Cannot select infiltration sidecar: {summary['rasmap_status']} - "
+        f"{summary['rasmap_error']}"
+    )
+infiltration_paths = summary["infiltration_hdf_path"]
+if not infiltration_paths:
+    raise ValueError("No infiltration layer is configured in RASMapper")
+infiltration_path = infiltration_paths[0]
+sidecar_df = HdfInfiltration.get_infiltration_layer_data(infiltration_path)
+
+updated_sidecar = HdfInfiltration.scale_infiltration_sidecar_parameters(
+    infiltration_path,
+    sidecar_df,
+    {"Curve Number": 1.02},
+    geometry_hdf_path=geom_hdf,
+    hecras_version="7.0",
+)
+```
+
+`scale_infiltration_data()` is intentionally fail-closed because its
+historical argument did not distinguish these two HDF types. Use one of the
+explicit methods above.
 
 ### Infiltration Calibration Workflow
 
 ```python
-from ras_commander import HdfInfiltration, RasGeo, RasCmdr
-
-# 1. Get infiltration data path
-infiltration_path = ras.rasmap_df['infiltration_hdf_path'][0][0]
-infil_df = HdfInfiltration.get_infiltration_baseoverrides(infiltration_path)
-
-# 2. Modify infiltration parameters
-scale_factors = {
-    'Maximum Deficit': 1.3,
-    'Initial Deficit': 1.1,
-    'Potential Percolation Rate': 0.9
-}
-updated_df = HdfInfiltration.scale_infiltration_data(
-    infiltration_path,
-    infil_df,
-    scale_factors
+from ras_commander import (
+    GeomPreprocessor, HdfInfiltration, RasCmdr, RasCurrency, RasPlan, ras
 )
 
-# 3. Clear geometry preprocessor
-RasGeo.clear_geompre_files()
+geom_hdf = RasCurrency.get_geom_hdf_path("01", ras)
+infil_df = HdfInfiltration.get_infiltration_baseoverrides(geom_hdf)
 
-# 4. Re-run simulation
+updated_df = HdfInfiltration.scale_infiltration_base_overrides(
+    geom_hdf,
+    infil_df,
+    {"Curve Number": 1.03},
+    hecras_version="7.0",
+)
+
+# Delete only the .c## cache; never selectively delete geometry-HDF datasets.
+GeomPreprocessor.clear_geompre_files(RasPlan.get_plan_path("01"))
+
 RasCmdr.compute_plan("01", dest_folder="calibration_infil_run1")
 ```
 
@@ -1035,8 +1336,8 @@ This example demonstrates a complete workflow combining terrain, Manning's n, an
 
 ```python
 from ras_commander import (
-    init_ras_project, ras, RasMap, RasGeo, RasPlan,
-    RasCmdr, HdfInfiltration
+    GeomLandCover, GeomPreprocessor, HdfInfiltration, RasCmdr,
+    RasCurrency, RasMap, RasPlan, init_ras_project, ras
 )
 
 # 1. Initialize project
@@ -1048,7 +1349,7 @@ print("Rasmap data:\n", ras.rasmap_df)
 
 # 3. Calibration: Adjust Manning's n
 geom_path = RasPlan.get_geom_path("01")
-mannings_df = RasGeo.get_mannings_baseoverrides(geom_path)
+mannings_df = GeomLandCover.get_base_mannings_n(geom_path)
 
 # Increase forest roughness
 mannings_df.loc[
@@ -1056,20 +1357,25 @@ mannings_df.loc[
     'Base Manning\'s n Value'
 ] = 0.18
 
-RasGeo.set_mannings_baseoverrides(geom_path, mannings_df)
+GeomLandCover.set_base_mannings_n(geom_path, mannings_df)
 
 # 4. Calibration: Adjust infiltration
-infiltration_path = ras.rasmap_df['infiltration_hdf_path'][0][0]
-infil_df = HdfInfiltration.get_infiltration_baseoverrides(infiltration_path)
+geom_hdf = RasCurrency.get_geom_hdf_path("01", ras)
+infil_df = HdfInfiltration.get_infiltration_baseoverrides(geom_hdf)
 
 scale_factors = {
-    'Maximum Deficit': 1.25,
-    'Potential Percolation Rate': 0.85
+    'Curve Number': 1.02,
+    'Minimum Infiltration Rate': 0.85,
 }
-HdfInfiltration.scale_infiltration_data(infiltration_path, infil_df, scale_factors)
+HdfInfiltration.scale_infiltration_base_overrides(
+    geom_hdf,
+    infil_df,
+    scale_factors,
+    hecras_version="7.0",
+)
 
 # 5. Clear preprocessor and run
-RasGeo.clear_geompre_files()
+GeomPreprocessor.clear_geompre_files(RasPlan.get_plan_path("01"))
 RasCmdr.compute_plan("01", dest_folder="calibrated_run")
 
 # 6. Generate result maps
@@ -1089,7 +1395,7 @@ print("Calibration run complete with updated spatial parameters!")
 !!! warning "Critical for Geometry Changes"
     Whenever you modify geometry-related data (Manning's n, cross sections, structures, etc.), always call:
     ```python
-    RasGeo.clear_geompre_files()
+    GeomPreprocessor.clear_geompre_files()
     ```
     This ensures HEC-RAS rebuilds the geometry from your modified files rather than using cached preprocessed data.
 
@@ -1106,7 +1412,7 @@ When calibrating models:
 
 ```python
 # Good practice: Verify changes before running expensive simulations
-mannings_df = RasGeo.get_mannings_baseoverrides(geom_path)
+mannings_df = GeomLandCover.get_base_mannings_n(geom_path)
 print("Manning's n summary:")
 print(mannings_df['Base Manning\'s n Value'].describe())
 
@@ -1140,7 +1446,7 @@ If `postprocess_stored_maps()` fails:
 
 If Manning's n modifications don't affect results:
 
-1. **Most common:** Forgot to call `RasGeo.clear_geompre_files()`
+1. **Most common:** Forgot to call `GeomPreprocessor.clear_geompre_files()`
 2. Check that you're modifying the correct geometry file
 3. Verify the plan references the geometry file you modified
 4. Ensure no errors in `set_mannings_baseoverrides()`
@@ -1149,7 +1455,7 @@ If Manning's n modifications don't affect results:
 
 If infiltration modifications don't affect results:
 
-1. Call `RasGeo.clear_geompre_files()` after infiltration changes
+1. Call `GeomPreprocessor.clear_geompre_files()` after infiltration changes
 2. Verify the infiltration HDF path is correct
 3. Check that your plan uses infiltration (2D unsteady flow)
 4. Ensure infiltration is enabled in the unsteady flow file

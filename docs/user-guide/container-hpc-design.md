@@ -1,0 +1,119 @@
+# Container implementation comparison and TACC design
+
+The implementation comparison was checked September 11, 2026. This page
+retains the proposed TACC/PyLauncher integration, with implementation status
+updated October 13, 2026. [RasApptainer](slurm-apptainer-execution.md)
+implements one native unsteady plan per Slurm allocation and an optional Wine
+prepare job; [RasSlurm](slurm-portable-execution.md) implements portable
+request pools and job arrays. Their contracts differ from the proposed
+worker integration below.
+
+The [Docker image pairs](container-images.md) have Docker qualification. CLB
+has run both Slurm APIs live with site-built SIFs (see
+[execution backends](execution-backends.md#image-compatibility-and-qualification));
+the published native 6.6 SIF and an executor built from this repository were
+run live through both APIs on October 13, 2026. None of these images has been
+qualified on TACC.
+
+## Useful patterns from public implementations
+
+| Implementation | Implemented behavior inspected | Application to this workflow |
+|---|---|---|
+| [Andy Carter's ras2fim command generator](https://github.com/andycarter-pe/ras2fim-2d/blob/main/src/create_hec_ras_scripts_for_linux_02c.py) | Bounded Windows Docker jobs; single-node Slurm/Apptainer shell pool; per-job logs; configurable threads per run. | Keep scheduling outside containers and preserve individual model folders. Add matched solver settings and resource allocation. |
+| [FEMA FFRD ras-runner](https://github.com/fema-ffrd/ras-runner/blob/main/actions/run/unsteady-simulation-action.go) | Action-based input/output transfer and an HDF completion check after native execution. | Retain explicit input/output contracts and verified results. Cloud object-store transfer can remain a separate adapter. |
+| [slawler/ras-docker](https://github.com/slawler/ras-docker/blob/main/ras-runner/main.go) | One S3 model payload per run, output upload, live solver output and progress parsing. | Expose live output and callbacks without adding a scheduler inside the image. |
+| [dhardestylewis/hec_ras_docker](https://github.com/dhardestylewis/hec_ras_docker/blob/main/README.md#singularity) | Native runtime image and documented TACC Singularity pull/exec examples. | Use the same distributed image under an HPC container runtime; qualify mounts and writable paths. |
+| [neeraip/hecras-v66-linux](https://github.com/neeraip/hecras-v66-linux/blob/main/run_simulation.sh) | ZIP staging and native geometry/unsteady commands. | Isolated staging is useful; do not copy shell failure handling or assume its hand-built preprocessing tables replace vendor preprocessing. |
+
+These are observed source features, not independent successful builds or
+hydraulic qualifications of those projects. Public availability also does not
+establish permission to copy code; implementation here uses our own API and
+does not vendor their source.
+
+## Two cores per model, controlled outside the image
+
+The default is two cores per container, configurable from one through eight.
+On Docker, [RasDocker](https://github.com/gpt-cmdr/ras-commander/blob/main/ras_commander/RasDocker.py)
+sets `--cpus=N`; the native worker passes `num_cores=N` to
+[RasCmdr.compute_plan_linux()](https://github.com/gpt-cmdr/ras-commander/blob/main/ras_commander/RasCmdr.py).
+The Wine worker applies the same count through
+[RasPlan.set_num_cores() and RasPlan.set_2d_flow_options()](https://github.com/gpt-cmdr/ras-commander/blob/main/ras_commander/RasPlan.py)
+before preprocessing. Both stage receipts record the effective count.
+Docker's quota and the solver's thread count serve different purposes and
+should agree. The quota alone does not prevent the solver from creating many
+threads, and a thread setting alone is not a container resource limit.
+[Docker resource documentation](https://docs.docker.com/engine/containers/resource_constraints/#cpu)
+explains quota versus CPU affinity.
+
+## Proposed TACC execution
+
+TACC documents Apptainer for HPC containers and PyLauncher for dispatching
+independent commands within a Slurm allocation. Apptainer can convert a
+Docker Hub image into a SIF file. Pull that file once before a campaign,
+then reuse it instead of contacting Docker Hub for every model.
+[TACC container guide](https://containers-at-tacc.readthedocs.io/en/latest/singularity/02.singularity_batch.html),
+[Apptainer OCI support](https://apptainer.org/docs/user/latest/docker_and_oci.html).
+
+```mermaid
+flowchart TD
+    P["Prepare complete models with RasDocker.preprocess_plan()"] --> I["Prepared project folders and receipts"]
+    S["Slurm allocation"] --> L["PyLauncher: two assigned cores per command"]
+    I --> L
+    L --> A["One Apptainer instance per selected model/plan"]
+    A --> R["Native worker: RasCmdr.compute_plan_linux(num_cores=2)"]
+    R --> O["Validated final HDF, logs and receipt on host storage"]
+```
+
+The host `RasDocker` class constructs Docker commands. The proposed TACC
+worker adapter would invoke the same native Python worker and preserve its
+request, receipt, and validation behavior. That adapter is distinct from the
+implemented `RasApptainer` API, which stages solver-ready artifacts and invokes
+the native engine, and `RasSlurm`, which uses the portable Python executor.
+No Docker daemon or MPI pool is needed inside the solver container.
+
+Configure PyLauncher with `cores=2` per command and verify CPU binding on
+the target system. Its documentation says that Slurm `-n` and
+`--tasks-per-node` do not set its task capacity; it queries allocated node
+cores. Do not assume those options alone prevent oversubscription. Reserve
+more capacity or reduce simultaneous jobs when memory and scratch use are
+the limiting factors. [TACC PyLauncher guide](https://docs.tacc.utexas.edu/software/pylauncher/).
+
+Apptainer runs as the submitting user and can inherit scheduler cgroup
+limits. The target site's allocation and binding policy must enforce the
+resource boundary; `num_cores` configures the solver inside that boundary.
+[Apptainer resource limits](https://apptainer.org/docs/user/latest/cgroups.html).
+
+Each model needs a separate writable `/job` bind and private scratch outside
+that model directory. Keep terrain and other shared dependencies read-only.
+Stage active jobs on the system's scratch storage and collect outputs before
+node-local temporary storage is cleared. [TACC I/O guidance](https://docs.tacc.utexas.edu/tutorials/managingio/).
+
+The current images contain x86-64 vendor binaries. The target must provide
+compatible x86 nodes; Vista's ARM nodes cannot run those binaries natively.
+[TACC Vista architecture](https://docs.tacc.utexas.edu/hpc/vista/).
+Choose the exact system, partition and allocation settings with Andy before
+writing a production Slurm example.
+
+## Required ras2fim handoff changes
+
+The existing [staging code](https://github.com/gpt-cmdr/ras2fim-2d/blob/codex/phase2-linux-wine-preprocessing/src/stage_hecras_for_linux_wine_02b.py)
+copies only the temporary plan HDF, boundary file and geometry input. The
+new native worker requires the complete prepared project plus its preparation
+receipt. Preserve the `.ras-commander` receipt tree when transferring it.
+
+The existing [result collector](https://github.com/andycarter-pe/ras2fim-2d/blob/main/src/ras2fim-2d.py)
+collects a modified `.p01.tmp.hdf` and renames it. Our native worker preserves
+that prepared input and publishes a separate `.p01.hdf`. Collection must
+select the final HDF named by a successful compute receipt. Merely changing
+the Docker image would leave the collector reading uncomputed input.
+
+Qualify native Apptainer execution first using a prepared model. Wine
+preparation can then move to the cluster with
+`RasApptainer.render_prepare_job`, which uses the
+[Wine executor image](apptainer-images.md#wine-executor-image): the SIF stays
+read-only, and each task copies the baked prefix into its own node-scratch
+`/tmp` under `apptainer exec --contain --cleanenv`. This replaces relying on
+the pre-compute image's default `/run/ras-job` directory, which an arbitrary
+host user cannot write under Apptainer. Wine needs a CPU-numbering shim when a
+Slurm CPU set does not start at CPU 0; see
+[the CPU shim](apptainer-images.md#cpu-numbering-shim).

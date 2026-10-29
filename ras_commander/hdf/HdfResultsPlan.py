@@ -26,8 +26,10 @@ Available Functions:
     Steady Flow:
         - is_steady_plan: Check if HDF contains steady state results
         - get_steady_profile_names: Extract steady state profile names
+        - get_steady_encroachment_stations: Read exact-profile station pairs
         - get_steady_wse: Extract WSE data for steady state profiles
         - get_steady_info: Extract steady flow attributes and metadata
+        - get_steady_results: Extract profile/XS hydraulics and channel length
 
     Computation Messages:
         - get_compute_messages: Extract computation messages from HDF (with .txt fallback)
@@ -40,14 +42,13 @@ from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
 import h5py
 import pandas as pd
-import xarray as xr
 from ..Decorators import standardize_input, log_call
 from .HdfUtils import HdfUtils
-from .HdfResultsXsec import HdfResultsXsec
 from ..LoggingConfig import get_logger
+from ..fast_hdf import read_attrs, read_typed, reraise_required
 import numpy as np
 from datetime import datetime
-from ..RasPrj import ras
+from ..fast_hdf import h5py_until_qualified
 
 logger = get_logger(__name__)
 
@@ -78,9 +79,12 @@ class HdfResultsPlan:
         """
         Get unsteady attributes from a HEC-RAS HDF plan file.
 
+        Note:
+            The input decorator accepts keyword-only ``ras_object`` for
+            project-number resolution; it is not in the underlying signature.
+
         Args:
             hdf_path (Path): Path to the HEC-RAS plan HDF file.
-            ras_object (RasPrj, optional): Specific RAS object to use. If None, uses the global ras instance.
 
         Returns:
             pd.DataFrame: A DataFrame containing the decoded unsteady attributes.
@@ -96,7 +100,7 @@ class HdfResultsPlan:
                 
                 # Create dictionary from attributes and decode byte strings
                 attrs_dict = {}
-                for key, value in dict(hdf_file["Results/Unsteady"].attrs).items():
+                for key, value in read_attrs(hdf_file["Results/Unsteady"]).items():
                     if isinstance(value, bytes):
                         attrs_dict[key] = value.decode('utf-8')
                     else:
@@ -111,6 +115,7 @@ class HdfResultsPlan:
                 f"See: https://rascommander.info/ras/user-guide/hdf-data-extraction/"
             )
         except Exception as e:
+            reraise_required(e)
             raise RuntimeError(f"Error reading unsteady attributes: {str(e)}")
         
     @staticmethod
@@ -120,9 +125,12 @@ class HdfResultsPlan:
         """
         Get results unsteady summary attributes from a HEC-RAS HDF plan file.
 
+        Note:
+            The input decorator accepts keyword-only ``ras_object`` for
+            project-number resolution; it is not in the underlying signature.
+
         Args:
             hdf_path (Path): Path to the HEC-RAS plan HDF file.
-            ras_object (RasPrj, optional): Specific RAS object to use. If None, uses the global ras instance.
 
         Returns:
             pd.DataFrame: A DataFrame containing the decoded results unsteady summary attributes.
@@ -138,7 +146,7 @@ class HdfResultsPlan:
                 
                 # Create dictionary from attributes and decode byte strings
                 attrs_dict = {}
-                for key, value in dict(hdf_file["Results/Unsteady/Summary"].attrs).items():
+                for key, value in read_attrs(hdf_file["Results/Unsteady/Summary"]).items():
                     if isinstance(value, bytes):
                         attrs_dict[key] = value.decode('utf-8')
                     else:
@@ -153,6 +161,7 @@ class HdfResultsPlan:
                 f"See: https://rascommander.info/ras/user-guide/hdf-data-extraction/"
             )
         except Exception as e:
+            reraise_required(e)
             raise RuntimeError(f"Error reading unsteady summary attributes: {str(e)}")
         
     @staticmethod
@@ -162,9 +171,12 @@ class HdfResultsPlan:
         """
         Get volume accounting attributes from a HEC-RAS HDF plan file.
 
+        Note:
+            The input decorator accepts keyword-only ``ras_object`` for
+            project-number resolution; it is not in the underlying signature.
+
         Args:
             hdf_path (Path): Path to the HEC-RAS plan HDF file.
-            ras_object (RasPrj, optional): Specific RAS object to use. If None, uses the global ras instance.
 
         Returns:
             Optional[pd.DataFrame]: DataFrame containing the decoded volume accounting attributes,
@@ -180,7 +192,7 @@ class HdfResultsPlan:
                 
                 # Get attributes and decode byte strings
                 attrs_dict = {}
-                for key, value in dict(hdf_file["Results/Unsteady/Summary/Volume Accounting"].attrs).items():
+                for key, value in read_attrs(hdf_file["Results/Unsteady/Summary/Volume Accounting"]).items():
                     if isinstance(value, bytes):
                         attrs_dict[key] = value.decode('utf-8')
                     else:
@@ -194,6 +206,7 @@ class HdfResultsPlan:
                 f"See: https://rascommander.info/ras/user-guide/hdf-data-extraction/"
             )
         except Exception as e:
+            reraise_required(e)
             raise RuntimeError(f"Error reading volume accounting attributes: {str(e)}")
 
     @staticmethod
@@ -916,9 +929,12 @@ class HdfResultsPlan:
         """
         Extract detailed runtime and computational performance metrics from HDF file.
 
+        Note:
+            The input decorator accepts keyword-only ``ras_object`` for
+            project-number resolution; it is not in the underlying signature.
+
         Args:
             hdf_path (Path): Path to HEC-RAS plan HDF file
-            ras_object (RasPrj, optional): Specific RAS object to use. If None, uses the global ras instance.
 
         Returns:
             Optional[pd.DataFrame]: DataFrame containing runtime statistics or None if data cannot be extracted
@@ -927,11 +943,11 @@ class HdfResultsPlan:
             - Times are reported in multiple units (ms, s, hours)
             - Compute speeds are calculated as simulation-time/compute-time ratios
             - Process times include: geometry, preprocessing, event conditions, 
-              and unsteady flow computations
+                and unsteady flow computations
         """
         try:
             if hdf_path is None:
-                logger.error(f"Could not find HDF file for input")
+                logger.error("Could not find HDF file for input")
                 return None
 
             with h5py.File(hdf_path, 'r') as hdf_file:
@@ -946,9 +962,10 @@ class HdfResultsPlan:
                     return None
 
                 # Extract plan information
-                plan_name = HdfUtils.convert_ras_string(plan_info.attrs.get('Plan Name', 'Unknown'))
-                start_time_str = HdfUtils.convert_ras_string(plan_info.attrs.get('Simulation Start Time', 'Unknown'))
-                end_time_str = HdfUtils.convert_ras_string(plan_info.attrs.get('Simulation End Time', 'Unknown'))
+                plan_attrs = read_attrs(plan_info)
+                plan_name = HdfUtils.convert_ras_string(plan_attrs.get('Plan Name', 'Unknown'))
+                start_time_str = HdfUtils.convert_ras_string(plan_attrs.get('Simulation Start Time', 'Unknown'))
+                end_time_str = HdfUtils.convert_ras_string(plan_attrs.get('Simulation End Time', 'Unknown'))
 
                 try:
                     # Check if times are already datetime objects
@@ -982,9 +999,11 @@ class HdfResultsPlan:
                     return None
 
                 # Process compute times
-                process_names = [HdfUtils.convert_ras_string(name) for name in compute_processes['Process'][:]]
-                filenames = [HdfUtils.convert_ras_string(filename) for filename in compute_processes['Filename'][:]]
-                completion_times = compute_processes['Compute Time (ms)'][:]
+                # One typed read of the whole table (plan_metadata family), then fields.
+                compute_table = read_typed(compute_processes, slice(None))
+                process_names = [HdfUtils.convert_ras_string(name) for name in compute_table['Process']]
+                filenames = [HdfUtils.convert_ras_string(filename) for filename in compute_table['Filename']]
+                completion_times = compute_table['Compute Time (ms)']
 
                 compute_processes_df = pd.DataFrame({
                     'Process': process_names,
@@ -1037,6 +1056,7 @@ class HdfResultsPlan:
                 return pd.DataFrame(compute_processes_summary)
 
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error in get_runtime_data: {str(e)}")
             return None
 
@@ -1045,55 +1065,66 @@ class HdfResultsPlan:
     @standardize_input(file_type='plan_hdf')
     def get_reference_timeseries(hdf_path: Path, reftype: str) -> pd.DataFrame:
         """
-        Get reference line or point timeseries output from HDF file.
+        Get reference-line or reference-point time series as a tidy DataFrame.
+
+        Modern HEC-RAS HDF files store a ``Name`` vector plus shared
+        ``(time, feature)`` matrices such as Flow, Velocity, and Water Surface.
+        This compatibility method delegates schema handling to
+        :class:`HdfResultsXsec` and converts its native xarray Dataset to one
+        row per time/feature pair. It therefore supports all numeric variables
+        present in the HDF instead of assuming one dataset per feature.
 
         Args:
             hdf_path (Path): Path to HEC-RAS plan HDF file
             reftype (str): Type of reference data ('lines' or 'points')
-            ras_object (RasPrj, optional): Specific RAS object to use. If None, uses the global ras instance.
 
         Returns:
-            pd.DataFrame: DataFrame containing reference timeseries data
+            pd.DataFrame: Tidy frame containing time, reference ID/name, mesh
+                name, and every numeric native result variable. Returns an
+                empty frame when the requested reference output is absent or
+                an error is caught, including an invalid reftype. Inspect log
+                diagnostics; an empty result is not a zero-valued hydrograph.
         """
         try:
-            with h5py.File(hdf_path, 'r') as hdf_file:
-                base_path = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series"
-                ref_path = f"{base_path}/Reference {reftype.capitalize()}"
-                
-                if ref_path not in hdf_file:
-                    logger.debug(f"Reference {reftype} data not found in HDF file")
-                    return pd.DataFrame()
+            from .HdfResultsXsec import HdfResultsXsec
 
-                ref_group = hdf_file[ref_path]
-                time_data = hdf_file[f"{base_path}/Time"][:]
-                
-                dfs = []
-                for ref_name in ref_group.keys():
-                    ref_data = ref_group[ref_name][:]
-                    df = pd.DataFrame(ref_data, columns=[ref_name])
-                    df['Time'] = time_data
-                    dfs.append(df)
+            normalized = str(reftype).strip().lower()
+            if normalized == "lines":
+                dataset = HdfResultsXsec.get_ref_lines_timeseries(hdf_path)
+            elif normalized == "points":
+                dataset = HdfResultsXsec.get_ref_points_timeseries(hdf_path)
+            else:
+                raise ValueError("reftype must be 'lines' or 'points'")
 
-                if not dfs:
-                    return pd.DataFrame()
-
-                return pd.concat(dfs, axis=1)
+            if not dataset.data_vars:
+                logger.debug(
+                    "Reference %s data not found in %s",
+                    normalized,
+                    Path(hdf_path).name,
+                )
+                return pd.DataFrame()
+            return dataset.to_dataframe().reset_index()
 
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error reading reference {reftype} timeseries: {str(e)}")
             return pd.DataFrame()
 
     @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
+    @h5py_until_qualified
     def get_reference_summary(hdf_path: Path, reftype: str) -> pd.DataFrame:
         """
         Get reference line or point summary output from HDF file.
 
+        Note:
+            The input decorator accepts keyword-only ``ras_object`` for
+            project-number resolution; it is not in the underlying signature.
+
         Args:
             hdf_path (Path): Path to HEC-RAS plan HDF file
             reftype (str): Type of reference data ('lines' or 'points')
-            ras_object (RasPrj, optional): Specific RAS object to use. If None, uses the global ras instance.
 
         Returns:
             pd.DataFrame: DataFrame containing reference summary data
@@ -1111,7 +1142,7 @@ class HdfResultsPlan:
                 dfs = []
                 
                 for ref_name in ref_group.keys():
-                    ref_data = ref_group[ref_name][:]
+                    ref_data = read_typed(ref_group[ref_name], slice(None))
                     if ref_data.ndim == 2:
                         df = pd.DataFrame(ref_data.T, columns=['Value', 'Time'])
                     else:
@@ -1125,6 +1156,7 @@ class HdfResultsPlan:
                 return pd.concat(dfs, ignore_index=True)
 
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Error reading reference {reftype} summary: {str(e)}")
             return pd.DataFrame()
 
@@ -1137,9 +1169,12 @@ class HdfResultsPlan:
         """
         Check if HDF file contains steady state results.
 
+        Note:
+            The input decorator accepts keyword-only ``ras_object`` for
+            project-number resolution; it is not in the underlying signature.
+
         Args:
             hdf_path (Path): Path to HEC-RAS plan HDF file
-            ras_object (RasPrj, optional): Specific RAS object to use. If None, uses the global ras instance.
 
         Returns:
             bool: True if the HDF contains steady state results, False otherwise
@@ -1162,9 +1197,12 @@ class HdfResultsPlan:
         """
         Extract profile names from steady state results.
 
+        Note:
+            The input decorator accepts keyword-only ``ras_object`` for
+            project-number resolution; it is not in the underlying signature.
+
         Args:
             hdf_path (Path): Path to HEC-RAS plan HDF file
-            ras_object (RasPrj, optional): Specific RAS object to use. If None, uses the global ras instance.
 
         Returns:
             List[str]: List of profile names (e.g., ['50Pct', '10Pct', '1Pct'])
@@ -1195,7 +1233,7 @@ class HdfResultsPlan:
 
                 # Read profile names dataset
                 profile_names_ds = hdf_file[profile_names_path]
-                profile_names_raw = profile_names_ds[()]
+                profile_names_raw = read_typed(profile_names_ds)
 
                 # Decode byte strings to regular strings
                 profile_names = []
@@ -1216,6 +1254,7 @@ class HdfResultsPlan:
         except KeyError as e:
             raise KeyError(f"Error accessing steady state profile names: {str(e)}")
         except Exception as e:
+            reraise_required(e)
             raise RuntimeError(f"Error reading steady state profile names: {str(e)}")
 
     @staticmethod
@@ -1237,7 +1276,7 @@ class HdfResultsPlan:
             if attribute_path not in hdf_file:
                 continue
 
-            attributes = hdf_file[attribute_path][()]
+            attributes = read_typed(hdf_file[attribute_path])
             field_names = attributes.dtype.names or ()
             field_lookup = {name.lower(): name for name in field_names}
             station_field = field_lookup.get("station") or field_lookup.get("rs")
@@ -1265,6 +1304,219 @@ class HdfResultsPlan:
         raise KeyError(f"Cross section attributes not found at: {paths}")
 
     @staticmethod
+    def _get_steady_channel_lengths(
+        hdf_file: h5py.File,
+        result_attributes: np.ndarray,
+        result_fields: Dict[str, str],
+    ) -> np.ndarray:
+        """Join geometry channel reach lengths to ordered result cross sections.
+
+        HEC-RAS stores the downstream channel reach length on geometry cross
+        sections, not in the steady output block. Result rows use ``Station``
+        while geometry rows use ``RS`` in the supported 6.x layouts, so the
+        join is performed on the complete river/reach/station identity.
+
+        Non-finite and HEC-RAS sentinel lengths are normalized to zero, matching
+        the value returned by established Controller-based ras2fim workflows.
+        """
+        geometry_path = "Geometry/Cross Sections/Attributes"
+        if geometry_path not in hdf_file:
+            return np.full(len(result_attributes), np.nan, dtype=float)
+
+        geometry_attributes = read_typed(hdf_file[geometry_path])
+        field_names = geometry_attributes.dtype.names or ()
+        field_lookup = {name.strip().lower(): name for name in field_names}
+        geometry_fields = {
+            "river": field_lookup.get("river"),
+            "reach": field_lookup.get("reach"),
+            "station": field_lookup.get("rs") or field_lookup.get("station"),
+            "length": (
+                field_lookup.get("len channel")
+                or field_lookup.get("length channel")
+                or field_lookup.get("channel length")
+            ),
+        }
+        missing = [name for name, field in geometry_fields.items() if field is None]
+        if missing:
+            logger.debug(
+                "Geometry cross-section attributes do not expose channel lengths; "
+                "missing fields: %s",
+                ", ".join(missing),
+            )
+            return np.full(len(result_attributes), np.nan, dtype=float)
+
+        def decode(value) -> str:
+            if isinstance(value, (bytes, np.bytes_)):
+                return value.decode("utf-8", errors="replace").rstrip("\x00").strip()
+            return str(value).rstrip("\x00").strip()
+
+        lengths_by_identity = {}
+        for item in geometry_attributes:
+            identity = tuple(
+                decode(item[geometry_fields[name]])
+                for name in ("river", "reach", "station")
+            )
+            if identity in lengths_by_identity:
+                raise ValueError(
+                    "Duplicate geometry cross-section identity while joining "
+                    f"channel lengths: {identity}"
+                )
+            value = float(item[geometry_fields["length"]])
+            if not np.isfinite(value) or abs(value) > 1e20:
+                value = 0.0
+            lengths_by_identity[identity] = value
+
+        ordered_lengths = []
+        for item in result_attributes:
+            identity = tuple(
+                decode(item[result_fields[name]])
+                for name in ("river", "reach", "station")
+            )
+            if identity not in lengths_by_identity:
+                raise ValueError(
+                    "Steady result cross section is absent from geometry "
+                    f"attributes: {identity}"
+                )
+            ordered_lengths.append(lengths_by_identity[identity])
+        return np.asarray(ordered_lengths, dtype=float)
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type='plan_hdf')
+    def get_steady_encroachment_stations(
+        hdf_path: Union[str, Path],
+        profile_name: str,
+    ) -> Optional[pd.DataFrame]:
+        """Read stored steady encroachment stations for an exact profile name.
+
+        Args:
+            hdf_path: Computed steady plan HDF path or project plan number.
+            profile_name: Exact, unique stored profile name.
+
+        Returns:
+            DataFrame with ``river``, ``reach``, ``station``, ``encr_sta_l``
+            and ``encr_sta_r``, preserving result-owned identities and stored
+            NaNs. Returns None when no station dataset exists; this means
+            unavailable evidence, not a successful floodway validation.
+            Station values retain the native model's length units.
+
+        Raises:
+            ValueError: Present data has missing paired arrays, malformed or
+                ambiguous axes/identities, non-real station dtypes, infinite
+                station values, or a missing/nonunique profile.
+
+        Notes:
+            Supports paired Additional Variables arrays and qualified legacy
+            combined layouts. Does not infer encroachment methods, hydraulic
+            acceptance, or stations for structures absent from these arrays.
+        """
+        base = 'Results/Steady/Output/Output Blocks/Base Output/Steady Profiles'
+        result_attrs = 'Results/Steady/Output/Geometry Info/Cross Section Attributes'
+        geometry_attrs = 'Geometry/Cross Sections/Attributes'
+
+        def decode(value):
+            return value.decode('utf-8').strip() if isinstance(value, bytes) else str(value).strip()
+
+        try:
+            with h5py.File(hdf_path, 'r') as hdf:
+                def read_dataset(path):
+                    dataset = hdf[path]
+                    if not isinstance(dataset, h5py.Dataset):
+                        raise ValueError(f'expected a dataset at {path}')
+                    return np.asarray(read_typed(dataset))
+
+                def validate_stations(values, path):
+                    if values.dtype.kind not in 'fiu':
+                        raise ValueError(f'stations must have real numeric dtype at {path}')
+                    if np.isinf(values).any():
+                        raise ValueError(f'infinite encroachment stations at {path}')
+
+                paired = f'{base}/Cross Sections/Additional Variables'
+                left_path = f'{paired}/Encroachment Station Left'
+                right_path = f'{paired}/Encroachment Station Right'
+                has_left, has_right = left_path in hdf, right_path in hdf
+                combined_path = next((path for path in (
+                    f'{base}/Cross Sections/Encroachment Stations',
+                    'Results/Steady/Output/Cross Sections/Encroachment Stations',
+                    'Geometry/Cross Sections/Encroachment Stations',
+                ) if path in hdf), None)
+                if not has_left and not has_right and combined_path is None:
+                    logger.debug("No encroachment station datasets in %s", hdf_path)
+                    return None
+                if has_left != has_right:
+                    raise ValueError('missing paired Encroachment Station Left/Right dataset')
+
+                profile_path = f'{base}/Profile Names'
+                if profile_path not in hdf:
+                    raise ValueError('missing steady profile names')
+                names = read_dataset(profile_path)
+                if names.ndim != 1 or names.dtype.kind not in 'SU':
+                    raise ValueError('steady profile names must be a one-dimensional string dataset')
+                profiles = [decode(name) for name in names]
+                if profiles.count(profile_name) != 1:
+                    raise ValueError(f'profile {profile_name!r} must occur exactly once')
+                profile_idx = profiles.index(profile_name)
+
+                # Result arrays must use result-owned identifiers. Equal row
+                # counts do not prove alignment with the geometry table.
+                attrs_path = (geometry_attrs if not has_left and
+                              combined_path.startswith('Geometry/') else result_attrs)
+                if attrs_path not in hdf:
+                    raise ValueError(f'missing cross-section identifiers: {attrs_path}')
+                xs_attrs = read_dataset(attrs_path)
+                fields = {name.lower(): name for name in (xs_attrs.dtype.names or ())}
+                station_field = fields.get('station') or fields.get('rs')
+                if (xs_attrs.ndim != 1 or not station_field or
+                        'river' not in fields or 'reach' not in fields):
+                    raise ValueError(f'invalid cross-section identifiers: {attrs_path}')
+                if any(xs_attrs.dtype.fields[field][0].kind not in 'SU'
+                       for field in (fields['river'], fields['reach'], station_field)):
+                    raise ValueError(f'cross-section identifier fields must have string dtype: {attrs_path}')
+                identifiers = [
+                    (decode(xs[fields['river']]), decode(xs[fields['reach']]),
+                     decode(xs[station_field])) for xs in xs_attrs
+                ]
+                if len(set(identifiers)) != len(identifiers):
+                    raise ValueError('duplicate cross-section identifiers')
+                count = len(xs_attrs)
+
+                if has_left:
+                    left = read_dataset(left_path)
+                    right = read_dataset(right_path)
+                    validate_stations(left, left_path)
+                    validate_stations(right, right_path)
+                    expected = (len(profiles), count)
+                    if left.shape != expected or right.shape != expected:
+                        raise ValueError(
+                            f'paired station shapes must be {expected}; '
+                            f'got {left.shape} and {right.shape}'
+                        )
+                    left, right = left[profile_idx], right[profile_idx]
+                else:
+                    combined = read_dataset(combined_path)
+                    validate_stations(combined, combined_path)
+                    if combined.shape == (count, len(profiles), 2):
+                        left, right = combined[:, profile_idx, 0], combined[:, profile_idx, 1]
+                    elif len(profiles) == 1 and combined.shape == (count, 2):
+                        left, right = combined[:, 0], combined[:, 1]
+                    else:
+                        raise ValueError(f'unsupported or ambiguous combined station shape {combined.shape}')
+
+                records = [
+                    {'river': river, 'reach': reach, 'station': station,
+                     'encr_sta_l': float(left[i]), 'encr_sta_r': float(right[i])}
+                    for i, (river, reach, station) in enumerate(identifiers)
+                ]
+                return pd.DataFrame(records, columns=[
+                    'river', 'reach', 'station', 'encr_sta_l', 'encr_sta_r'
+                ]).astype({'encr_sta_l': 'float64', 'encr_sta_r': 'float64'})
+        except (OSError, KeyError, ValueError, TypeError) as exc:
+            raise ValueError(
+                f"Could not extract encroachment stations from {hdf_path} "
+                f"for profile {profile_name!r}: {exc}"
+            ) from exc
+
+    @staticmethod
     @log_call
     @standardize_input(file_type='plan_hdf')
     def get_steady_wse(
@@ -1275,11 +1527,14 @@ class HdfResultsPlan:
         """
         Extract water surface elevation (WSE) data for steady state profiles.
 
+        Note:
+            The input decorator accepts keyword-only ``ras_object`` for
+            project-number resolution; it is not in the underlying signature.
+
         Args:
             hdf_path (Path): Path to HEC-RAS plan HDF file
             profile_index (int, optional): Index of profile to extract (0-based). If None, extracts all profiles.
             profile_name (str, optional): Name of profile to extract (e.g., '1Pct'). If specified, overrides profile_index.
-            ras_object (RasPrj, optional): Specific RAS object to use. If None, uses the global ras instance.
 
         Returns:
             pd.DataFrame: DataFrame containing WSE data with columns:
@@ -1319,7 +1574,7 @@ class HdfResultsPlan:
                     raise KeyError(f"WSE data not found at: {wse_path}")
                 # Get WSE dataset (shape: num_profiles × num_cross_sections)
                 wse_ds = hdf_file[wse_path]
-                wse_data = wse_ds[()]
+                wse_data = read_typed(wse_ds)
                 num_profiles, num_xs = wse_data.shape
 
                 # Get profile names
@@ -1415,6 +1670,7 @@ class HdfResultsPlan:
         except KeyError as e:
             raise KeyError(f"Error accessing steady state WSE data: {str(e)}")
         except Exception as e:
+            reraise_required(e)
             raise RuntimeError(f"Error reading steady state WSE data: {str(e)}")
 
     @staticmethod
@@ -1424,9 +1680,12 @@ class HdfResultsPlan:
         """
         Get steady flow attributes and metadata from HEC-RAS HDF plan file.
 
+        Note:
+            The input decorator accepts keyword-only ``ras_object`` for
+            project-number resolution; it is not in the underlying signature.
+
         Args:
             hdf_path (Path): Path to HEC-RAS plan HDF file
-            ras_object (RasPrj, optional): Specific RAS object to use. If None, uses the global ras instance.
 
         Returns:
             pd.DataFrame: DataFrame containing steady flow attributes including:
@@ -1459,7 +1718,7 @@ class HdfResultsPlan:
                 output_path = "Results/Steady/Output"
                 if output_path in hdf_file:
                     output_group = hdf_file[output_path]
-                    for key, value in output_group.attrs.items():
+                    for key, value in read_attrs(output_group).items():
                         if isinstance(value, bytes):
                             attrs_dict[key] = value.decode('utf-8')
                         else:
@@ -1469,7 +1728,7 @@ class HdfResultsPlan:
                 summary_path = "Results/Steady/Summary"
                 if summary_path in hdf_file:
                     summary_group = hdf_file[summary_path]
-                    for key, value in summary_group.attrs.items():
+                    for key, value in read_attrs(summary_group).items():
                         if isinstance(value, bytes):
                             attrs_dict[key] = value.decode('utf-8')
                         else:
@@ -1478,10 +1737,10 @@ class HdfResultsPlan:
                 # Add flow file information from Plan Data
                 plan_info_path = "Plan Data/Plan Information"
                 if plan_info_path in hdf_file:
-                    plan_info = hdf_file[plan_info_path]
+                    plan_info = read_attrs(hdf_file[plan_info_path])
                     for key in ['Flow Filename', 'Flow Title']:
-                        if key in plan_info.attrs:
-                            value = plan_info.attrs[key]
+                        if key in plan_info:
+                            value = plan_info[key]
                             if isinstance(value, bytes):
                                 attrs_dict[key] = value.decode('utf-8')
                             else:
@@ -1502,6 +1761,7 @@ class HdfResultsPlan:
         except KeyError as e:
             raise KeyError(f"Error accessing steady state info: {str(e)}")
         except Exception as e:
+            reraise_required(e)
             raise RuntimeError(f"Error reading steady state info: {str(e)}")
 
     @staticmethod
@@ -1575,7 +1835,7 @@ class HdfResultsPlan:
                 # Read dataset from HDF
                 logger.debug(f"Reading computation messages from HDF: {hdf_path.name}")
                 dataset = hdf_file[compute_msgs_path]
-                data = dataset[()]
+                data = read_typed(dataset)
 
                 # Decode byte string to UTF-8
                 if isinstance(data, bytes):
@@ -1601,7 +1861,7 @@ class HdfResultsPlan:
                 txt_contents = RasControl.get_comp_msgs(hdf_path)
                 if txt_contents:
                     logger.debug(
-                        f"HDF file not found, successfully retrieved computation messages from .txt file"
+                        "HDF file not found, successfully retrieved computation messages from .txt file"
                     )
                     return txt_contents
             except Exception as e:
@@ -1611,6 +1871,7 @@ class HdfResultsPlan:
             return ""
 
         except Exception as e:
+            reraise_required(e)
             logger.debug(f"Error reading computation messages from HDF: {str(e)}")
 
             # Try .txt fallback on any HDF error
@@ -1619,7 +1880,7 @@ class HdfResultsPlan:
                 txt_contents = RasControl.get_comp_msgs(hdf_path)
                 if txt_contents:
                     logger.debug(
-                        f"HDF extraction failed, successfully retrieved computation messages from .txt file"
+                        "HDF extraction failed, successfully retrieved computation messages from .txt file"
                     )
                     return txt_contents
             except Exception as fallback_error:
@@ -1666,7 +1927,7 @@ class HdfResultsPlan:
                 if compute_msgs_path in hdf_file:
                     logger.debug(f"Reading computation messages from HDF: {hdf_path.name}")
                     dataset = hdf_file[compute_msgs_path]
-                    data = dataset[()]
+                    data = read_typed(dataset)
 
                     # Decode byte string to UTF-8
                     if isinstance(data, bytes):
@@ -1690,6 +1951,7 @@ class HdfResultsPlan:
         except FileNotFoundError:
             logger.debug(f"HDF file not found: {hdf_path}")
         except Exception as e:
+            reraise_required(e)
             logger.debug(f"Error reading computation messages from HDF: {str(e)}")
 
         # Attempt 2: Read .computeMsgs.txt file (HEC-RAS 6.x+)
@@ -1768,7 +2030,11 @@ class HdfResultsPlan:
             +----------------+----------+---------------------------------------+
             | energy         | float    | Energy grade elevation (ft or m)      |
             +----------------+----------+---------------------------------------+
-            | max_depth      | float    | Maximum channel depth (ft or m)       |
+            | max_depth      | float    | Maximum total depth (ft or m)         |
+            +----------------+----------+---------------------------------------+
+            | hydraulic_depth| float    | Channel hydraulic depth (ft or m)     |
+            +----------------+----------+---------------------------------------+
+            | channel_length | float    | Downstream channel reach length       |
             +----------------+----------+---------------------------------------+
             | min_ch_el      | float    | Minimum channel elevation (ft or m)   |
             +----------------+----------+---------------------------------------+
@@ -1791,9 +2057,27 @@ class HdfResultsPlan:
         **Comparison with RasControl.get_steady_results():**
 
         This HDF-based method provides the same schema as the COM-based
-        RasControl.get_steady_results(), plus additional hydraulic variables
-        (top_width, area, eg_slope, friction_slope) that are readily
-        available in the HDF file.
+        RasControl.get_steady_results(), plus channel reach length and
+        additional hydraulic variables (hydraulic_depth, top_width, area,
+        eg_slope, friction_slope) that are readily available in the HDF file.
+
+        ``max_depth`` is read from HEC-RAS ``Maximum Depth Total``. Older HDFs
+        without that dataset fall back to ``Hydraulic Depth Channel`` and
+        record the selected dataset in ``df.attrs['max_depth_source']``.
+
+        ``energy`` uses the primary Cross Sections/Energy Grade dataset, with
+        Additional Variables/Energy Grade as a fallback only when the primary
+        dataset is absent. Optional profile outputs, including ``froude`` and
+        ``min_ch_el``, remain NaN when their datasets are not stored. No Froude
+        number or minimum channel elevation is inferred from other quantities.
+
+        ``df.attrs['column_sources']`` maps optional profile-output columns to
+        their selected HDF dataset paths, or None when no source is available.
+        ``df.attrs['unavailable_columns']`` lists those columns with no source;
+        one summarized warning names the missing datasets. A stored array that
+        contains only NaNs still has a source and is not listed as unavailable.
+        Existing ``max_depth_source`` and ``channel_length_source`` attributes
+        are retained. Present datasets with incorrect shapes raise ValueError.
 
         **Performance:**
 
@@ -1842,7 +2126,7 @@ class HdfResultsPlan:
 
                 # Get profile names
                 if profile_names_path in hdf_file:
-                    profile_names_raw = hdf_file[profile_names_path][()]
+                    profile_names_raw = read_typed(hdf_file[profile_names_path])
                     profile_names = [
                         name.decode('utf-8').strip() if isinstance(name, bytes) else str(name).strip()
                         for name in profile_names_raw
@@ -1851,32 +2135,92 @@ class HdfResultsPlan:
                     raise ValueError("Profile names not found in HDF file")
 
                 # Get main variables (WSE, Flow)
-                wse_data = hdf_file[f"{xs_path}/Water Surface"][()]
-                flow_data = hdf_file[f"{xs_path}/Flow"][()]
+                wse_data = np.asarray(
+                    read_typed(hdf_file[f"{xs_path}/Water Surface"])
+                )
+                flow_data = np.asarray(read_typed(hdf_file[f"{xs_path}/Flow"]))
+                if wse_data.ndim != 2:
+                    raise ValueError(
+                        "Steady Water Surface dataset must be a 2D "
+                        "profile-by-cross-section array"
+                    )
+                if flow_data.shape != wse_data.shape:
+                    raise ValueError(
+                        "Steady Flow dataset shape does not match Water Surface: "
+                        f"{flow_data.shape} != {wse_data.shape}"
+                    )
                 num_profiles, num_xs = wse_data.shape
+                if len(profile_names) != num_profiles:
+                    raise ValueError(
+                        "Steady profile-name count does not match result rows: "
+                        f"{len(profile_names)} != {num_profiles}"
+                    )
                 xs_attrs, xs_fields = HdfResultsPlan._get_steady_cross_section_attributes(
                     hdf_file,
                     expected_count=num_xs,
+                )
+                channel_length_data = HdfResultsPlan._get_steady_channel_lengths(
+                    hdf_file,
+                    xs_attrs,
+                    xs_fields,
                 )
 
                 # Missing optional variables are returned as null values. Do
                 # not infer a cross-section join from legacy packed arrays;
                 # their axis ordering and row coverage vary by HEC-RAS version.
-                def get_additional_var(var_name, default=np.nan):
-                    path = f"{add_vars_path}/{var_name}"
-                    if path in hdf_file:
-                        return hdf_file[path][()]
-                    return np.full((num_profiles, num_xs), default)
+                column_sources = {}
+                optional_paths = {}
 
-                velocity_data = get_additional_var('Velocity Channel')
-                energy_data = get_additional_var('Energy Grade')
-                froude_data = get_additional_var('Froude # Channel')
-                max_depth_data = get_additional_var('Hydraulic Depth Channel')
-                min_ch_el_data = get_additional_var('Min Ch El')
-                top_width_data = get_additional_var('Top Width Total')
-                area_data = get_additional_var('Area Flow Total')
-                eg_slope_data = get_additional_var('EG Slope')
-                friction_slope_data = get_additional_var('Friction Slope')
+                def get_optional_var(column, var_name, paths=None):
+                    paths = paths or [f"{add_vars_path}/{var_name}"]
+                    optional_paths[column] = paths
+                    column_sources[column] = None
+                    for path in paths:
+                        # Absence and shape are metadata; only a present,
+                        # correctly shaped dataset is read (natively when
+                        # selected). A malformed present dataset raises here in
+                        # every backend mode and is never replaced by a
+                        # fallback path; a native refusal propagates unchanged.
+                        if path not in hdf_file:
+                            continue
+                        dataset = hdf_file[path]
+                        expected_shape = (num_profiles, num_xs)
+                        if dataset.shape != expected_shape:
+                            raise ValueError(
+                                f"Steady variable {var_name!r} has shape "
+                                f"{dataset.shape}; expected {expected_shape}"
+                            )
+                        values = np.asarray(read_typed(dataset))
+                        if values.shape != expected_shape:
+                            raise ValueError(
+                                f"Steady variable {var_name!r} has shape "
+                                f"{values.shape}; expected {expected_shape}"
+                            )
+                        column_sources[column] = path
+                        return values
+                    return np.full((num_profiles, num_xs), np.nan)
+
+                velocity_data = get_optional_var('velocity', 'Velocity Channel')
+                energy_data = get_optional_var('energy', 'Energy Grade', paths=[
+                    f"{xs_path}/Energy Grade",
+                    f"{add_vars_path}/Energy Grade",
+                ])
+                froude_data = get_optional_var('froude', 'Froude # Channel')
+                hydraulic_depth_data = get_optional_var('hydraulic_depth', 'Hydraulic Depth Channel')
+                maximum_depth_path = f"{add_vars_path}/Maximum Depth Total"
+                if maximum_depth_path in hdf_file:
+                    max_depth_data = get_optional_var('max_depth', 'Maximum Depth Total')
+                    max_depth_source = 'Maximum Depth Total'
+                else:
+                    max_depth_data = hydraulic_depth_data
+                    max_depth_source = 'Hydraulic Depth Channel (legacy fallback)'
+                    column_sources['max_depth'] = column_sources['hydraulic_depth']
+                    optional_paths['max_depth'] = [maximum_depth_path] + optional_paths['hydraulic_depth']
+                min_ch_el_data = get_optional_var('min_ch_el', 'Min Ch El')
+                top_width_data = get_optional_var('top_width', 'Top Width Total')
+                area_data = get_optional_var('area', 'Area Flow Total')
+                eg_slope_data = get_optional_var('eg_slope', 'EG Slope')
+                friction_slope_data = get_optional_var('friction_slope', 'Friction Slope')
 
                 # Build results DataFrame
                 rows = []
@@ -1902,6 +2246,8 @@ class HdfResultsPlan:
                             'froude': float(froude_data[prof_idx, xs_idx]),
                             'energy': float(energy_data[prof_idx, xs_idx]),
                             'max_depth': float(max_depth_data[prof_idx, xs_idx]),
+                            'hydraulic_depth': float(hydraulic_depth_data[prof_idx, xs_idx]),
+                            'channel_length': float(channel_length_data[xs_idx]),
                             'min_ch_el': float(min_ch_el_data[prof_idx, xs_idx]),
                             'top_width': float(top_width_data[prof_idx, xs_idx]),
                             'area': float(area_data[prof_idx, xs_idx]),
@@ -1910,6 +2256,26 @@ class HdfResultsPlan:
                         })
 
                 df = pd.DataFrame(rows)
+                df.attrs['max_depth_source'] = max_depth_source
+                df.attrs['channel_length_source'] = (
+                    'unavailable'
+                    if np.isnan(channel_length_data).all()
+                    else 'Geometry/Cross Sections/Attributes/Len Channel'
+                )
+                df.attrs['column_sources'] = column_sources
+                unavailable = [
+                    column for column in df.columns
+                    if column in column_sources and column_sources[column] is None
+                ]
+                df.attrs['unavailable_columns'] = unavailable
+                if unavailable:
+                    logger.warning(
+                        "Optional steady result datasets unavailable; columns remain NaN: %s",
+                        "; ".join(
+                            f"{column} ({' or '.join(path.rsplit('/', 1)[-1] for path in optional_paths[column])})"
+                            for column in unavailable
+                        ),
+                    )
                 logger.debug(f"Extracted steady results: {len(df)} rows "
                             f"({num_profiles} profiles x {num_xs} cross sections)")
                 return df

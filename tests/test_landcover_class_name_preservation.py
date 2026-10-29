@@ -1,4 +1,4 @@
-"""Manning's n updates must preserve full-width native HDF class identities."""
+"""Implicit native edits must refuse without changing legacy HDF identities."""
 
 from pathlib import Path
 
@@ -10,7 +10,7 @@ from ras_commander import HdfLandCover
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_roughness_update_preserves_full_width_nullterm_name(tmp_path: Path, legacy: bool):
+def test_implicit_roughness_update_refuses_and_preserves_full_width_name(tmp_path: Path, legacy: bool):
     path = tmp_path / "landcover.hdf"
     names = [b"Water", b"Emergent Herbaceous Wetlands"]
     width = len(names[-1])
@@ -36,13 +36,20 @@ def test_roughness_update_preserves_full_width_nullterm_name(tmp_path: Path, leg
             dataset.write(h5py.h5s.ALL, h5py.h5s.ALL, values, mtype=compound)
     before = HdfLandCover.get_landcover_raster_map(path)
     assert before.mannings_n.notna().all()
-    HdfLandCover.set_landcover_raster_map(path, {names[-1].decode(): 0.06})
+    before_bytes = path.read_bytes()
+    # The accepted native-authoring migration requires explicit version/context.
+    # Complete native table edits are covered by test_landcover_parameter_preservation.
+    with pytest.warns(DeprecationWarning, match="set_landcover_mannings_n"):
+        with pytest.raises(ValueError, match="hecras_version is required"):
+            HdfLandCover.set_landcover_raster_map(path, {names[-1].decode(): 0.06})
+    assert path.read_bytes() == before_bytes
+    assert list(tmp_path.iterdir()) == [path]
     after = HdfLandCover.get_landcover_raster_map(path)
     assert after.class_name.tolist() == before.class_name.tolist()
-    assert after.mannings_n.tolist() == pytest.approx([0.12, 0.06])
+    assert after.mannings_n.tolist() == pytest.approx([0.12, 0.12])
     with h5py.File(path, "r") as hdf:
         assert hdf["Variables"]["Name"].tolist() == names
         assert hdf["Variables"]["Other"].tolist() == [7.0, 7.0]
         if legacy:
             assert hdf["Raster Map"]["Name"].tolist() == names
-            assert hdf["Raster Map"]["ManningsN"].tolist() == pytest.approx([0.12, 0.06])
+            assert hdf["Raster Map"]["ManningsN"].tolist() == pytest.approx([0.12, 0.12])

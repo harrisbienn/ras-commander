@@ -37,11 +37,19 @@ This file is the canonical local instruction file for `ras_commander/geom/`.
 ## Common Use Cases
 
 - Cross-section extraction and modification: `GeomCrossSection`
+- Text-only 1D footprints from cross-section endpoints: `GeomParser.get_1d_footprint()`
 - 2D flow area settings and storage curves: `GeomStorage`
 - SA/2D connections and laterals: `GeomLateral`
 - Structure geometry and metadata: `GeomBridge`, `GeomInlineWeir`, `GeomCulvert`
 - Culvert GIS reconstruction / hydraulic-validity checks: `GeomCulvertGIS`
 - HTAB optimization from results: `GeomHtab`
+
+## Packed refinement-region audits
+
+- `GeomMesh.audit_domain_containment()` assembles refinement rings by containment,
+  preserving holes, disjoint shells and islands without changing coordinates.
+  Parts offsets are local to each feature's Info point range; malformed spans
+  raise instead of silently dropping or truncating rings.
 
 ## Culvert GIS Validation (`GeomCulvertGIS`)
 
@@ -91,11 +99,16 @@ Reconstruct and validate culvert placement from geometry; complements `GeomCulve
 HEC-RAS resolves per-cell Manning's n through a layered override hierarchy:
 
 1. **Sidecar HDF Variables** — authoritative base n-values per class
-2. **LCMann Table= (plain text .g##)** — optional base overrides
+2. **LCMann Table= (plain text .g##)** — optional base overrides; the
+   integer is the number of following base-table rows
 3. **LCMann Region Table=** — optional per-region calibration overrides
 4. **Geometry HDF Calibration Table** — final preprocessed values (NaN = use sidecar)
 
-`LCMann Table=0` means no overrides defined (empty table). NaN in the calibration table is normal — HEC-RAS reads the sidecar directly. There is no 16-class limit.
+`LCMann Table=0` means no overrides are defined and must not be followed by
+base-table rows. When overrides are present, the header count must equal the
+number of emitted rows; HEC-RAS 7.0 otherwise ignores those rows. NaN in the
+calibration table can be normal for an actually empty override table because
+HEC-RAS reads the sidecar directly. There is no 16-class limit.
 
 See `.claude/rules/hec-ras/land-cover-mannings-n.md` for full documentation.
 
@@ -103,3 +116,38 @@ See `.claude/rules/hec-ras/land-cover-mannings-n.md` for full documentation.
 
 - Validate geometry changes against real `.g##` files.
 - Re-run geometry preprocessing or model execution when a change can affect HEC-RAS interpretation.
+
+## Packed polyline audit offsets
+
+- `GeomMesh.audit_domain_containment()` uses feature-local offsets for packed
+  polylines, valid when every part lies within the feature's point count.
+  Legacy global offsets remain supported when the complete feature reconciles
+  exactly; individual parts never guess their offset convention by numeric
+  overlap. Invalid or truncated spans raise.
+
+## Reference features
+
+- `GeomReferenceFeatures.add_reference_points` writes native `Reference Point Name=`
+  (40-byte padded field) and `Reference Point Position=X,Y` before LCMann. It keeps
+  literal names, validates finite coordinates and duplicate names before writing,
+  and uses atomic geometry writes with preserved numbered backups.
+- `get_reference_points` reads only native records. IC Points are separate initial
+  condition features; even old `IC Point Name=Reference Point ...` records are left
+  untouched and excluded. No automatic migration or prefix insertion occurs.
+- Both point APIs retain their signatures. Callers migrating old IC-authored gauges
+  must explicitly supply the intended native names/coordinates. A text round trip
+  is not sufficient: check mesh membership, preprocess and compute a new plan, then
+  inspect `HdfBndry.get_reference_points` and `HdfResultsXsec.get_ref_points_timeseries`.
+- Reference-line authoring validates field widths, finite coordinates and duplicate
+  names. The getter uses the strict fixed-width parser and rejects truncated data.
+  Native point blocks are recognised as insertion boundaries. Preserve vertex order
+  and signed stored flow. The add method does not establish mesh membership or area
+  semantics; computation/geometry validation remains necessary.
+- Reference Areas have no authoring/reading API in this module; do not substitute
+  storage areas or calibration regions. That is a separate feature gap.
+- Notebook 207 demonstrates native point/line authoring, in-mesh checks and a
+  one-day RasCmdr computation in a separate destination, followed by HDF reads.
+
+Native Reference Point blocks terminate connection ownership/rewrite slices. Preserve
+them in all connection editing paths. GeomProjection transforms their Position
+records alongside IC Point Position; the two feature types remain distinct.

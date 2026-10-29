@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 terrain_mod_module = import_module("ras_commander.terrain.RasTerrainMod")
@@ -53,7 +54,6 @@ def test_setup_gdal_bridge_info_uses_version_and_debug_keeps_path(monkeypatch, t
     debug_text = _text(caplog, logging.DEBUG)
 
     assert configured == [
-        ("runtime", ras_path),
         ("bridge", ras_path, None),
     ]
     assert "Configured HEC-RAS GDAL runtime for HEC-RAS 6.6" in info_text
@@ -163,12 +163,16 @@ def test_compute_modified_terrain_raster_info_uses_filename_and_debug_keeps_path
     )
     caplog.set_level(logging.DEBUG, logger=terrain_mod_module.logger.name)
 
-    result = RasTerrainMod.compute_modified_terrain_raster(
-        rasmap_path=rasmap,
-        geom_hdf_path=geom_hdf,
-        terrain_tif_path=terrain_tif,
-        output_tif_path=output_tif,
-    )
+    with pytest.warns(
+        DeprecationWarning,
+        match="RasTerrain.export_rasmapper_terrain",
+    ) as caught:
+        result = RasTerrainMod.compute_modified_terrain_raster(
+            rasmap_path=rasmap,
+            geom_hdf_path=geom_hdf,
+            terrain_tif_path=terrain_tif,
+            output_tif_path=output_tif,
+        )
 
     info_text = _text(caplog, logging.INFO)
     debug_text = _text(caplog, logging.DEBUG)
@@ -179,3 +183,4 @@ def test_compute_modified_terrain_raster_info_uses_filename_and_debug_keeps_path
     assert "Modified terrain raster written: ModifiedTerrain.tif" in info_text
     assert str(tmp_path) not in info_text
     assert str(output_tif) in debug_text
+    assert caught[0].filename == __file__

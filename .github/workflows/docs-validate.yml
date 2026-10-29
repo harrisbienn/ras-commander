@@ -1,5 +1,9 @@
 name: Validate Documentation
 
+# Catches build-breaking docs errors (bad nav entries, missing pages, mkdocstrings
+# failures) on PRs BEFORE they merge to main and trigger the self-hosted CT 210 rebuild
+# (rascommander.info). Build-only; does not deploy. Strictness also lives in mkdocs.yml.
+
 on:
   pull_request:
   push:
@@ -36,6 +40,8 @@ jobs:
           python -m pip install . -c docs/constraints-docs.txt
           python -m pip check
           python -m pip freeze --all > docs-dependencies.txt
+      - name: Install documentation test runner
+        run: python -m pip install pytest==9.1.1
       - name: Validate notebook inventory
         run: |
           python .claude/scripts/generate_notebooks_metadata.py --check
@@ -53,10 +59,12 @@ jobs:
           git diff --exit-code -- docs/examples/index.md
       - name: Generate cognitive infrastructure docs
         run: python .claude/scripts/generate_cognitive_docs.py
+      - name: Verify source and signature rendering regressions
+        run: python -m pytest tests/test_mkdocstrings_source_anchors.py -q
       - name: Build without deployment credentials
-        # Preserve the existing production policy for notebook link warnings.
-        # Build exceptions still fail; strict-mode cleanup is separate work.
-        run: python -m mkdocs build
+        run: python -m mkdocs build --strict
+      - name: Verify rendered API members and unique HTML IDs
+        run: python .claude/scripts/validate_rasmapper_api_rendering.py
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: docs-dependencies

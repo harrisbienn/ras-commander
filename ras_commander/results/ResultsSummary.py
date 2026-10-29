@@ -70,7 +70,7 @@ class ResultsSummary:
     @staticmethod
     def _infer_flow_type_from_reference(flow_ref: Any) -> str:
         """
-        Infer flow type from raw flow metadata like ``u01`` or ``Project.u01``.
+        Infer flow type from raw flow metadata like ``q01`` or ``Project.u01``.
 
         Bare numeric flow identifiers from ``plan_df`` (for example ``01``)
         are ambiguous after ras-commander normalization and therefore return
@@ -88,6 +88,9 @@ class ResultsSummary:
         if flow_name.startswith('f') and flow_name[1:].isdigit():
             return 'Steady'
 
+        if flow_name.startswith('q') and flow_name[1:].isdigit():
+            return 'Quasi-Unsteady'
+
         if '.u' in flow_name:
             suffix = flow_name.rsplit('.u', 1)[1]
             if suffix.isdigit():
@@ -98,6 +101,11 @@ class ResultsSummary:
             if suffix.isdigit():
                 return 'Steady'
 
+        if '.q' in flow_name:
+            suffix = flow_name.rsplit('.q', 1)[1]
+            if suffix.isdigit():
+                return 'Quasi-Unsteady'
+
         return 'Unknown'
 
     @staticmethod
@@ -107,12 +115,27 @@ class ResultsSummary:
 
         Preferred inputs:
         1. Explicit ``flow_type``
-        2. ``unsteady_number`` from ``plan_df``
-        3. Raw ``Flow Path`` or ``Flow File`` values with ``u##``/``f##``
+        2. Normalized ``flow_file_prefix``
+        3. Quasi/unsteady number columns from ``plan_df``
+        4. Raw ``Flow Path`` or ``Flow File`` values with ``f##``/``u##``/``q##``
         """
         flow_type = entry.get('flow_type')
         if ResultsSummary._has_value(flow_type):
             return str(flow_type).strip()
+
+        prefix = entry.get('flow_file_prefix')
+        if ResultsSummary._has_value(prefix):
+            normalized = str(prefix).strip().lower()
+            inferred = {
+                'f': 'Steady',
+                'u': 'Unsteady',
+                'q': 'Quasi-Unsteady',
+            }.get(normalized)
+            if inferred:
+                return inferred
+
+        if ResultsSummary._has_value(entry.get('quasi_unsteady_number')):
+            return 'Quasi-Unsteady'
 
         if ResultsSummary._has_value(entry.get('unsteady_number')):
             return 'Unsteady'
@@ -145,7 +168,7 @@ class ResultsSummary:
             plan_meta: Dict with keys:
                 - plan_number (str): Plan identifier (e.g., "01")
                 - plan_title (str): Plan title from plan file
-                - flow_type (str): "Steady" or "Unsteady"
+                - flow_type (str): "Steady", "Unsteady", or "Quasi-Unsteady"
 
         Returns:
             dict: Flattened summary with prefixed keys:
@@ -222,6 +245,9 @@ class ResultsSummary:
                 parsed = ResultsParser.parse_compute_messages(messages)
                 result.update(parsed)
         except Exception as e:
+            from ..fast_hdf import reraise_required
+
+            reraise_required(e)
             logger.debug(f"Error extracting compute messages: {e}")
 
         # Extract runtime data - try HDF structured paths first, then compute messages fallback
@@ -242,6 +268,9 @@ class ResultsSummary:
                 result['runtime_source'] = 'hdf'
                 runtime_extracted = True
         except Exception as e:
+            from ..fast_hdf import reraise_required
+
+            reraise_required(e)
             logger.debug(f"Error extracting runtime data from HDF: {e}")
 
         # Fallback: Parse compute messages for runtime data (pre-6.4 HEC-RAS versions)
@@ -289,6 +318,9 @@ class ResultsSummary:
                             result[result_col] = vol_row.get(hdf_col)
                     vol_extracted = True
             except Exception as e:
+                from ..fast_hdf import reraise_required
+
+                reraise_required(e)
                 logger.debug(f"Error extracting volume accounting from HDF: {e}")
 
             # Fallback: Use volume error percent from compute messages (pre-6.4 HEC-RAS)

@@ -60,6 +60,20 @@ import numpy as np
 import pandas as pd
 
 
+class StoredMapProductsIncompleteError(RuntimeError):
+    """Raised when StoreAllMaps ran but did not produce every requested product.
+
+    Successfully generated products are preserved on disk before this error is
+    raised. ``frame`` holds the complete per-product DataFrame (including the
+    ``status`` column) and ``missing`` lists the missing product rows.
+    """
+
+    def __init__(self, message: str, frame: pd.DataFrame):
+        super().__init__(message)
+        self.frame = frame
+        self.missing = frame[frame["status"] != "generated"].to_dict(orient="records")
+
+
 @dataclass
 class ProjectionInfo:
     """
@@ -92,12 +106,14 @@ class WineConfig:
     ras_install_dir: Optional[Path] = None
 
 
+from ._ras_text import _normalize_ras_newlines, _write_ras_text, _write_ras_xml
 from .RasPrj import ras
 from .RasMap import RasMap
 from .RasBenefits import BenefitAreaConfig, RasBenefits
 from .RasUtils import RasUtils
 from .LoggingConfig import get_logger
 from .Decorators import log_call
+from .fast_hdf import read_attr, read_typed, reraise_required
 from ._native_helper import (
     _is_wine_helper_runtime,
     normalize_store_map_render_mode,
@@ -1319,6 +1335,290 @@ Step 5: Configure (optional — auto-detection usually works)
             )
 
     @staticmethod
+    def _geometry_completion_semantics(geom_hdf_path: Path) -> Dict[str, Any]:
+        """Inspect 1D completion layers and 2D property-table readiness."""
+        evidence: Dict[str, Any] = {
+            "readable": False,
+            "has_1d_geometry": False,
+            "has_2d_geometry": False,
+            "edge_lines_written": False,
+            "interpolation_surface_written": False,
+            "two_d_flow_areas": {},
+            "success": False,
+            "error": None,
+        }
+        try:
+            import h5py
+
+            with h5py.File(geom_hdf_path, "r") as hdf:
+                evidence["readable"] = True
+                evidence["edge_lines_written"] = (
+                    "Geometry/River Edge Lines" in hdf
+                )
+                evidence["interpolation_surface_written"] = (
+                    "Geometry/Cross Section Interpolation Surfaces" in hdf
+                )
+                cross_sections = hdf.get("Geometry/Cross Sections/Attributes")
+                evidence["has_1d_geometry"] = bool(
+                    cross_sections is not None and cross_sections.shape[0] > 0
+                )
+
+                collection = hdf.get("Geometry/2D Flow Areas")
+                attributes = (
+                    collection.get("Attributes") if collection is not None else None
+                )
+                evidence["has_2d_geometry"] = bool(
+                    attributes is not None and attributes.shape[0] > 0
+                )
+                if collection is not None:
+                    for name, area in collection.items():
+                        if name == "Attributes" or not isinstance(area, h5py.Group):
+                            continue
+                        cells = area.get("Cells Center Coordinate")
+                        faces = area.get("Faces FacePoint Indexes")
+                        cell_info = area.get("Cells Volume Elevation Info")
+                        cell_values = area.get("Cells Volume Elevation Values")
+                        face_info = area.get("Faces Area Elevation Info")
+                        face_values = area.get("Faces Area Elevation Values")
+                        cell_rows = int(cells.shape[0]) if cells is not None else 0
+                        face_rows = int(faces.shape[0]) if faces is not None else 0
+                        area_ready = bool(
+                            cell_rows > 0
+                            and face_rows > 0
+                            and cell_info is not None
+                            and cell_info.shape[0] == cell_rows
+                            and cell_values is not None
+                            and cell_values.shape[0] > 0
+                            and face_info is not None
+                            and face_info.shape[0] == face_rows
+                            and face_values is not None
+                            and face_values.shape[0] > 0
+                        )
+                        evidence["two_d_flow_areas"][name] = {
+                            "cell_rows": cell_rows,
+                            "face_rows": face_rows,
+                            "cell_property_info_rows": (
+                                int(cell_info.shape[0])
+                                if cell_info is not None
+                                else 0
+                            ),
+                            "cell_property_value_rows": (
+                                int(cell_values.shape[0])
+                                if cell_values is not None
+                                else 0
+                            ),
+                            "face_property_info_rows": (
+                                int(face_info.shape[0])
+                                if face_info is not None
+                                else 0
+                            ),
+                            "face_property_value_rows": (
+                                int(face_values.shape[0])
+                                if face_values is not None
+                                else 0
+                            ),
+                            "ready": area_ready,
+                        }
+
+                one_d_ready = (
+                    not evidence["has_1d_geometry"]
+                    or evidence["edge_lines_written"]
+                )
+                two_d_ready = (
+                    not evidence["has_2d_geometry"]
+                    or (
+                        bool(evidence["two_d_flow_areas"])
+                        and all(
+                            item["ready"]
+                            for item in evidence["two_d_flow_areas"].values()
+                        )
+                    )
+                )
+                evidence["success"] = bool(
+                    (evidence["has_1d_geometry"] or evidence["has_2d_geometry"])
+                    and one_d_ready
+                    and two_d_ready
+                )
+        except Exception as exc:
+            evidence["error"] = f"{type(exc).__name__}: {exc}"
+        return evidence
+
+    @staticmethod
+    def _terminate_owned_process_tree(process: subprocess.Popen) -> Dict[str, Any]:
+        """Terminate only the process tree rooted at *process*."""
+        evidence = {
+            "root_pid": int(process.pid),
+            "observed_pids": [],
+            "terminated_pids": [],
+            "killed_pids": [],
+            "survivor_pids": [],
+        }
+        try:
+            import psutil
+
+            try:
+                root = psutil.Process(int(process.pid))
+                owned = [root, *root.children(recursive=True)]
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                owned = []
+            evidence["observed_pids"] = sorted(int(item.pid) for item in owned)
+            alive = []
+            for item in reversed(owned):
+                try:
+                    if item.is_running() and item.status() != psutil.STATUS_ZOMBIE:
+                        evidence["terminated_pids"].append(int(item.pid))
+                        item.terminate()
+                        alive.append(item)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            _gone, alive = psutil.wait_procs(alive, timeout=3)
+            for item in alive:
+                try:
+                    evidence["killed_pids"].append(int(item.pid))
+                    item.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            _gone, survivors = psutil.wait_procs(alive, timeout=3)
+            evidence["survivor_pids"] = sorted(
+                int(item.pid) for item in survivors
+            )
+        except Exception:
+            if process.poll() is None:
+                process.kill()
+        try:
+            process.wait(timeout=10)
+        except Exception:
+            pass
+        return evidence
+
+    @staticmethod
+    def _run_complete_geometry_supervised(
+        rasprocess_path: Path,
+        args: List[str],
+        geom_hdf_path: Path,
+        timeout: int,
+        working_dir: Path,
+        semantic_stable_seconds: float,
+    ) -> Tuple[subprocess.CompletedProcess, str, Dict[str, Any]]:
+        """Wait for exit, or witnessed completion plus fresh stable geometry.
+
+        Existing tables and a pause between processing stages cannot establish
+        completion. The Wine fallback also requires this invocation's terminal
+        geometry message and a changed file signature.
+        """
+        if IS_LINUX:
+            wine_config = RasProcess._get_wine_config()
+            if wine_config is None:
+                raise RuntimeError(
+                    "Wine not configured on Linux. Call RasProcess.configure_wine() "
+                    "or set WINEPREFIX."
+                )
+            command, env, cwd = RasProcess._build_wine_command(
+                rasprocess_path,
+                args,
+                wine_config,
+                working_dir=working_dir,
+            )
+        else:
+            command = [str(rasprocess_path), *args]
+            env = None
+            cwd = str(working_dir) if working_dir else None
+
+        if semantic_stable_seconds < 0:
+            raise ValueError("semantic_stable_seconds must be non-negative")
+
+        try:
+            before = geom_hdf_path.stat()
+            initial_signature = (before.st_size, before.st_mtime_ns)
+        except OSError:
+            initial_signature = None
+
+        with tempfile.TemporaryDirectory(prefix="ras-geometry-") as log_directory, open(
+            Path(log_directory) / "stdout.log", "w+", encoding="utf-8", errors="replace"
+        ) as stdout_file, open(
+            Path(log_directory) / "stderr.log", "w+", encoding="utf-8", errors="replace"
+        ) as stderr_file:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=env,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=True,
+            )
+            deadline = time.monotonic() + timeout
+            ready_since = None
+            ready_signature = None
+            completion_mode = "process_exit"
+            cleanup = {
+                "root_pid": int(process.pid),
+                "observed_pids": [int(process.pid)],
+                "terminated_pids": [],
+                "killed_pids": [],
+                "survivor_pids": [],
+            }
+            while process.poll() is None:
+                semantics = RasProcess._geometry_completion_semantics(
+                    geom_hdf_path
+                )
+                # Reopen independently: seeking the handle shared with the
+                # writer would change its output offset and corrupt its log.
+                with (Path(log_directory) / "stdout.log").open("rb") as reader:
+                    reader.seek(0, os.SEEK_END)
+                    reader.seek(max(0, reader.tell() - 65536))
+                    tail = reader.read().decode("utf-8", errors="replace")
+                terminal_message = tail.rstrip().endswith("Completed Writing Geometry")
+                try:
+                    stat = geom_hdf_path.stat()
+                    signature = (stat.st_size, stat.st_mtime_ns)
+                except OSError:
+                    signature = None
+                fresh_geometry = signature is not None and signature != initial_signature
+                if semantics["success"] and terminal_message and fresh_geometry:
+                    if signature == ready_signature:
+                        ready_since = ready_since or time.monotonic()
+                    else:
+                        ready_signature = signature
+                        ready_since = time.monotonic()
+                    if (
+                        ready_since is not None
+                        and time.monotonic() - ready_since
+                        >= semantic_stable_seconds
+                    ):
+                        completion_mode = "semantic_hdf_stable"
+                        cleanup = RasProcess._terminate_owned_process_tree(process)
+                        break
+                else:
+                    ready_since = None
+                    ready_signature = None
+
+                if time.monotonic() >= deadline:
+                    cleanup = RasProcess._terminate_owned_process_tree(process)
+                    raise subprocess.TimeoutExpired(command, timeout)
+                time.sleep(1)
+
+            if process.poll() is None:
+                process.wait(timeout=10)
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read()
+            stderr = stderr_file.read()
+            if IS_LINUX and stderr:
+                stderr = "\n".join(
+                    line
+                    for line in stderr.splitlines()
+                    if not line.startswith(("0", "wine: "))
+                    and "err:" not in line[:20]
+                )
+            completed = subprocess.CompletedProcess(
+                command,
+                process.returncode,
+                stdout,
+                stderr,
+            )
+            return completed, completion_mode, cleanup
+
+    @staticmethod
     def _resolve_path_for_rasprocess(path: Path) -> str:
         """
         Convert a path to the format RasProcess.exe expects.
@@ -1356,8 +1656,9 @@ Step 5: Configure (optional — auto-detection usually works)
             This method runs RasProcess.exe ``SetGeometryAssociation`` in-place
             and mutates the supplied geometry HDF. It is a reference/validation
             path only. Normal workflows should call
-            ``RasMap.associate_geometry_layers(...)``, which writes the same
-            ``/Geometry`` association attributes through Python-native h5py.
+            ``RasMap.associate_geometry_layers(...)``, which delegates to the
+            selected HEC-RAS generation's native geometry-association API and
+            validates its readback.
 
         Args:
             hdf_path: Existing geometry HDF to mutate and validate.
@@ -1367,7 +1668,7 @@ Step 5: Configure (optional — auto-detection usually works)
             sediment_soils_hdf_path: Optional sediment bed-material soils HDF.
             ras_version: Optional HEC-RAS version for RasProcess.exe lookup.
             timeout: Command timeout in seconds.
-            ras_object: Optional RasPrj object. Present for API consistency.
+            ras_object (RasPrj, optional): Optional RasPrj object. Present for API consistency.
 
         Returns:
             Dict containing command args, return code, stdout/stderr,
@@ -1458,6 +1759,7 @@ Step 5: Configure (optional — auto-detection usually works)
         ras_object=None,
         ras_version: str = None,
         timeout: int = 1800,
+        semantic_stable_seconds: float = 10.0,
     ) -> Dict[str, Any]:
         """
         Run HEC-RAS's headless geometry completion (RasProcess.exe CompleteGeometry).
@@ -1491,6 +1793,15 @@ Step 5: Configure (optional — auto-detection usually works)
         to complete the original geometry. On models with large 2D flow areas the
         pipeline also (re)builds 2D property tables and can take minutes.
 
+        Notes
+        -----
+        HEC-RAS 7.0 exposes a ``ComputePropertyTables`` command, but its
+        ``ExecuteWith`` implementation raises ``NotImplementedException``.
+        ``CompleteGeometry`` is the working command. Its CLI key is
+        ``GeomFilename`` (not the .NET property name ``GeometryFilename``).
+        RasProcess.exe can report argument errors on stderr while returning zero,
+        so this wrapper treats a leading ``Error:`` there as unsuccessful.
+
         Parameters
         ----------
         geom_hdf_path : str or Path
@@ -1500,11 +1811,18 @@ Step 5: Configure (optional — auto-detection usually works)
             ``ras_object`` is available, it is discovered via
             ``RasMap.get_rasmap_path``.
         ras_object : RasPrj, optional
-            RAS project object used to locate the ``.rasmap`` when not supplied.
+            RAS project object used to locate the ``.rasmap`` and version-matched
+            RasProcess.exe when not supplied.
         ras_version : str, optional
             Specific HEC-RAS version for the RasProcess.exe lookup.
         timeout : int, optional
             Command timeout in seconds (default 1800).
+        semantic_stable_seconds : float, optional
+            Under Wine, terminate only the owned ``RasProcess.exe`` tree after
+            this invocation reports ``Completed Writing Geometry``, changes the
+            geometry file, and leaves valid HDF semantics and size/mtime stable
+            for this many seconds (default 10). Preexisting tables cannot trigger
+            this fallback. Native Windows waits for normal process exit.
 
         Returns
         -------
@@ -1535,7 +1853,20 @@ Step 5: Configure (optional — auto-detection usually works)
                 logger.debug(f"Could not auto-resolve .rasmap: {e}")
         rasmap_path = Path(rasmap_path) if rasmap_path else None
 
-        rasprocess = RasProcess.find_rasprocess(ras_version)
+        # Prefer the RasProcess.exe shipped beside the project's own Ras.exe.
+        # This keeps preprocessing aligned with the HEC-RAS version that will
+        # compute the plan; fall back to normal version discovery otherwise.
+        ras_obj = ras_object or ras
+        rasprocess = None
+        if ras_version is None:
+            ras_exe_path = getattr(ras_obj, "ras_exe_path", None)
+            if ras_exe_path:
+                candidate = Path(ras_exe_path).parent / "RasProcess.exe"
+                if candidate.exists():
+                    rasprocess = candidate
+
+        if rasprocess is None:
+            rasprocess = RasProcess.find_rasprocess(ras_version)
         if rasprocess is None:
             raise FileNotFoundError("RasProcess.exe not found")
 
@@ -1549,33 +1880,51 @@ Step 5: Configure (optional — auto-detection usually works)
             )
 
         logger.info(f"Running RasProcess.exe CompleteGeometry on {geom_hdf_path.name}")
-        result = RasProcess._run_rasprocess(
-            rasprocess, args, timeout=timeout, working_dir=geom_hdf_path.parent
-        )
+        completion_mode = "process_exit"
+        owned_process_cleanup = None
+        if _is_wine_helper_runtime():
+            result, completion_mode, owned_process_cleanup = (
+                RasProcess._run_complete_geometry_supervised(
+                    rasprocess,
+                    args,
+                    geom_hdf_path,
+                    timeout=timeout,
+                    working_dir=geom_hdf_path.parent,
+                    semantic_stable_seconds=semantic_stable_seconds,
+                )
+            )
+        else:
+            result = RasProcess._run_rasprocess(
+                rasprocess,
+                args,
+                timeout=timeout,
+                working_dir=geom_hdf_path.parent,
+            )
         stdout = result.stdout or ""
         stderr = result.stderr or ""
 
-        # Confirm the artifacts landed in the geometry HDF.
-        edge_lines_written = False
-        interp_surface_written = False
-        try:
-            import h5py
+        semantic_validation = RasProcess._geometry_completion_semantics(
+            geom_hdf_path
+        )
+        edge_lines_written = semantic_validation["edge_lines_written"]
+        interp_surface_written = semantic_validation[
+            "interpolation_surface_written"
+        ]
 
-            with h5py.File(geom_hdf_path, "r") as hdf:
-                edge_lines_written = "Geometry/River Edge Lines" in hdf
-                interp_surface_written = (
-                    "Geometry/Cross Section Interpolation Surfaces" in hdf
-                )
-        except Exception as e:
-            logger.debug(f"Post-run HDF inspection failed: {e}")
-
+        process_completed = (
+            result.returncode == 0 or completion_mode == "semantic_hdf_stable"
+        )
         success = (
-            result.returncode == 0 and "Error:" not in stdout and edge_lines_written
+            process_completed
+            and "Error:" not in stdout
+            and not stderr.lstrip().startswith("Error:")
+            and semantic_validation["success"]
         )
         if not success:
             logger.warning(
                 f"CompleteGeometry did not fully succeed (rc={result.returncode}, "
-                f"edge_lines={edge_lines_written}). stdout: {stdout.strip()[:400]}"
+                f"mode={completion_mode}, semantics="
+                f"{semantic_validation['success']}). stdout: {stdout.strip()[:400]}"
             )
 
         return {
@@ -1586,6 +1935,9 @@ Step 5: Configure (optional — auto-detection usually works)
             "stderr": stderr,
             "edge_lines_written": edge_lines_written,
             "interpolation_surface_written": interp_surface_written,
+            "completion_mode": completion_mode,
+            "semantic_validation": semantic_validation,
+            "owned_process_cleanup": owned_process_cleanup,
             "success": success,
         }
 
@@ -1597,6 +1949,7 @@ Step 5: Configure (optional — auto-detection usually works)
         ras_object=None,
         ras_version: str = None,
         timeout: int = 1800,
+        semantic_stable_seconds: float = 10.0,
     ) -> Dict[str, Any]:
         """Deprecated alias for :meth:`compute_geometry`. Use ``compute_geometry``."""
         warnings.warn(
@@ -1611,6 +1964,7 @@ Step 5: Configure (optional — auto-detection usually works)
             ras_object=ras_object,
             ras_version=ras_version,
             timeout=timeout,
+            semantic_stable_seconds=semantic_stable_seconds,
         )
 
     @staticmethod
@@ -1621,7 +1975,7 @@ Step 5: Configure (optional — auto-detection usually works)
 
         Args:
             plan_number: Plan number (e.g., "01", "06")
-            ras_object: Optional RAS object instance
+            ras_object (RasPrj, optional): Optional RAS object instance
 
         Returns:
             List of timestamp strings in format "DDMMMYYYY HH:MM:SS" (e.g., "10SEP2018 02:30:00")
@@ -1649,6 +2003,7 @@ Step 5: Configure (optional — auto-detection usually works)
                 rasmap_timestamps.append(formatted)
             return rasmap_timestamps
         except Exception as e:
+            reraise_required(e)
             logger.error(f"Failed to get timestamps from {hdf_path}: {e}")
             return []
 
@@ -2032,6 +2387,8 @@ Step 5: Configure (optional — auto-detection usually works)
             ProjectionInfo containing the projection path and every terrain
             raster associated with the rasmap terrain layers.
         """
+        from ._land_classification_helper import resolve_rasmap_relative_path
+
         try:
             rasmap_path = Path(rasmap_path)
             tree = ET.parse(_windows_extended_length_path(rasmap_path))
@@ -2043,10 +2400,12 @@ Step 5: Configure (optional — auto-detection usually works)
             if proj_elem is not None:
                 filename = proj_elem.get("Filename")
                 if filename:
-                    prj_path = rasmap_path.parent / filename.replace(".\\", "").replace(
-                        "./", ""
+                    prj_path = resolve_rasmap_relative_path(
+                        rasmap_path.parent, filename
                     )
-                    if not os.path.exists(_windows_extended_length_path(prj_path)):
+                    if prj_path is None or not os.path.exists(
+                        _windows_extended_length_path(prj_path)
+                    ):
                         prj_path = None
 
             terrain_paths: List[Path] = []
@@ -2055,10 +2414,12 @@ Step 5: Configure (optional — auto-detection usually works)
                     continue
                 filename = layer.get("Filename")
                 if filename:
-                    terrain_hdf = rasmap_path.parent / filename.replace(
-                        ".\\", ""
-                    ).replace("./", "")
-                    if os.path.exists(_windows_extended_length_path(terrain_hdf)):
+                    terrain_hdf = resolve_rasmap_relative_path(
+                        rasmap_path.parent, filename
+                    )
+                    if terrain_hdf is not None and os.path.exists(
+                        _windows_extended_length_path(terrain_hdf)
+                    ):
                         terrain_dir = terrain_hdf.parent
                         layer_tifs = _glob_paths(
                             terrain_dir,
@@ -2282,9 +2643,9 @@ Step 5: Configure (optional — auto-detection usually works)
                         elevation_path = f"{geometry_root}/{name}/{elevation_name}"
                         if wse_path not in hdf or elevation_path not in hdf:
                             continue
-                        wse = np.asarray(hdf[wse_path][()], dtype=np.float64)
+                        wse = np.asarray(read_typed(hdf[wse_path]), dtype=np.float64)
                         elevations = np.asarray(
-                            hdf[elevation_path][()], dtype=np.float64
+                            read_typed(hdf[elevation_path]), dtype=np.float64
                         ).reshape(-1)
                         if wse.ndim > 1:
                             wse = np.nanmax(wse, axis=0)
@@ -2297,6 +2658,7 @@ Step 5: Configure (optional — auto-detection usually works)
                         ):
                             return True
         except Exception as exc:
+            reraise_required(exc)
             logger.debug("Could not audit plan-HDF wet cells: %s", exc)
         return False
 
@@ -2481,13 +2843,173 @@ Step 5: Configure (optional — auto-detection usually works)
                 if "Plan Data" in hdf and "Plan Information" in hdf["Plan Data"]:
                     info = hdf["Plan Data"]["Plan Information"]
                     if "Plan ShortID" in info.attrs:
-                        short_id = info.attrs["Plan ShortID"]
+                        short_id = read_attr(info, "Plan ShortID")
                         if isinstance(short_id, bytes):
                             short_id = short_id.decode("utf-8")
                         return short_id.strip()
         except Exception as e:
+            reraise_required(e)
             logger.debug(f"Could not read Plan ShortID from {hdf_path}: {e}")
         return None
+
+    @staticmethod
+    def _stored_map_display_name(map_type: str) -> str:
+        """Return the canonical display name for one RASMapper map type."""
+        for xml_name, display_name, _ in RasProcess.MAP_TYPES.values():
+            if xml_name == map_type:
+                return display_name
+        return str(map_type).title()
+
+    @staticmethod
+    def _safe_stored_map_profile(profile_name: str) -> str:
+        """Normalize a profile label exactly once for a Windows-safe filename."""
+        return re.sub(r'[<>:"/\\|?*]', "_", str(profile_name)).rstrip(". ")
+
+    @staticmethod
+    def _stored_map_output_filename(
+        *,
+        output_folder: str,
+        display_name: str,
+        profile_name: str,
+        output_mode: str,
+    ) -> str:
+        safe_profile = RasProcess._safe_stored_map_profile(profile_name)
+        extension = ".shp" if "Polygon" in output_mode else ".vrt"
+        return f".\\{output_folder}\\{display_name} ({safe_profile}){extension}"
+
+    @staticmethod
+    def _add_stored_maps_to_rasmap(
+        rasmap_path: Path,
+        plan_hdf_filename: str,
+        output_folder: str,
+        map_specs: Sequence[Dict[str, Any]],
+        *,
+        clear_existing: bool,
+    ) -> List[Dict[str, Any]]:
+        """Configure a stored-map batch in one XML parse/write transaction."""
+        rasmap_path = Path(rasmap_path)
+        tree = ET.parse(_windows_extended_length_path(rasmap_path))
+        root = tree.getroot()
+
+        results_elem = root.find(".//Results")
+        if results_elem is None:
+            results_elem = ET.Element("Results")
+            results_elem.set("Checked", "True")
+            results_elem.set("Expanded", "True")
+            geom_elem = root.find(".//Geometries")
+            if geom_elem is not None and geom_elem in list(root):
+                root.insert(list(root).index(geom_elem) + 1, results_elem)
+            else:
+                root.append(results_elem)
+            logger.debug("Created Results element in rasmap")
+
+        plan_layer = None
+        plan_basename = Path(plan_hdf_filename).name.casefold()
+        for layer in results_elem.findall("Layer"):
+            filename = layer.get("Filename", "")
+            if PureWindowsPath(filename).name.casefold() == plan_basename:
+                plan_layer = layer
+                break
+        if plan_layer is None:
+            plan_layer = ET.SubElement(results_elem, "Layer")
+            plan_layer.set("Name", output_folder)
+            plan_layer.set("Filename", f".\\{plan_hdf_filename}")
+            logger.debug(
+                "Created plan layer '%s' in rasmap for %s",
+                output_folder,
+                plan_hdf_filename,
+            )
+        plan_layer.set("Type", "RASResults")
+        plan_layer.set("Checked", "True")
+        plan_layer.set("Expanded", "True")
+
+        existing_filenames = set()
+        for layer in list(plan_layer.findall("Layer")):
+            if layer.get("Type") != "RASResultsMap":
+                continue
+            parameters = layer.find("MapParameters")
+            if parameters is None or "Stored" not in parameters.get(
+                "OutputMode", ""
+            ):
+                continue
+            if clear_existing:
+                plan_layer.remove(layer)
+            else:
+                stored_filename = parameters.get("StoredFilename", "")
+                if stored_filename:
+                    existing_filenames.add(stored_filename.casefold())
+
+        configured = []
+        batch_filenames = set()
+        for raw_spec in map_specs:
+            spec = dict(raw_spec)
+            map_type = str(spec["map_type"])
+            profile_name = str(spec["profile_name"])
+            profile_index = int(spec["profile_index"])
+            output_mode = str(
+                spec.get("output_mode", "Stored Current Terrain")
+            )
+            display_name = str(
+                spec.get("display_name")
+                or RasProcess._stored_map_display_name(map_type)
+            )
+            output_filename = RasProcess._stored_map_output_filename(
+                output_folder=output_folder,
+                display_name=display_name,
+                profile_name=profile_name,
+                output_mode=output_mode,
+            )
+            filename_key = output_filename.casefold()
+            if filename_key in batch_filenames or filename_key in existing_filenames:
+                raise ValueError(
+                    "Stored-map output filename collision: " + output_filename
+                )
+            batch_filenames.add(filename_key)
+
+            layer_elem = ET.SubElement(plan_layer, "Layer")
+            layer_elem.set("Name", display_name)
+            layer_elem.set("Type", "RASResultsMap")
+            layer_elem.set("Checked", "True")
+            layer_elem.set("Filename", output_filename)
+
+            map_params = ET.SubElement(layer_elem, "MapParameters")
+            map_params.set("MapType", map_type)
+            map_params.set("OutputMode", output_mode)
+            map_params.set("StoredFilename", output_filename)
+            map_params.set("ProfileIndex", str(profile_index))
+            map_params.set("ProfileName", profile_name)
+            for attr_name, attr_value in spec.get("extra_attrs", {}).items():
+                map_params.set(str(attr_name), str(attr_value))
+
+            spec["display_name"] = display_name
+            spec["output_filename"] = output_filename
+            configured.append(spec)
+
+        temporary_path = rasmap_path.with_name(
+            f".{rasmap_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            _write_ras_xml(
+                tree,
+                _windows_extended_length_path(temporary_path),
+                encoding="utf-8",
+                xml_declaration=True,
+            )
+            os.replace(
+                _windows_extended_length_path(temporary_path),
+                _windows_extended_length_path(rasmap_path),
+            )
+        finally:
+            temporary_io = _windows_extended_length_path(temporary_path)
+            if os.path.exists(temporary_io):
+                os.remove(temporary_io)
+
+        logger.debug(
+            "Configured %d stored maps in one rasmap update for %s",
+            len(configured),
+            plan_hdf_filename,
+        )
+        return configured
 
     @staticmethod
     @log_call
@@ -2608,7 +3130,8 @@ Step 5: Configure (optional — auto-detection usually works)
                 map_params.set(attr_name, str(attr_value))
 
             # Write back
-            tree.write(
+            _write_ras_xml(
+                tree,
                 _windows_extended_length_path(rasmap_path),
                 encoding="utf-8",
                 xml_declaration=True,
@@ -2667,7 +3190,8 @@ Step 5: Configure (optional — auto-detection usually works)
                     removed_count += 1
 
             if removed_count > 0:
-                tree.write(
+                _write_ras_xml(
+                    tree,
                     _windows_extended_length_path(rasmap_path),
                     encoding="utf-8",
                     xml_declaration=True,
@@ -3170,6 +3694,30 @@ Step 5: Configure (optional — auto-detection usually works)
         return generated
 
     @staticmethod
+    def _set_rasmap_render_mode(render_mode, ras_obj) -> None:
+        """Write ``render_mode`` to the .rasmap, including any sloping flags.
+
+        Accepts every form the StoreMap helper accepts: a mode name,
+        ``"slopingPretty:<reduce_shallow>:<depth_weighted>"``, or a dict with
+        ``mode`` and optional ``reduce_shallow_to_horizontal`` and
+        ``use_depth_weighted_faces`` keys.
+        """
+        helper_mode = normalize_store_map_render_mode(render_mode)
+        base = render_mode.get("mode", "horizontal") if isinstance(render_mode, dict) else render_mode
+        flags = helper_mode.split(":")[1:]
+        kwargs = {}
+        if flags:
+            kwargs = {
+                "reduce_shallow_to_horizontal": flags[0] == "true",
+                "use_depth_weighted_faces": flags[1] == "true",
+            }
+        RasMap.set_water_surface_render_mode(
+            mode=str(base).strip().split(":")[0],
+            ras_object=ras_obj,
+            **kwargs,
+        )
+
+    @staticmethod
     @_serialize_store_maps
     @log_call
     def store_maps(
@@ -3238,7 +3786,13 @@ Step 5: Configure (optional — auto-detection usually works)
             profile: Profile to map - "Max", "Min", or specific timestamp string
             render_mode: Water surface rendering mode to set before generating
                 maps. Options: "horizontal", "sloping", "slopingPretty".
-                If None (default), uses whatever mode is already in the .rasmap.
+                For slopingPretty, flags can be given as
+                "slopingPretty:<reduce_shallow>:<depth_weighted>" (for example
+                "slopingPretty:true:true" for depth-weighted faces) or as a dict
+                with ``mode``, ``reduce_shallow_to_horizontal`` and
+                ``use_depth_weighted_faces``. The flags are written to the
+                .rasmap. If None (default), uses whatever mode is already in
+                the .rasmap.
             wse: Generate Water Surface Elevation map. Defaults to True for
                 ordinary stored-map generation and False for BenefitArea unless
                 ``BenefitAreaConfig.include_wse`` is True.
@@ -3269,15 +3823,16 @@ Step 5: Configure (optional — auto-detection usually works)
                 BenefitArea raster is calculated.
             clear_existing: Clear existing stored maps before adding new ones (default: True)
             fix_georef: Apply georeferencing fix to output TIFs (default: True)
-            ras_object: Optional RAS object instance
+            ras_object (RasPrj, optional): Optional RAS object instance
             ras_version: Optional specific HEC-RAS mapping-runtime version
             timeout: Command timeout in seconds (default: 600)
             performance: Keyword-only StoreMap execution and resource policy.
                 The default preserves serial StoreAllMaps behavior. Use
                 ``StoreMapPerformanceOptions(max_workers=None)`` for automatic
                 memory- and CPU-bounded map-level parallelism.
-            max_workers, memory_per_worker_mb, reserve_memory_mb: Deprecated
-                keyword-only migration aliases. Do not combine them with
+            max_workers: Deprecated keyword-only worker-count migration alias.
+            memory_per_worker_mb: Deprecated keyword-only per-worker memory alias.
+            reserve_memory_mb: Deprecated keyword-only reserved-memory alias. Do not combine them with
                 ``performance``.
 
         Returns:
@@ -3506,10 +4061,7 @@ Step 5: Configure (optional — auto-detection usually works)
 
             # Set render mode if requested (before modifying stored maps)
             if render_mode is not None:
-                RasMap.set_water_surface_render_mode(
-                    mode=render_mode,
-                    ras_object=ras_obj,
-                )
+                RasProcess._set_rasmap_render_mode(render_mode, ras_obj)
                 logger.debug(f"Set render mode to '{render_mode}' before StoreAllMaps")
 
             # Clear existing stored maps if requested
@@ -4057,6 +4609,572 @@ Step 5: Configure (optional — auto-detection usually works)
                 os.remove(rasmap_backup_path)
 
     @staticmethod
+    def _resolve_steady_profile_selectors(
+        profile_names: Sequence[str],
+        profiles: Optional[
+            Union[str, int, Sequence[Union[str, int]]]
+        ] = None,
+    ) -> List[Tuple[int, str]]:
+        """Resolve exact steady profile names/indexes without fallback."""
+        available = [str(name) for name in profile_names]
+        if not available:
+            raise ValueError("Steady result HDF contains no profiles")
+
+        if profiles is None:
+            requested: List[Union[str, int]] = list(range(len(available)))
+        elif isinstance(profiles, bool):
+            raise ValueError("Boolean values are not valid steady profile indexes")
+        elif isinstance(profiles, (str, int, np.integer)):
+            requested = [profiles]
+        else:
+            requested = list(profiles)
+        if not requested:
+            raise ValueError("At least one steady profile must be selected")
+
+        resolved: List[Tuple[int, str]] = []
+        seen_indexes = set()
+        for selector in requested:
+            if isinstance(selector, bool):
+                raise ValueError(
+                    "Boolean values are not valid steady profile indexes"
+                )
+            if isinstance(selector, (int, np.integer)):
+                selector = int(selector)
+                if selector < 0 or selector >= len(available):
+                    raise ValueError(
+                        f"Steady profile index {selector} is out of range for "
+                        f"{len(available)} profiles"
+                    )
+                index = selector
+            elif isinstance(selector, str):
+                matches = [
+                    index
+                    for index, name in enumerate(available)
+                    if name == selector
+                ]
+                if not matches:
+                    raise ValueError(
+                        f"Steady profile {selector!r} was not found. "
+                        f"Available profiles: {available}"
+                    )
+                if len(matches) > 1:
+                    raise ValueError(
+                        f"Steady profile name {selector!r} is ambiguous at "
+                        f"indexes {matches}; select by zero-based index"
+                    )
+                index = matches[0]
+            else:
+                raise TypeError(
+                    "Steady profile selectors must be exact names or "
+                    f"zero-based integer indexes, got {type(selector).__name__}"
+                )
+            if index in seen_indexes:
+                raise ValueError(
+                    f"Steady profile {available[index]!r} (index {index}) "
+                    "was selected more than once"
+                )
+            seen_indexes.add(index)
+            resolved.append((index, available[index]))
+        return resolved
+
+    @staticmethod
+    def _normalize_steady_map_types(
+        map_types: Union[str, Sequence[str]],
+    ) -> List[str]:
+        """Normalize and validate profile-dependent stored-map products."""
+        supported = {
+            "wse",
+            "depth",
+            "velocity",
+            "froude",
+            "shear_stress",
+            "depth_x_velocity",
+            "depth_x_velocity_sq",
+            "flow",
+        }
+        raw_values = [map_types] if isinstance(map_types, str) else list(map_types)
+        normalized = [
+            str(value).strip().casefold().replace(" ", "_")
+            for value in raw_values
+        ]
+        if not normalized or any(not value for value in normalized):
+            raise ValueError("At least one steady stored-map product is required")
+        unknown = sorted(set(normalized) - supported)
+        if unknown:
+            raise ValueError(
+                "Unsupported steady stored-map products: " + ", ".join(unknown)
+            )
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("Steady stored-map products contain duplicates")
+        return normalized
+
+    @staticmethod
+    @_serialize_store_maps
+    @log_call
+    def store_maps_at_steady_profiles(
+        plan_number: str,
+        profiles: Optional[
+            Union[str, int, Sequence[Union[str, int]]]
+        ] = None,
+        output_path: Union[str, Path] = None,
+        map_types: Union[str, Sequence[str]] = ("depth",),
+        render_mode: str = None,
+        clear_existing: bool = True,
+        fix_georef: bool = True,
+        ras_object=None,
+        ras_version: str = None,
+        timeout: int = 1800,
+        *,
+        terrain_name: Optional[str] = None,
+        inundation_boundary: bool = True,
+        raise_on_missing: bool = True,
+    ) -> pd.DataFrame:
+        """Generate all selected steady-profile maps with one helper launch.
+
+        Profiles are resolved from the result HDF in exact HDF order. ``None``
+        selects every profile; exact names and zero-based indexes may be mixed
+        in a sequence. The request order is preserved and no selector falls
+        back to ``Max``.
+
+        Every profile/product layer is configured in one ``.rasmap`` XML
+        transaction, then aggregate ``StoreAllMaps`` is invoked exactly once.
+        By default, one inundation boundary is also generated for the final
+        selected profile. This means the highest profile for ras2fim's
+        ascending ladders, but no hydraulic ordering is inferred here.
+
+        Args:
+            plan_number: Steady plan number.
+            profiles: ``None``, an exact profile name, zero-based index, or a
+                sequence mixing names and indexes.
+            output_path: Optional destination for all newly generated files.
+            map_types: Profile-dependent product key(s). Defaults to Depth.
+            render_mode: Optional water-surface render-mode override.
+            clear_existing: Remove existing stored-map layers for this plan in
+                the temporary configuration.
+            fix_georef: Apply the existing terrain georeferencing repair to
+                generated TIFF tiles.
+            ras_object (RasPrj, optional): Optional initialized project object.
+            ras_version: Optional installed HEC-RAS mapping-runtime version.
+            timeout: Aggregate helper timeout in seconds.
+            terrain_name: Optional registered RASMapper terrain to select.
+            inundation_boundary: Generate one polygon for the final selected
+                profile. Defaults to True. RASMapper names the polygon
+                ``Inundation Boundary (<profile> Value_<depth>).shp`` (the
+                specified depth is appended); both that and the configured
+                ``Inundation Boundary (<profile>).shp`` name are recognized.
+            raise_on_missing: When True (default), raise
+                :class:`StoredMapProductsIncompleteError` if any requested
+                product is missing after StoreAllMaps. Every product that was
+                generated is moved to ``output_path`` and kept on disk first;
+                the exception's ``frame`` carries the per-product status.
+                When False, return the frame with ``status="missing"`` rows.
+
+        Returns:
+            DataFrame with one row per logical profile/product and stable
+            columns registered as ``steady_profile_stored_maps`` in
+            :mod:`ras_commander.schemas`. ``status`` is ``"generated"`` or
+            ``"missing"``; ``primary_path`` is None for missing products.
+            ``attrs["missing_product_count"]`` counts missing rows.
+
+        Raises:
+            FileNotFoundError: If required project, HDF, mapper, runtime, or
+                terrain files are missing.
+            ValueError: If the plan, selectors, products, or output filenames
+                are invalid or ambiguous.
+            RuntimeError: If StoreAllMaps fails.
+            StoredMapProductsIncompleteError: If ``raise_on_missing`` is True
+                and a requested product is missing from the fresh outputs
+                (a ``RuntimeError`` subclass; generated outputs are preserved).
+            subprocess.TimeoutExpired: If the aggregate StoreAllMaps helper
+                exceeds ``timeout``.
+        """
+        from .hdf.HdfResultsPlan import HdfResultsPlan
+
+        started = time.perf_counter()
+        ras_obj = ras_object or ras
+        ras_obj.check_initialized()
+        plan_num = RasUtils.normalize_ras_number(plan_number)
+
+        hecras_dir = Path(str(ras_obj.ras_exe_path)).parent
+        if not hecras_dir.is_dir():
+            raise FileNotFoundError(f"HEC-RAS directory not found: {hecras_dir}")
+        rasmap_path = RasMap.get_rasmap_path(ras_obj)
+        if rasmap_path is None or not Path(rasmap_path).is_file():
+            raise FileNotFoundError("No .rasmap file found in project folder")
+        rasmap_path = Path(rasmap_path)
+
+        plan_hdf_name = f"{ras_obj.project_name}.p{plan_num}.hdf"
+        plan_hdf_path = ras_obj.project_folder / plan_hdf_name
+        if not plan_hdf_path.is_file():
+            raise FileNotFoundError(f"Plan HDF not found: {plan_hdf_path}")
+        if not HdfResultsPlan.is_steady_plan(plan_hdf_path):
+            raise ValueError(
+                f"Plan {plan_num} does not contain steady results: {plan_hdf_path}"
+            )
+
+        available_profiles = HdfResultsPlan.get_steady_profile_names(plan_hdf_path)
+        selected_profiles = RasProcess._resolve_steady_profile_selectors(
+            available_profiles,
+            profiles,
+        )
+        selected_map_types = RasProcess._normalize_steady_map_types(map_types)
+
+        plan_short_id = RasProcess._get_plan_short_id(plan_hdf_path)
+        if not plan_short_id:
+            plan_rows = ras_obj.plan_df[
+                ras_obj.plan_df["plan_number"].astype(str).eq(plan_num)
+            ]
+            plan_short_id = (
+                str(plan_rows.iloc[0].get("Short Identifier", "")).strip()
+                if not plan_rows.empty
+                else ""
+            )
+        output_folder = plan_short_id or f"Plan_{plan_num}"
+        output_dir = ras_obj.project_folder / output_folder
+
+        extra_attrs = {"Terrain": terrain_name} if terrain_name is not None else {}
+        map_specs: List[Dict[str, Any]] = []
+        for profile_index, profile_name in selected_profiles:
+            for map_key in selected_map_types:
+                xml_name, display_name, _ = RasProcess.MAP_TYPES[map_key]
+                map_specs.append(
+                    {
+                        "map_key": map_key,
+                        "map_type": xml_name,
+                        "display_name": display_name,
+                        "profile_index": profile_index,
+                        "profile_name": profile_name,
+                        "output_mode": "Stored Current Terrain",
+                        "extra_attrs": dict(extra_attrs),
+                    }
+                )
+        if inundation_boundary:
+            boundary_index, boundary_name = selected_profiles[-1]
+            boundary_attrs = {**extra_attrs, "ArrivalDepth": "0"}
+            map_specs.append(
+                {
+                    "map_key": "inundation_boundary",
+                    "map_type": "depth",
+                    "display_name": "Inundation Boundary",
+                    "profile_index": boundary_index,
+                    "profile_name": boundary_name,
+                    "output_mode": "Stored Polygon Specified Depth",
+                    "extra_attrs": boundary_attrs,
+                }
+            )
+
+        # Fail before mutating the rasmap when two selected labels normalize to
+        # the same StoredFilename.
+        requested_filenames = []
+        for spec in map_specs:
+            requested_filenames.append(
+                RasProcess._stored_map_output_filename(
+                    output_folder=output_folder,
+                    display_name=spec["display_name"],
+                    profile_name=spec["profile_name"],
+                    output_mode=spec["output_mode"],
+                )
+            )
+        collision_keys = [name.casefold() for name in requested_filenames]
+        if len(set(collision_keys)) != len(collision_keys):
+            duplicates = sorted(
+                {
+                    name
+                    for name in requested_filenames
+                    if collision_keys.count(name.casefold()) > 1
+                }
+            )
+            raise ValueError(
+                "Steady stored-map output filename collision: "
+                + ", ".join(duplicates)
+            )
+
+        resolved_output_path = None
+        if output_path is not None:
+            resolved_output_path = Path(output_path)
+            if not resolved_output_path.is_absolute():
+                resolved_output_path = RasUtils.safe_resolve(
+                    ras_obj.project_folder / resolved_output_path
+                )
+
+        rasmap_backup = rasmap_path.with_name(
+            f"{rasmap_path.name}.{os.getpid()}.{uuid.uuid4().hex}.bak"
+        )
+        shutil.copy2(
+            _windows_extended_length_path(rasmap_path),
+            _windows_extended_length_path(rasmap_backup),
+        )
+
+        helper_elapsed = 0.0
+        configuration_elapsed = 0.0
+        try:
+            configuration_started = time.perf_counter()
+            configured_specs = RasProcess._add_stored_maps_to_rasmap(
+                rasmap_path,
+                plan_hdf_name,
+                output_folder,
+                map_specs,
+                clear_existing=clear_existing,
+            )
+            configuration_elapsed = time.perf_counter() - configuration_started
+
+            if terrain_name is not None:
+                RasProcess._select_terrain_for_mapping(
+                    rasmap_path,
+                    terrain_name,
+                    ras_object=ras_obj,
+                )
+            if render_mode is not None:
+                RasProcess._set_rasmap_render_mode(render_mode, ras_obj)
+
+            os.makedirs(_windows_extended_length_path(output_dir), exist_ok=True)
+            if resolved_output_path is not None:
+                os.makedirs(
+                    _windows_extended_length_path(resolved_output_path),
+                    exist_ok=True,
+                )
+
+            before = {}
+            for item in _iterdir_paths(output_dir):
+                if not os.path.isfile(_windows_extended_length_path(item)):
+                    continue
+                stat = os.stat(_windows_extended_length_path(item))
+                before[item.name] = (stat.st_mtime_ns, stat.st_size)
+
+            current_mode = render_mode or RasMap.get_water_surface_render_mode(
+                ras_object=ras_obj
+            )
+            helper_mode = normalize_store_map_render_mode(current_mode)
+            effective_ras_version = ras_version or getattr(
+                ras_obj,
+                "ras_version",
+                None,
+            )
+            runtime_provenance = store_maps_runtime_provenance(hecras_dir)
+
+            with RasProcess._mapper_compatible_result_hdf(
+                plan_hdf_path,
+                effective_ras_version,
+            ) as mapper_hdf_path:
+                helper_started = time.perf_counter()
+                result = run_store_all_maps_helper(
+                    hecras_dir=hecras_dir,
+                    render_mode=helper_mode,
+                    rasmap_path=rasmap_path,
+                    result_hdf_path=mapper_hdf_path,
+                    timeout=timeout,
+                    working_dir=ras_obj.project_folder,
+                )
+                helper_elapsed = time.perf_counter() - helper_started
+
+            logger.debug("Steady StoreAllMaps stdout: %s", result.stdout)
+            if result.stderr:
+                logger.debug("Steady StoreAllMaps stderr: %s", result.stderr)
+            if result.returncode != 0:
+                detail = next(
+                    (line.strip() for line in result.stderr.splitlines() if line.strip()),
+                    "",
+                )
+                raise RuntimeError(
+                    f"StoreAllMaps failed for steady plan {plan_num} "
+                    f"(exit code {result.returncode})"
+                    + (f": {detail[:500]}" if detail else "")
+                )
+
+            produced_paths = []
+            for item in _iterdir_paths(output_dir):
+                if not os.path.isfile(_windows_extended_length_path(item)):
+                    continue
+                stat = os.stat(_windows_extended_length_path(item))
+                signature = (stat.st_mtime_ns, stat.st_size)
+                if before.get(item.name) != signature:
+                    produced_paths.append(item)
+
+            if resolved_output_path is not None and os.path.normcase(
+                os.path.abspath(resolved_output_path)
+            ) != os.path.normcase(os.path.abspath(output_dir)):
+                moved_paths = []
+                for item in produced_paths:
+                    if item.name == "PostProcessing.hdf":
+                        continue
+                    destination = resolved_output_path / item.name
+                    destination_io = _windows_extended_length_path(destination)
+                    if os.path.exists(destination_io):
+                        os.remove(destination_io)
+                    shutil.move(
+                        _windows_extended_length_path(item),
+                        destination_io,
+                    )
+                    moved_paths.append(destination)
+                produced_paths = moved_paths
+
+            if fix_georef:
+                tif_paths = [
+                    path
+                    for path in produced_paths
+                    if path.suffix.casefold() in {".tif", ".tiff"}
+                ]
+                if tif_paths:
+                    projection = RasProcess._get_projection_info(rasmap_path)
+                    terrain_paths = projection.terrain_paths
+                    if not terrain_paths and projection.terrain_path is not None:
+                        terrain_paths = (projection.terrain_path,)
+                    for tif_path in tif_paths:
+                        terrain_path = RasProcess._terrain_for_stored_map(
+                            tif_path,
+                            terrain_paths,
+                        )
+                        if terrain_path is None:
+                            logger.warning(
+                                "Could not match steady stored-map TIFF to a "
+                                "terrain; georeferencing was not changed: %s",
+                                tif_path,
+                            )
+                            continue
+                        RasProcess._fix_georeferencing(
+                            tif_path,
+                            projection.prj_path,
+                            terrain_path,
+                        )
+                    readable = {"batch": list(tif_paths)}
+                    RasProcess._drop_unreadable_tifs(readable)
+                    readable_keys = {
+                        os.path.normcase(os.path.abspath(path))
+                        for path in readable["batch"]
+                    }
+                    produced_paths = [
+                        path
+                        for path in produced_paths
+                        if path.suffix.casefold() not in {".tif", ".tiff"}
+                        or os.path.normcase(os.path.abspath(path)) in readable_keys
+                    ]
+
+            produced_paths = sorted(
+                produced_paths,
+                key=lambda path: path.name.casefold(),
+            )
+            rows = []
+            missing_messages: List[str] = []
+            for spec in configured_specs:
+                safe_profile = RasProcess._safe_stored_map_profile(
+                    spec["profile_name"]
+                )
+                # RASMapper appends the specified depth to polygon names, e.g.
+                # "Inundation Boundary (flow_075 Value_0).shp", even though
+                # StoredFilename is "Inundation Boundary (flow_075).shp".
+                filename_pattern = re.compile(
+                    re.escape(f"{spec['display_name']} ({safe_profile}")
+                    + r"(?: Value_[^)]*)?\)",
+                    re.IGNORECASE,
+                )
+                associated = [
+                    path
+                    for path in produced_paths
+                    if filename_pattern.match(path.name)
+                ]
+                is_polygon = "Polygon" in spec["output_mode"]
+                primary_suffix = ".shp" if is_polygon else ".vrt"
+                primary = next(
+                    (
+                        path
+                        for path in associated
+                        if path.suffix.casefold() == primary_suffix
+                    ),
+                    None,
+                )
+                raster_tiles = [
+                    path
+                    for path in associated
+                    if path.suffix.casefold() in {".tif", ".tiff"}
+                ]
+                generated = primary is not None and (is_polygon or bool(raster_tiles))
+                if not generated:
+                    expected = "SHP" if is_polygon else "VRT and TIFF tile(s)"
+                    missing_messages.append(
+                        f"{expected} for {spec['map_key']} profile "
+                        f"{spec['profile_name']!r}"
+                    )
+                rows.append(
+                    {
+                        "plan_number": plan_num,
+                        "result_hdf_path": str(plan_hdf_path.resolve()),
+                        "profile_index": int(spec["profile_index"]),
+                        "profile_name": str(spec["profile_name"]),
+                        "map_type": str(spec["map_key"]),
+                        "output_mode": "polygon" if is_polygon else "raster",
+                        "primary_path": (
+                            str(primary.resolve()) if generated else None
+                        ),
+                        "files": [str(path.resolve()) for path in associated],
+                        "file_count": len(associated),
+                        "status": "generated" if generated else "missing",
+                    }
+                )
+
+            frame = pd.DataFrame(
+                rows,
+                columns=[
+                    "plan_number",
+                    "result_hdf_path",
+                    "profile_index",
+                    "profile_name",
+                    "map_type",
+                    "output_mode",
+                    "primary_path",
+                    "files",
+                    "file_count",
+                    "status",
+                ],
+            )
+            frame.attrs["schema"] = (
+                "ras_commander.steady_profile_stored_maps.v2"
+            )
+            frame.attrs["helper_launch_count"] = 1
+            frame.attrs["elapsed_seconds"] = time.perf_counter() - started
+            frame.attrs["configuration_elapsed_seconds"] = configuration_elapsed
+            frame.attrs["helper_elapsed_seconds"] = helper_elapsed
+            frame.attrs["profile_count"] = len(selected_profiles)
+            frame.attrs["configured_map_count"] = len(configured_specs)
+            frame.attrs["generated_file_count"] = len(produced_paths)
+            frame.attrs["runtime_provenance"] = runtime_provenance
+            frame.attrs["missing_product_count"] = len(missing_messages)
+            if missing_messages:
+                message = (
+                    f"StoreAllMaps did not produce {len(missing_messages)} of "
+                    f"{len(configured_specs)} requested product(s) for steady "
+                    f"plan {plan_num}: " + "; ".join(missing_messages[:10])
+                    + ("; ..." if len(missing_messages) > 10 else "")
+                    + f". {len(configured_specs) - len(missing_messages)} "
+                    "generated product(s) were preserved"
+                    + (
+                        f" in {resolved_output_path}"
+                        if resolved_output_path is not None
+                        else f" in {output_dir}"
+                    )
+                )
+                logger.error(message)
+                if raise_on_missing:
+                    raise StoredMapProductsIncompleteError(message, frame)
+            logger.info(
+                "Steady-profile StoreAllMaps complete: plan=%s; profiles=%d; "
+                "configured_maps=%d; missing=%d; helper_launches=1; files=%d",
+                plan_num,
+                len(selected_profiles),
+                len(configured_specs),
+                len(missing_messages),
+                len(produced_paths),
+            )
+            return frame
+        finally:
+            backup_io = _windows_extended_length_path(rasmap_backup)
+            if os.path.exists(backup_io):
+                shutil.copy2(
+                    backup_io,
+                    _windows_extended_length_path(rasmap_path),
+                )
+                os.remove(backup_io)
+
+    @staticmethod
     @log_call
     def store_maps_at_timesteps(
         plan_number: str,
@@ -4098,14 +5216,24 @@ Step 5: Configure (optional — auto-detection usually works)
                 integer indices, exact RASMapper timestamp strings, or datetimes.
                 If omitted, all available output timesteps are used.
             max_timesteps: Optional cap applied after timestep selection.
-            wse, depth, velocity, froude, shear_stress, depth_x_velocity,
-                depth_x_velocity_sq: Map types to export. Defaults to Depth only.
-            render_mode, clear_existing, fix_georef, ras_object, ras_version,
-                timeout: Passed through to ``store_maps``.
+            wse: Generate WSE maps (default: False).
+            depth: Generate Depth maps (default: True).
+            velocity: Generate Velocity maps (default: False).
+            froude: Generate Froude maps (default: False).
+            shear_stress: Generate Shear Stress maps (default: False).
+            depth_x_velocity: Generate depth-times-velocity maps (default: False).
+            depth_x_velocity_sq: Generate depth-times-velocity-squared maps (default: False).
+            render_mode: Rendering mode passed through to ``store_maps``.
+            clear_existing: Clear existing stored maps, passed to ``store_maps``.
+            fix_georef: Georeferencing fix flag passed to ``store_maps``.
+            ras_object (RasPrj, optional): Project object passed to ``store_maps``.
+            ras_version: Mapping-runtime version passed to ``store_maps``.
+            timeout: Per-call timeout in seconds passed to ``store_maps``.
             performance: StoreMap execution and memory policy for every
                 timestep.
-            max_workers, memory_per_worker_mb, reserve_memory_mb: Deprecated
-                keyword-only migration aliases.
+            max_workers: Deprecated keyword-only worker-count migration alias.
+            memory_per_worker_mb: Deprecated keyword-only per-worker memory alias.
+            reserve_memory_mb: Deprecated keyword-only reserved-memory alias.
 
         Returns:
             Dict keyed by RASMapper timestamp string. Each value is the
@@ -4280,12 +5408,13 @@ Step 5: Configure (optional — auto-detection usually works)
             depth_x_velocity: Generate D*V maps (default: False)
             depth_x_velocity_sq: Generate D*V² maps (default: False)
             fix_georef: Apply georeferencing fix (default: True)
-            ras_object: Optional RAS object instance
+            ras_object (RasPrj, optional): Optional RAS object instance
             ras_version: Optional specific HEC-RAS version
             timeout: Timeout per plan in seconds (default: 1800)
             performance: StoreMap execution and memory policy for every plan.
-            max_workers, memory_per_worker_mb, reserve_memory_mb: Deprecated
-                keyword-only migration aliases.
+            max_workers: Deprecated keyword-only worker-count migration alias.
+            memory_per_worker_mb: Deprecated keyword-only per-worker memory alias.
+            reserve_memory_mb: Deprecated keyword-only reserved-memory alias.
 
         Returns:
             Dict mapping plan numbers to their generated files dict.
@@ -4407,16 +5536,15 @@ Step 5: Configure (optional — auto-detection usually works)
                 temp_dir = wine_config.wine_prefix / "drive_c" / "temp"
                 temp_dir.mkdir(parents=True, exist_ok=True)
                 xml_path = temp_dir / f"rasprocess_cmd_{os.getpid()}.xml"
-                with open(xml_path, "w", encoding="utf-8") as f:
-                    f.write(command_xml)
+                _write_ras_text(xml_path, command_xml, encoding="utf-8")
                 xml_wine_path = RasProcess._linux_to_wine_path(xml_path)
             else:
                 raise RuntimeError("Wine not configured on Linux")
         else:
             f = tempfile.NamedTemporaryFile(
-                mode="w", suffix=".xml", delete=False, encoding="utf-8"
+                mode="w", suffix=".xml", delete=False, encoding="utf-8", newline=""
             )
-            f.write(command_xml)
+            f.write(_normalize_ras_newlines(command_xml))
             f.close()
             xml_path = Path(f.name)
             xml_wine_path = str(xml_path)

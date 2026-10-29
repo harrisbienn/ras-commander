@@ -21,6 +21,7 @@ import pandas as pd
 from scipy.optimize import minimize
 
 from .Decorators import log_call
+from .fast_hdf import reraise_required
 from .LoggingConfig import get_logger
 from .RasCmdr import RasCmdr
 from .RasPermutation import RasPermutation
@@ -452,7 +453,8 @@ def _normalize_steady_wse_frame(
                 profile_names = HdfResultsPlan.get_steady_profile_names(plan_hdf)
                 if len(profile_names) == 1:
                     resolved_profile = profile_names[0]
-            except Exception:
+            except Exception as exc:
+                reraise_required(exc)
                 resolved_profile = None
         result["Profile"] = resolved_profile or "Profile_1"
 
@@ -738,6 +740,7 @@ def _get_reference_dataset(
         if len(dataset.data_vars) > 0:
             return dataset
     except Exception as exc:
+        reraise_required(exc)
         logger.debug(
             "Reference %s getter failed for %s; falling back to internal "
             "helper: %s",
@@ -1612,7 +1615,7 @@ def make_mannings_apply_fn(
             class_name: float(param_row[param_column])
             for param_column, class_name in zone_column_map.items()
         }
-        HdfLandCover.set_landcover_raster_map(
+        HdfLandCover.set_landcover_mannings_n(
             sidecar_path,
             class_mapping,
             ras_object=ras_object,
@@ -1628,11 +1631,15 @@ def make_infiltration_apply_fn(
         Union[Tuple[str, str], List[str], Dict[str, str]],
     ],
     name_column: Optional[str] = None,
+    hecras_version: Optional[str] = None,
 ) -> ApplyFn:
     """
     Factory returning an apply_fn for infiltration base overrides.
 
     parameter_mapping maps permutation column names to target row/field pairs.
+    Native geometry writes resolve the HEC-RAS runtime from
+    ``hecras_version``, then the apply function's ``ras_object``, then the
+    initialized global project.
 
     Example:
         {
@@ -1647,17 +1654,6 @@ def make_infiltration_apply_fn(
         param_row: pd.Series,
         ras_object: Any = None,
     ) -> None:
-        setter = getattr(
-            HdfInfiltration,
-            "set_infiltration_baseoverrides",
-            None,
-        )
-        if setter is None:
-            raise NotImplementedError(
-                "HdfInfiltration.set_infiltration_baseoverrides() is not "
-                "currently implemented in this repository."
-            )
-
         geom_hdf_path = _resolve_geom_hdf_path_from_plan(Path(plan_path))
         infiltration_df = HdfInfiltration.get_infiltration_baseoverrides(
             geom_hdf_path
@@ -1708,7 +1704,12 @@ def make_infiltration_apply_fn(
 
             updated_df.loc[mask, field_name] = float(param_row[param_column])
 
-        setter(geom_hdf_path, updated_df)
+        HdfInfiltration.set_infiltration_base_overrides(
+            geom_hdf_path,
+            updated_df,
+            hecras_version=hecras_version,
+            ras_object=ras_object,
+        )
 
     return apply_fn
 

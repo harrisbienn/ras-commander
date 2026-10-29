@@ -2,6 +2,57 @@
 
 RAS Commander provides three modes for executing HEC-RAS plans, each optimized for different workflows.
 
+## Execution Capabilities and Return Values
+
+| Entry point | Run arrangement | `stream_callback` | `max_runtime` | `verify` | Return |
+|---|---|---|---|---|---|
+| `compute_plan()` | One plan; call in a loop for serial monitoring | Supported | Supported, seconds | Supported | `ComputeResult` |
+| `compute_test_mode()` | Serial plans in a copied project | Not accepted | Not accepted | Supported | `ComputeParallelResult` |
+| `compute_parallel()` | Independent worker folders | Not accepted | Not accepted | Supported | `ComputeParallelResult` |
+
+`ComputeResult` supports existing boolean checks: `bool(result)` is
+`result.success`. Its `completion_verified` is `None` when verification was not
+requested, or a boolean when checked; `results_df_row` can be `None`.
+`execution_details` records available execution and artifact evidence.
+
+`ComputeParallelResult` preserves mapping access (`results[plan]`, `.items()`,
+`.values()`). `bool(results)` only means the mapping has entries; use
+`bool(results) and all(results.values())` to require a nonempty set of successful
+plans. Its `results_df` can be empty, and `execution_details_by_plan` keeps the
+available per-plan evidence. See the [execution API reference](../api/core.md#rascmdr).
+
+Execution success and optional completion verification do not establish hydraulic
+acceptability. Check the selected result family, model diagnostics, and study
+criteria separately. Completion can verify even when later artifact handling
+fails and the overall result reports failure.
+
+## Lean Batch Installation
+
+Batch workers that only need project inventory, plan computation, computation
+messages, and HDF result extraction can install the compute dependency profile:
+
+```bash
+pip install "ras-commander[compute]"
+```
+
+Use the intentionally narrow facade in integration code:
+
+```python
+from ras_commander.compute import (
+    HdfResultsPlan,
+    RasCmdr,
+    ResultsParser,
+    init_ras_project,
+)
+```
+
+This facade does not export `RasControl` or `RasControlResult`. Call
+`RasCmdr.compute_plan()` rather than constructing a `Ras.exe -c` command in the
+integrating application. The method retains normal ras-commander behavior:
+command construction, process and dialog supervision, compute-message handling,
+caller-controlled semantic verification, and post-compute project/result
+DataFrame refresh.
+
 ## Single Plan Execution
 
 Execute one plan with full parameter control using `RasCmdr.compute_plan()`.
@@ -40,6 +91,7 @@ no completion or hydraulic acceptance.
 | `clear_geompre` | bool | Clear geometry preprocessor files first |
 | `num_cores` | int | Number of CPU cores to use |
 | `overwrite_dest` | bool | Overwrite destination if exists |
+| `max_runtime` | float/None | Optional positive finite execution limit in seconds |
 
 ### Examples
 
@@ -57,6 +109,90 @@ success = RasCmdr.compute_plan(
 # Force geometry preprocessing
 success = RasCmdr.compute_plan("01", clear_geompre=True)
 ```
+
+### Bounded Execution and Launch Evidence
+
+`max_runtime` is an additive execution-safety option for direct
+`RasCmdr.compute_plan()` runs. Supply a positive finite number of seconds when
+the caller needs a hard plan-specific engine deadline:
+
+```python
+result = RasCmdr.compute_plan(
+    "01",
+    force_rerun=True,
+    verify=True,
+    max_runtime=900,
+)
+
+details = result.execution_details
+if details["runtime_timed_out"]:
+    print(details["failure_stage"], details["cancellation_details"])
+```
+
+Boolean values, strings, zero, negative values, NaN, infinity, and values above
+4,294,967.294 seconds are rejected before project access or execution begins.
+The upper limit keeps the value representable by the Windows subprocess wait
+API. An explicit value establishes one monotonic engine deadline immediately
+before `Ras.exe` launch, after executable proof, process preflight, and
+result-artifact preparation. The remaining budget is shared by compute-message
+callback monitoring, the direct launcher wait, asynchronous solver completion,
+and exact-plan quiescence confirmation; each phase does not receive a fresh
+timeout.
+
+`max_runtime=None` is the compatibility default. It does not add a deadline to
+the direct `Ras.exe` launcher wait. The existing 7,200-second bound for an
+asynchronous `RasUnsteady.exe` solver that outlives its launcher remains in
+place.
+
+When an explicit deadline expires, ras-commander records the timeout and calls
+only `RasCmdr.cancel_plan_exact()` for that initialized project and plan. It
+does not fall back to a process-name kill. Opposing result-family artifacts are
+finalized only when the structured cancellation or final process inspection
+positively confirms exact-plan quiescence. An uncertain cancellation therefore
+returns a failed `ComputeResult` and leaves potentially active artifacts
+untouched. Exact-plan cancellation and terminal evidence collection can extend
+the method's wall-clock return time beyond `max_runtime`; the deadline limits
+the engine attempt, not the safety work needed to prove what remains running.
+
+Plan-specific cancellation currently has qualified command signatures for the
+core steady and unsteady launchers/solvers. Sediment, quasi-unsteady, and
+water-quality engines are inventoried and make quiescence fail closed when they
+can be linked to the plan, but they are not signalled until their exact native
+command signatures are qualified. A timeout involving one of these engines can
+therefore return an uncertain, failed cancellation while leaving the process
+running for manual review.
+
+`ComputeResult.execution_details` provides JSON-safe audit evidence, including:
+
+- `max_runtime_seconds` and `runtime_timed_out`;
+- `launch_details`, with the exact command, working directory, executable path
+  and SHA-256, project and plan paths, and launcher PID/create-time identity;
+- `launcher_returncode`, which can remain nonzero when a delegated modern solver
+  nevertheless produces a verified final HDF;
+- `failure_stage`, `failure_type`, and `failure_detail`;
+- structured `cancellation_details`, including tri-state quiescence evidence;
+  and
+- `artifact_preparation_cleanup` and `artifact_finalization_cleanup`, which
+  report the exact removed and already-missing target paths before and after
+  execution; and
+- `result_artifacts_finalized` plus `artifact_finalization_failure`, which keep
+  a cleanup defect separate from an earlier timeout or execution failure.
+
+Within either cleanup record, `result_format` is the result family targeted for
+deletion—the opposing family—not the run's selected output format. On a
+successful cleanup, `removed_paths` and `missing_paths` are disjoint and their
+union is the complete plan-scoped target set. Both cleanup fields are `None`
+when calculation is skipped before cleanup.
+
+`completion_verified` is independent of overall `ComputeResult.success`. For
+example, a complete HDF may verify and then result-family finalization may fail;
+that outcome is `success=False`, `completion_verified=True`, and remains safe to
+inspect as a failed execution receipt when exact-plan quiescence is proven.
+
+Advanced supervisors can implement the optional duck-typed
+`on_exec_launched(plan_number, launch_details)` callback to persist the launch
+identity immediately after it is captured. This additive hook does not change
+the exported `ExecutionCallback` protocol.
 
 ## Sequential Execution
 
@@ -168,8 +304,8 @@ new_plan = RasPlan.clone_plan("01", new_plan_shortid="Modified Run")
 
 # Change parameters
 RasPlan.set_num_cores(new_plan, 4)
-RasPlan.set_computation_interval(new_plan, "5MIN")
-RasPlan.set_description(new_plan, "Run with finer timestep")
+RasPlan.update_plan_intervals(new_plan, computation_interval="5MIN")
+RasPlan.update_plan_description(new_plan, "Run with finer timestep")
 
 # Execute modified plan
 success = RasCmdr.compute_plan(new_plan)
@@ -213,6 +349,164 @@ Use `RasFlowOptimization.get_settings()` to audit an existing plan and `RasFlowO
 ## Checking Results
 
 After execution, verify results were generated and the run completed without errors. This is critical for determining if the simulation succeeded.
+
+### Structured Mechanical Evidence
+
+Use `inspect_execution_evidence()` when automation must distinguish an
+inspected false value from an unavailable, uninspected, or unreadable channel.
+The method is read-only: it does not run HEC-RAS, preprocess the plan, or open
+the legacy COM controller.
+
+```python
+from ras_commander import RasCmdr
+
+evidence = RasCmdr.inspect_execution_evidence(
+    "01",
+    ras_object=ras,
+    hash_files=True,
+)
+
+completion = evidence.mechanical_completion
+print(completion.state, completion.value, completion.reason_code)
+
+errors = evidence.observations["message_error_count"]
+print(errors.state, errors.value, errors.source_locator)
+```
+
+The four observation states have distinct meanings:
+
+- `available` means inspection produced a value, including `False` or zero.
+- `not_available_in_version` is used only for a positively established
+  producer-version limitation.
+- `not_inspected` means no trustworthy observation was possible or requested.
+- `failed` means inspection was attempted but the source was unreadable,
+  malformed, unstable, or contradictory.
+
+If `result_modified_after` is supplied, pass a timezone-aware `datetime` so
+the freshness comparison is reproducible across machines. Message-health
+counts prefer embedded HDF messages and fall back to stored messages; the two
+completion-message observations remain separate.
+
+Result-family selection reads `Program Version=` from the current `.p##` bytes,
+not from cached `plan_df` metadata. When only one result family exists, that
+artifact is selected even if its family differs from the declaration; the
+evidence records `unexpected_result_format`. This supports a copied legacy plan
+that was cleanly rerun by a newer engine without rewriting its declaration.
+
+When both `.p##.hdf` and `.O##` exist, the inspector applies stricter rules:
+
+| Plan declaration | Selection |
+|---|---|
+| HEC-RAS 5 or newer, `.O##` timestamp after HDF | Raise `ResultArtifactAmbiguityError`. |
+| HEC-RAS 5 or newer, `.O##` timestamp equal to or before HDF | Select HDF, warn, and record `multiple_result_formats_present`. Legacy output does not contribute to the selected evidence. |
+| HEC-RAS 4 or older, HDF timestamp after `.O##` | Raise `ResultArtifactAmbiguityError`. The timestamp is only a conservative ambiguity trigger, not proof of run chronology. |
+| HEC-RAS 4 or older, HDF timestamp equal to or before `.O##` | Select `.O##`, warn, and record `multiple_result_formats_present`. HDF completion and runtime do not contribute to the selected evidence. |
+| Missing or unreadable declaration | Raise `ResultArtifactAmbiguityError`. |
+
+```mermaid
+flowchart TD
+    A["Inspect existing project"] --> B{"Both HDF and .O##?"}
+    B -- "No" --> C["Read sole existing format<br/>record a conflict if unexpected"]
+    B -- "Yes" --> D{"Declared plan family"}
+    D -- "HEC-RAS 5+" --> E{"HDF mtime >= .O## mtime?"}
+    E -- "Yes" --> F["Select HDF<br/>warn about ignored .O##"]
+    E -- "No" --> G["Raise ResultArtifactAmbiguityError"]
+    D -- "HEC-RAS 4 or older" --> H{".O## mtime >= HDF mtime?"}
+    H -- "Yes" --> I["Select .O##<br/>warn about ignored HDF"]
+    H -- "No" --> G
+    D -- "Unresolved" --> G
+```
+
+Copied-folder timestamps can be misleading. The error therefore asks the user
+to resolve the formats rather than claiming which computation is newest.
+
+An actual ras-commander computation does not use those timestamps to decide
+what to remove. It normalizes artifacts using the selected HEC-RAS executable
+or controller, not the plan declaration: HEC-RAS 5+ runs preserve HDF and
+remove `.O##`; legacy runs preserve `.O##` and remove the plan HDF. Cleanup is
+coupled to the real launch after skip decisions, plan preparation, callbacks,
+watchdog startup, and log creation have succeeded. It runs again after every
+launched attempt once solver completion or termination is confirmed, because
+modern HEC-RAS 1D engines recreate `.O##` during computation. If solver
+quiescence cannot be confirmed, the run fails and leaves the opposing artifact
+visible rather than racing an active writer. Remote PsExec staging is also
+retained when completion is unconfirmed. Skipped runs do not change plan bytes
+or delete result artifacts.
+
+```mermaid
+flowchart TD
+    A["Resolve selected executable or controller"] --> B{"Engine family reliable?"}
+    B -- "No or conflicting" --> C["Fail without deleting results"]
+    B -- "Yes" --> D{"Skip calculation?"}
+    D -- "Yes" --> E["Return without changing<br/>plan bytes or results"]
+    D -- "No" --> F["Finish plan preparation,<br/>callbacks, watchdog, and log setup"]
+    F --> G{"Selected engine family"}
+    G -- "HEC-RAS 5+" --> H["Remove exact .O##<br/>and stale messages"]
+    G -- "HEC-RAS 3-4" --> I["Remove exact plan HDF<br/>and stale messages"]
+    H --> J["Launch calculation"]
+    I --> J
+    J --> K["Wait for launcher, solver children,<br/>and temporary HDF state"]
+    K --> L{"Solver quiescence confirmed?"}
+    L -- "No" --> M["Fail and preserve visible conflict<br/>and remote staging"]
+    L -- "Yes" --> N["Remove any opposing result<br/>recreated during execution"]
+    N --> O["Return normalized result set"]
+```
+
+For command-line execution, a versioned `ras_exe_path` is authoritative and
+`ras_version` is the fallback for an unversioned executable name. If both are
+resolvable but imply different result families, automatic cleanup fails closed
+without deleting either family. `RasControl.run_plan()` instead follows the
+version of the selected COM controller. An unversioned `Ras.exe` path with no
+resolvable version is not assumed to be modern, because that guess could
+permanently remove a valid legacy result.
+
+This automatic normalization belongs to full plan-calculation APIs.
+`RasPreprocess.preprocess_plan()` and
+`GeomPreprocessor.run_geometry_preprocessor()` are preflight/preprocessing
+operations. `GeomPreprocessor.run_geometry_preprocessor()` disables hydraulic
+run flags by default and waits for normal process completion; diagnostic
+messages never authorize early termination. With `geometry_only=False`, it
+waits for all enabled plan work. See its [completion contract](../api/geometry.md#geompreprocessor-source-reference).
+Neither operation normalizes an ambiguous final-result family.
+
+To resolve an existing project manually, explicitly select the family to
+remove:
+
+```python
+from ras_commander import RasCmdr
+
+# Permanent, exact plan-scoped removal. Geometry HDF, DSS, terrain, and
+# .p##.tmp.hdf preprocessing files are never included.
+cleanup = RasCmdr.remove_plan_execution_artifacts(
+    "01",
+    result_format="legacy",  # or "hdf" / "both"
+    include_message_sidecars=False,
+    ras_object=ras,
+)
+print(cleanup.removed_paths)
+```
+
+The helper validates its complete, project-contained target list before the
+first deletion. If an operating-system error occurs during deletion,
+`PlanExecutionCleanupError.cleanup` records any paths already removed and
+`failed_path` identifies the file that could not be removed.
+
+Alternatively, rerun with the intended HEC-RAS version through
+`RasCmdr.compute_plan()` or `RasControl.run_plan()`; the execution path removes
+the opposing result family and stale compute-message sidecars.
+
+Mechanical completion is deliberately independent from message errors,
+warnings, result freshness, volume accounting, convergence quality, and
+hydraulic acceptance. Review those observations separately.
+
+For native Linux unsteady runs, an HDF `Event Conditions` completion attribute
+can be inherited from the prepared `.tmp.hdf`. An `available / True`
+observation from that attribute describes the file; it does not establish that
+the subsequent native calculation finished. Native results may also omit the
+Windows `Complete Process` message. Use the native execution API's solver-log
+and populated-result checks, then verify the requested output time window,
+array dimensions, and finite values. Keep the structured observations alongside
+these checks rather than using the inherited attribute as the acceptance gate.
 
 ### Quick Verification
 
@@ -392,7 +686,6 @@ from ras_commander.callbacks import (
     ConsoleCallback,      # Print to console
     FileLoggerCallback,   # Log to file
     ProgressBarCallback,  # Show progress bar (requires tqdm)
-    SynchronizedCallback  # Thread-safe wrapper for parallel execution
 )
 
 # Console callback
@@ -413,13 +706,12 @@ Create custom callbacks for specialized monitoring:
 from ras_commander.callbacks import ExecutionCallback
 
 class ErrorDetectionCallback(ExecutionCallback):
-    """Callback that stops execution on first error."""
+    """Print messages containing error or warning keywords for review."""
 
-    def on_exec_message(self, message):
+    def on_exec_message(self, plan_number, message):
         # Check for error keywords
         if any(kw in message.upper() for kw in ['ERROR', 'FAILED', 'UNSTABLE']):
             print(f"❌ ERROR DETECTED: {message}")
-            # Could raise exception, send alert, etc.
         elif 'warning' in message.lower():
             print(f"⚠ WARNING: {message}")
         else:
@@ -432,46 +724,49 @@ RasCmdr.compute_plan("01", stream_callback=ErrorDetectionCallback())
 
 ### Callback Methods
 
-Custom callbacks can implement these methods:
+Custom callbacks can implement the hooks they need. Prep hooks bracket plan
+setup (including requested preprocessor-file clearing and core settings), not
+the engine's full geometry preprocessing. Message callbacks are notifications;
+printing an error does not stop computation or establish result validity.
 
 ```python
+from ras_commander.callbacks import ExecutionCallback
+
 class MyCallback(ExecutionCallback):
-    def on_start(self, plan_number):
-        """Called when execution starts."""
-        print(f"Starting plan {plan_number}")
+    def on_prep_start(self, plan_number):
+        print(f"Preparing plan {plan_number}")
 
-    def on_exec_message(self, message):
-        """Called for each HEC-RAS message during execution."""
-        print(f"HEC-RAS: {message}")
+    def on_prep_complete(self, plan_number):
+        print(f"Plan {plan_number} setup complete")
 
-    def on_complete(self, success):
-        """Called when execution completes."""
-        if success:
-            print("✓ Execution completed successfully")
-        else:
-            print("✗ Execution failed")
+    def on_exec_start(self, plan_number, command):
+        print(f"Launching plan {plan_number}")
 
-    def on_error(self, error):
-        """Called if exception occurs."""
-        print(f"Exception: {error}")
+    def on_exec_message(self, plan_number, message):
+        print(f"Plan {plan_number}: {message}")
+
+    def on_exec_complete(self, plan_number, success, duration):
+        print(f"Plan {plan_number}: success={success}, duration={duration:.1f}s")
+
+    def on_verify_result(self, plan_number, verified):
+        # Called for completion verification when verify=True
+        print(f"Plan {plan_number}: completion verified={verified}")
 ```
 
-### Parallel Execution with Callbacks
+### Monitor Several Plans Serially
 
-Use `SynchronizedCallback` wrapper for thread-safe logging:
+`compute_parallel()` and `compute_test_mode()` do not accept `stream_callback`.
+`SynchronizedCallback` can protect a callback shared by caller-managed threads,
+but does not add a parameter to either API. For monitored serial execution:
 
 ```python
-from ras_commander.callbacks import ConsoleCallback, SynchronizedCallback
+from ras_commander import RasCmdr
+from ras_commander.callbacks import ConsoleCallback
 
-# Wrap callback for thread safety
-safe_callback = SynchronizedCallback(ConsoleCallback(verbose=True))
-
-# Use with parallel execution
-results = RasCmdr.compute_parallel(
-    plan_number=["01", "02", "03"],
-    max_workers=3,
-    stream_callback=safe_callback  # Thread-safe logging
-)
+callback = ConsoleCallback(verbose=True)
+for plan in ["01", "02", "03"]:
+    result = RasCmdr.compute_plan(plan, stream_callback=callback, verify=True)
+    print(plan, result.success, result.completion_verified)
 ```
 
 ### Post-Execution Message Review
@@ -575,3 +870,21 @@ last unsteady output timestamps exactly match the workspace simulation window.
 The artifact records each check separately, including any HDF inspection
 error. This execution status is intentionally not a hydraulic acceptance
 decision.
+
+## Per-plan execution limits
+
+`RasCmdr.compute_parallel(..., max_runtime=3600)` forwards one deadline per plan
+to `compute_plan`. The clock starts at engine launch and excludes project copying
+and preprocessing. `None` preserves existing limits. Plans assigned to one worker
+project run sequentially; different workers remain concurrent.
+
+Timeouts use exact-plan cancellation. If quiescence cannot be confirmed, that
+worker's remaining plans are not attempted and its artifacts are not published.
+Timeout worker folders and diagnostics are retained even when cancellation is
+confirmed; successful sibling plans can still be published. Inspect
+`execution_details_by_plan` for cancellation evidence and recovery paths.
+
+`RasPermutation.execute_and_summarize(timeout_sec=...)` and
+`RasMonteCarlo.run_ensemble(timeout_sec=...)` forward this local limit. Remote
+worker overrides are rejected explicitly; configure their separate worker
+runtime policy instead.

@@ -21,6 +21,7 @@ import pandas as pd
 
 from .Decorators import log_call
 from .LoggingConfig import get_logger
+from ._ras_text import _write_ras_text
 
 
 logger = get_logger(__name__)
@@ -158,13 +159,7 @@ class RasPermutation:
             for line in lines
         ]
 
-        with open(
-            file_path,
-            "w",
-            encoding="utf-8",
-            newline="",
-        ) as handle:
-            handle.writelines(normalized_lines)
+        _write_ras_text(file_path, "".join(normalized_lines), encoding="utf-8")
 
         if not RasPermutation._has_crlf_only(file_path):
             raise RuntimeError(
@@ -385,6 +380,18 @@ class RasPermutation:
         )
 
     @staticmethod
+    def _rows_for_plans(results_df: pd.DataFrame, plan_numbers) -> pd.DataFrame:
+        """Return the results rows for ``plan_numbers``.
+
+        A results frame without a ``plan_number`` column (for example, when
+        every plan in the batch failed) yields an empty frame, so the batch is
+        reported per permutation instead of raising ``KeyError``.
+        """
+        if results_df is None or "plan_number" not in results_df.columns:
+            return pd.DataFrame()
+        return results_df[results_df["plan_number"].isin(plan_numbers)].copy()
+
+    @staticmethod
     def _derive_status(
         summary_row: pd.Series,
         execution_success: Optional[bool],
@@ -427,6 +434,9 @@ class RasPermutation:
                 if values.notna().any():
                     return float(values.max())
         except Exception as exc:
+            from .fast_hdf import reraise_required
+
+            reraise_required(exc)
             logger.debug(
                 "1D max WSE extraction failed for %s: %s",
                 hdf_path,
@@ -434,7 +444,7 @@ class RasPermutation:
             )
 
         try:
-            mesh_gdf = HdfResultsMesh.get_mesh_max_ws(hdf_path)
+            mesh_gdf = HdfResultsMesh.get_mesh_max_ws(hdf_path, include_geometry=False)
             if (
                 not mesh_gdf.empty
                 and "maximum_water_surface" in mesh_gdf.columns
@@ -446,6 +456,9 @@ class RasPermutation:
                 if values.notna().any():
                     return float(values.max())
         except Exception as exc:
+            from .fast_hdf import reraise_required
+
+            reraise_required(exc)
             logger.debug(
                 "2D max WSE extraction failed for %s: %s",
                 hdf_path,
@@ -515,7 +528,7 @@ class RasPermutation:
         Generate plan permutations from a template plan.
         """
         from .RasPlan import RasPlan
-        from .RasPrj import RasPrj, init_ras_project, ras
+        from .RasPrj import RasPrj, _matching_copied_prj_file, init_ras_project, ras
         from .RasUtils import RasUtils
 
         if not callable(apply_fn):
@@ -596,8 +609,11 @@ class RasPermutation:
             )
 
             batch_ras = RasPrj()
+            batch_prj = _matching_copied_prj_file(
+                batch_folder, getattr(source_ras, "prj_file", None)
+            )
             init_ras_project(
-                batch_folder,
+                batch_prj or batch_folder,
                 getattr(source_ras, "ras_exe_path", None),
                 ras_object=batch_ras,
                 load_results_summary=False,
@@ -756,7 +772,7 @@ class RasPermutation:
         max_workers: int = 2,
         num_cores: int = 2,
         ras_object: Any = None,
-        timeout_sec: Optional[int] = None,
+        timeout_sec: Optional[float] = None,
         clear_geompre: bool = False,
         force_geompre: bool = False,
         workers: Optional[List[Any]] = None,
@@ -769,10 +785,10 @@ class RasPermutation:
             max_workers: Maximum parallel worker count (local execution).
             num_cores: HEC-RAS core count per plan execution.
             ras_object: Optional project object for multi-project workflows.
-            timeout_sec: Optional per-plan timeout in seconds. NOTE: per-plan
-                timeout is not yet supported by RasCmdr.compute_parallel() on the
-                current Windows execution path; when set it is logged and ignored
-                (tracked as a follow-up). The ensemble still runs to completion.
+            timeout_sec: Optional per-plan engine-execution deadline in seconds,
+                forwarded as compute_parallel(max_runtime=...). Setup and
+                preprocessing are excluded. Remote workers do not yet support
+                this override and reject it rather than silently ignoring it.
             clear_geompre: Clear .c## preprocessor files before execution.
             force_geompre: Force full geometry preprocessing before execution.
             workers: Optional list of remote worker objects from
@@ -781,7 +797,7 @@ class RasPermutation:
                 instead of local compute_parallel().
         """
         from .RasCmdr import RasCmdr
-        from .RasPrj import RasPrj, init_ras_project, ras
+        from .RasPrj import RasPrj, _matching_copied_prj_file, init_ras_project, ras
 
         if "master_log" not in plan_matrix:
             raise ValueError("plan_matrix must contain a 'master_log' entry")
@@ -796,6 +812,9 @@ class RasPermutation:
         ras_exe_path = getattr(source_ras, "ras_exe_path", None)
 
         use_remote = workers is not None and len(workers) > 0
+        timeout_sec = RasCmdr._normalize_max_runtime(timeout_sec)
+        if use_remote and timeout_sec is not None:
+            raise ValueError("timeout_sec is not supported for remote workers; configure worker runtime limits instead")
 
         batch_results: List[pd.DataFrame] = []
         for batch_folder in plan_matrix["batch_folders"]:
@@ -811,8 +830,11 @@ class RasPermutation:
             )
 
             batch_ras = RasPrj()
+            batch_prj = _matching_copied_prj_file(
+                batch_folder, getattr(source_ras, "prj_file", None)
+            )
             init_ras_project(
-                batch_folder,
+                batch_prj or batch_folder,
                 ras_exe_path,
                 ras_object=batch_ras,
                 load_results_summary=False,
@@ -838,18 +860,11 @@ class RasPermutation:
                     for plan_num, er in remote_results.items()
                 }
 
-                summary_df = batch_ras.update_results_df(plan_numbers=plan_numbers)
-                summary_df = summary_df[
-                    summary_df["plan_number"].isin(plan_numbers)
-                ].copy()
+                summary_df = RasPermutation._rows_for_plans(
+                    batch_ras.update_results_df(plan_numbers=plan_numbers),
+                    plan_numbers,
+                )
             else:
-                if timeout_sec is not None:
-                    logger.warning(
-                        "timeout_sec=%s ignored: per-plan timeout is not yet supported "
-                        "by RasCmdr.compute_parallel(); the ensemble runs without a "
-                        "per-plan timeout (tracked as a follow-up).",
-                        timeout_sec,
-                    )
                 compute_result = RasCmdr.compute_parallel(
                     plan_number=plan_numbers,
                     max_workers=max_workers,
@@ -857,16 +872,17 @@ class RasPermutation:
                     ras_object=batch_ras,
                     clear_geompre=clear_geompre,
                     force_geompre=force_geompre,
+                    **({"max_runtime": timeout_sec} if timeout_sec is not None else {}),
                 )
 
                 execution_success_map = compute_result.execution_results
 
                 summary_df = compute_result.results_df.copy()
                 if summary_df.empty:
-                    summary_df = batch_ras.update_results_df(plan_numbers=plan_numbers)
-                    summary_df = summary_df[
-                        summary_df["plan_number"].isin(plan_numbers)
-                    ].copy()
+                    summary_df = RasPermutation._rows_for_plans(
+                        batch_ras.update_results_df(plan_numbers=plan_numbers),
+                        plan_numbers,
+                    )
 
             if summary_df.empty:
                 batch_summary = batch_log_df[
