@@ -24,10 +24,20 @@ stable. Upstream square raster grids and physical-cell filtering can change
 pixels relative to older exports; compare and accept derivatives before
 replacing published products. Source HDF files remain read only.
 
+The candidate `result-footprint` contains per-mesh 2D flow-area polygons in
+WGS84. Earlier fork exports unioned the project 1D river and 2D areas in the
+project CRS. These are different spatial scopes: a 2D raster support polygon
+does not describe the whole coupled 1D/2D response. Consumers that previously
+used the asset for full response coverage need an explicit migration before
+adoption. Hydrograph coverage does not expand the raster footprint.
+
 The historical direct-path `RasUnsteady.delete_boundary()` interface is rejected;
 use an owned stage and exact inventory evidence. Land-cover edits require the
 native writer's explicit HEC-RAS version or initialized project context. Legacy
 study scripts that omit this context need migration before using the candidate.
+Native Manning edits verify class identities and unrequested parameters after
+saving; a mismatch restores the sidecar and native backup. This postcondition
+does not reinstate the legacy raw-HDF writer or qualify a new installed runtime.
 Model execution and engineering acceptance remain separate gates.
 
 ## Worker contract

@@ -387,6 +387,43 @@ payload is `GridData` plus a `GridInfo` subclass. ras-commander writes via
 `GriddedData.storeGriddedData()` because that route is stable from pyjnius for
 the bundled HEC Monolith version.
 
+## Windows JVM diagnostics during tests
+
+With Python's fault handler enabled, a Windows process can print
+`Windows fatal exception: access violation` for an exception subsequently
+handled by the JVM. CPython's Windows handler prints the traceback and returns
+control to the next exception handler; the message alone does not establish
+that the process crashed. See the [CPython 3.12.10 implementation](https://github.com/python/cpython/blob/v3.12.10/Modules/faulthandler.c#L334-L375)
+and [Oracle's Windows exception-handling description](https://docs.oracle.com/javase/8/docs/technotes/guides/troubleshoot/signals004.html).
+
+An isolated Windows/Python 3.12.10/OpenJDK 11.0.6 investigation attributed two
+observed cases to the JVM's generated CPU-information probe and a safepoint
+poll. The latter's exception address matched the JVM safepoint log. Synthetic
+DSS assertions passed and the process continued with fault reporting enabled.
+This finding applies to those attributed events, not every access violation.
+
+For a fresh diagnostic process, configure logging before the first Java import:
+
+```python
+import faulthandler
+import jnius_config
+
+faulthandler.enable()
+jnius_config.add_options(
+    "-XX:+UnlockDiagnosticVMOptions",
+    "-XX:+PrintStubCode",
+    "-Xlog:safepoint=debug",
+)
+# Run the isolated reproduction using RasDss after setting these options.
+```
+
+These options were exercised with OpenJDK 11.0.6. Preserve stdout/stderr,
+exit status, native runtime identity and data readback checks. Attribute the
+exception address to the JVM event before accepting it as handled. Do not
+disable the fault handler, suppress stderr or treat exit 0 as sufficient
+evidence. Unknown exceptions, damaged outputs or a nonzero exit remain failures.
+The library does not change JVM options or exception handlers automatically.
+
 ## Supported Features
 
 | Feature | Status |
