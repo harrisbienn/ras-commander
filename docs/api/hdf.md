@@ -663,9 +663,19 @@ The output directory must not already exist. Stable assets are:
 - `hydraulic-hydrographs.parquet`
 - `result-metadata.json`
 - `numerical-qaqc.json`
-- `result-footprint.geojson`
+- `result-footprint.geojson` (full coupled model domain, WGS84)
+- `raster-support.geojson` (per-mesh 2D support, WGS84)
 - `maximum-depth-preview.png`, when the renderer is available
 - `hydraulic-products.json`
+
+`hydraulic-products.json` uses
+`ras-commander/hydraulic-product-manifest/2.0`. The result footprint unions
+1D river, 2D flow-area and storage-area polygons; it does not represent wet
+extent. The separate raster-support asset declares the area used for 2D raster
+sampling. Each raster references that asset through `support_asset`. Invalid or
+incomplete declared 1D/storage geometry fails export before a terminal manifest
+is published. Historical version 1 packages retain their original identities;
+consumers must explicitly migrate to read version 2.
 
 The three rasters are Cloud Optimized GeoTIFFs on one grid and carry CRS,
 bounds, shape, transform, nodata, units, statistics, checksums, and sizes in

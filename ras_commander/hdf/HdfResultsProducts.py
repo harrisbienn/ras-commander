@@ -83,7 +83,7 @@ def _frame_records(frame: pd.DataFrame | None) -> list[dict[str, Any]]:
 class HdfResultsProducts:
     """Static namespace for deterministic hydraulic product packages."""
 
-    SCHEMA = "ras-commander/hydraulic-product-manifest/1.0"
+    SCHEMA = "ras-commander/hydraulic-product-manifest/2.0"
     INSPECTION_SCHEMA = "ras-commander/hydraulic-result-inspection/1.0"
     FILENAMES = {
         "maximum-wse": "maximum-wse.tif",
@@ -93,6 +93,7 @@ class HdfResultsProducts:
         "result-metadata": "result-metadata.json",
         "numerical-qaqc": "numerical-qaqc.json",
         "result-footprint": "result-footprint.geojson",
+        "raster-support": "raster-support.geojson",
         "preview": "maximum-depth-preview.png",
     }
     MANIFEST_FILENAME = "hydraulic-products.json"
@@ -392,6 +393,8 @@ class HdfResultsProducts:
         if CRS.from_user_input(mesh_areas.crs) != expected_crs:
             raise ValueError("2D mesh footprint CRS differs from inspected CRS")
         bbox = tuple(float(value) for value in mesh_areas.total_bounds)
+        response_areas = _ProductRenderers.response_areas(source, mesh_areas)
+        response_bbox = [float(value) for value in response_areas.total_bounds]
         grid = _ProductRenderers.grid_spec(
             bbox,
             resolution=resolution,
@@ -549,23 +552,26 @@ class HdfResultsProducts:
             roles=["metadata", "quality"],
         )
 
-        footprint_path = stage / HdfResultsProducts.FILENAMES["result-footprint"]
-        footprint_metadata = _ProductRenderers.write_footprint(
-            footprint_path,
-            mesh_areas,
-            source_name=source.name,
-        )
-        assets["result-footprint"] = _ProductRenderers.file_asset(
-            footprint_path,
-            media_type="application/geo+json",
-            roles=["metadata", "footprint"],
-            extra={
-                "bbox": footprint_metadata["bbox_wgs84"],
-                "proj:bbox": list(bbox),
-                "proj:code": inspection["crs"],
-                "feature_count": footprint_metadata["feature_count"],
-            },
-        )
+        for key, areas, bounds, scope in (
+            ("result-footprint", response_areas, response_bbox, "coupled_model_domain"),
+            ("raster-support", mesh_areas, list(bbox), "2d_flow_area_footprints"),
+        ):
+            footprint_path = stage / HdfResultsProducts.FILENAMES[key]
+            footprint_metadata = _ProductRenderers.write_footprint(
+                footprint_path, areas, source_name=source.name, scope=scope,
+            )
+            assets[key] = _ProductRenderers.file_asset(
+                footprint_path, media_type="application/geo+json",
+                roles=["metadata", "footprint"],
+                extra={
+                    "bbox": footprint_metadata["bbox_wgs84"],
+                    "proj:bbox": bounds, "proj:code": inspection["crs"],
+                    "feature_count": footprint_metadata["feature_count"],
+                    "scope": scope,
+                },
+            )
+        for key in ("maximum-depth", "maximum-wse", "maximum-velocity"):
+            assets[key]["support_asset"] = "raster-support"
 
         omissions: list[dict[str, str]] = []
         if include_preview:
@@ -609,9 +615,11 @@ class HdfResultsProducts:
             "time": inspection["time"],
             "spatial": {
                 "crs": inspection["crs"],
-                "bbox": list(bbox),
+                "bbox": response_bbox,
+                "raster_bbox": list(bbox),
                 "footprint_asset": "result-footprint",
-                "support": "2d_flow_area_footprints",
+                "support": "coupled_model_domain",
+                "raster_support_asset": "raster-support",
             },
             "assets": dict(sorted(assets.items())),
             "omissions": omissions,

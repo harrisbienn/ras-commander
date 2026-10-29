@@ -523,11 +523,9 @@ def test_export_generates_deterministic_arrow_and_geospatial_package(
         (first / "result-footprint.geojson").read_text(encoding="utf-8")
     )
     assert footprint["type"] == "FeatureCollection"
-    mesh_names = [
-        feature["properties"]["mesh_name"]
-        for feature in footprint["features"]
-    ]
-    assert mesh_names == ["Mesh"]
+    assert footprint["features"][0]["properties"]["scope"] == "coupled_model_domain"
+    support = json.loads((first / "raster-support.geojson").read_text())
+    assert [feature["properties"]["mesh_name"] for feature in support["features"]] == ["Mesh"]
     assert "generated ras-commander hydraulic product package" in caplog.text.lower()
     assert "no HEC-RAS model output was created or modified" in caplog.text
 
@@ -917,3 +915,66 @@ def test_export_existing_producer_hdfs_read_only(tmp_path):
                 assert raster.tags()["generated_by"] == "ras-commander"
                 assert raster.tags()["source_access"] == "read-only"
         assert _sha256(source) == source_before
+
+
+def _add_coupled_geometry(source):
+    """Synthetic packed XS/storage geometry, never engineering model output."""
+    with h5py.File(source, "r+") as hdf:
+        hdf["Geometry/Cross Sections/Attributes"] = np.array(
+            [(b"River", b"Reach", b"100", 1., 3.), (b"River", b"Reach", b"90", 1., 3.)],
+            dtype=[("River", "S16"), ("Reach", "S16"), ("RS", "S8"), ("Left Bank", "f4"), ("Right Bank", "f4")],
+        )
+        hdf["Geometry/Cross Sections/Polyline Info"] = np.array([[0, 2, 0, 1], [2, 2, 1, 1]], dtype="i4")
+        hdf["Geometry/Cross Sections/Polyline Parts"] = np.array([[0, 2], [0, 2]], dtype="i4")
+        hdf["Geometry/Cross Sections/Polyline Points"] = np.array([[0., 0.], [4., 0.], [0., 1.], [4., 1.]])
+        for prefix in ("Station Elevation", "Manning's n"):
+            hdf[f"Geometry/Cross Sections/{prefix} Info"] = np.array([[0, 2], [2, 2]], dtype="i4")
+            hdf[f"Geometry/Cross Sections/{prefix} Values"] = np.array([[0., 0.04], [4., 0.04]] * 2)
+        hdf["Geometry/Storage Areas/Attributes"] = np.array([(b"Storage",)], dtype=[("Name", "S16")])
+        hdf["Geometry/Storage Areas/Polygon Info"] = np.array([[0, 4, 0, 0]], dtype="i4")
+        hdf["Geometry/Storage Areas/Polygon Points"] = np.array([[5., 0.], [6., 0.], [6., 1.], [5., 1.]])
+
+
+def test_coupled_footprint_restores_1d_and_storage_without_expanding_rasters(tmp_path):
+    from shapely.geometry import shape
+    from shapely.ops import transform, unary_union
+    from pyproj import Transformer
+
+    source = tmp_path / "coupled.p01.hdf"
+    _write_export_hdf(source)
+    baseline = HdfResultsProducts.export(source, tmp_path / "mesh", max_dimension=64, include_preview=False)
+    _add_coupled_geometry(source)
+    before = _sha256(source)
+    manifest = HdfResultsProducts.export(source, tmp_path / "coupled", max_dimension=64, include_preview=False)
+    assert manifest["schema"] == "ras-commander/hydraulic-product-manifest/2.0"
+    assert manifest["spatial"]["bbox"] == [-1., -1., 6., 2.]
+    assert manifest["spatial"]["raster_bbox"] == [-1., -1., 2., 2.]
+    for key in ("maximum-depth", "maximum-wse", "maximum-velocity"):
+        assert manifest["assets"][key]["sha256"] == baseline["assets"][key]["sha256"]
+        assert manifest["assets"][key]["support_asset"] == "raster-support"
+    areas = {}
+    for key in ("result-footprint", "raster-support"):
+        payload = json.loads((tmp_path / "coupled" / manifest["assets"][key]["href"]).read_text())
+        geometry = unary_union([shape(f["geometry"]) for f in payload["features"]])
+        projected = transform(Transformer.from_crs(4326, 3451, always_xy=True).transform, geometry)
+        areas[key] = projected.area
+    assert areas["result-footprint"] == pytest.approx(12., abs=1e-5)
+    assert areas["raster-support"] == pytest.approx(9., abs=1e-5)
+    assert _sha256(source) == before
+
+
+@pytest.mark.parametrize("missing", [
+    "Cross Sections/Attributes", "Cross Sections/Polyline Points",
+    "Storage Areas/Attributes", "Storage Areas/Polygon Points",
+])
+def test_coupled_footprint_refuses_incomplete_geometry(tmp_path, missing):
+    source = tmp_path / "incomplete.p01.hdf"
+    _write_export_hdf(source)
+    _add_coupled_geometry(source)
+    with h5py.File(source, "r+") as hdf:
+        del hdf[f"Geometry/{missing}"]
+    before = _sha256(source)
+    with pytest.raises(ValueError, match="footprint"):
+        HdfResultsProducts.export(source, tmp_path / "products", max_dimension=64, include_preview=False)
+    assert not (tmp_path / "products/hydraulic-products.json").exists()
+    assert _sha256(source) == before

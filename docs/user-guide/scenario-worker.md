@@ -24,12 +24,22 @@ stable. Upstream square raster grids and physical-cell filtering can change
 pixels relative to older exports; compare and accept derivatives before
 replacing published products. Source HDF files remain read only.
 
-The candidate `result-footprint` contains per-mesh 2D flow-area polygons in
-WGS84. Earlier fork exports unioned the project 1D river and 2D areas in the
-project CRS. These are different spatial scopes: a 2D raster support polygon
-does not describe the whole coupled 1D/2D response. Consumers that previously
-used the asset for full response coverage need an explicit migration before
-adoption. Hydrograph coverage does not expand the raster footprint.
+Hydraulic product manifest version `2.0` restores full coupled model coverage:
+`result-footprint.geojson` unions the 1D river, 2D flow-area and storage-area
+polygons, while `raster-support.geojson` retains the per-mesh 2D polygons.
+Both GeoJSON assets use WGS84; their `proj:bbox` and `proj:code` describe the
+source projected coordinates. The full domain is not an inundation extent.
+Missing or invalid declared 1D/storage geometry prevents product publication.
+
+The manifest declares `spatial.support="coupled_model_domain"`, binds the
+footprint and raster-support asset keys separately, and gives each raster a
+`support_asset="raster-support"` reference. `spatial.bbox` covers the full
+domain; `spatial.raster_bbox` covers the meshes. Raster sampling and masks remain
+2D-only. Hydrograph coverage does not expand raster support. Consumers must
+accept and validate version 2 before adopting this exporter. Historical version
+1 packages remain immutable and must not be relabeled as version 2. Worker
+request/result envelope versions are unchanged; the product receipt carries the
+exporter's independent manifest version.
 
 The historical direct-path `RasUnsteady.delete_boundary()` interface is rejected;
 use an owned stage and exact inventory evidence. Land-cover edits require the

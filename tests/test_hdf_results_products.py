@@ -190,5 +190,6 @@ def test_product_filenames_and_keys_are_stable():
         "result-metadata": "result-metadata.json",
         "numerical-qaqc": "numerical-qaqc.json",
         "result-footprint": "result-footprint.geojson",
+        "raster-support": "raster-support.geojson",
         "preview": "maximum-depth-preview.png",
     }

@@ -319,7 +319,7 @@ def test_inspect_result_rejects_contradictory_units(tmp_path):
 
 def test_product_contract_names_are_stable():
     assert HdfResultsProducts.SCHEMA == (
-        "ras-commander/hydraulic-product-manifest/1.0"
+        "ras-commander/hydraulic-product-manifest/2.0"
     )
     assert HdfResultsProducts.FILENAMES == {
         "maximum-wse": "maximum-wse.tif",
@@ -329,6 +329,7 @@ def test_product_contract_names_are_stable():
         "result-metadata": "result-metadata.json",
         "numerical-qaqc": "numerical-qaqc.json",
         "result-footprint": "result-footprint.geojson",
+        "raster-support": "raster-support.geojson",
         "preview": "maximum-depth-preview.png",
     }
     assert HdfResultsProducts.MANIFEST_FILENAME == "hydraulic-products.json"

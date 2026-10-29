@@ -38,6 +38,61 @@ class _ProductRenderers:
     MAX_RASTER_CELLS = 16_777_216
 
     @staticmethod
+    def response_areas(source: Path, mesh_areas):
+        """Union the coupled domain, refusing silently omitted 1D/storage areas."""
+        import geopandas as gpd
+        from pyproj import CRS
+        from shapely.ops import unary_union
+
+        from .HdfStruc import HdfStruc
+        from .HdfXsec import HdfXsec
+
+        geometries = list(mesh_areas.geometry)
+        components = (
+            ("Cross Sections", ("River", "Reach"), HdfXsec.get_1d_footprint),
+            ("Storage Areas", ("Name",), HdfStruc.get_storage_area_polygons),
+        )
+
+        def label(value):
+            return value.decode("utf-8").strip() if isinstance(value, bytes) else str(value).strip()
+
+        for group_name, fields, reader in components:
+            with h5py.File(source, "r") as hdf:
+                group = hdf.get(f"Geometry/{group_name}")
+                if group is None or not len(group):
+                    continue
+                if "Attributes" not in group:
+                    raise ValueError(f"Cannot authenticate {group_name} footprint identities")
+                attributes = read_typed(group["Attributes"], slice(None))
+                if not len(attributes):
+                    if any(dataset.size for dataset in group.values() if isinstance(dataset, h5py.Dataset)):
+                        raise ValueError(f"{group_name} geometry has no attribute identities")
+                    continue
+                if not set(fields).issubset(attributes.dtype.names or ()):
+                    raise ValueError(f"Missing {group_name} footprint identity fields")
+                expected = {tuple(label(row[field]) for field in fields) for row in attributes}
+                if any(not all(identity) for identity in expected):
+                    raise ValueError(f"Empty {group_name} footprint identity")
+            frame = reader(source)
+            if frame.empty or not set(fields).issubset(frame.columns):
+                raise ValueError(f"Cannot reconstruct complete {group_name} footprint")
+            identities = [tuple(label(row[field]) for field in fields) for _, row in frame.iterrows()]
+            if set(identities) != expected or len(identities) != len(expected):
+                raise ValueError(f"Incomplete or duplicate {group_name} footprint identities")
+            if frame.crs is None or CRS.from_user_input(frame.crs) != CRS.from_user_input(mesh_areas.crs):
+                raise ValueError(f"{group_name} footprint CRS differs from mesh CRS")
+            if any(g is None or g.is_empty or not g.is_valid or g.geom_type not in {"Polygon", "MultiPolygon"}
+                   for g in frame.geometry):
+                raise ValueError(f"Invalid {group_name} footprint geometry")
+            geometries.extend(frame.geometry)
+        domain = unary_union(geometries)
+        if domain.is_empty or not domain.is_valid:
+            raise ValueError("Invalid coupled model domain")
+        return gpd.GeoDataFrame(
+            {"mesh_name": ["coupled-model-domain"], "geometry": [domain]}, crs=mesh_areas.crs,
+        )
+
+    @staticmethod
     def maximum_velocity_points(source: Path, inspection: dict[str, Any]):
         import geopandas as gpd
 
@@ -585,7 +640,10 @@ class _ProductRenderers:
         }
 
     @staticmethod
-    def write_footprint(path: Path, mesh_areas, *, source_name: str) -> dict[str, Any]:
+    def write_footprint(
+        path: Path, mesh_areas, *, source_name: str,
+        scope: str = "2d_flow_area_footprints",
+    ) -> dict[str, Any]:
         from shapely.geometry import mapping
 
         geographic = mesh_areas.to_crs("EPSG:4326")
@@ -596,7 +654,8 @@ class _ProductRenderers:
                     "type": "Feature",
                     "id": str(area.mesh_name),
                     "properties": {
-                        "mesh_name": str(area.mesh_name),
+                        ("mesh_name" if scope == "2d_flow_area_footprints" else "domain_name"): str(area.mesh_name),
+                        "scope": scope,
                         "source": source_name,
                         "source_access": "read_only",
                     },
