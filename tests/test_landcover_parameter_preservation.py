@@ -29,10 +29,11 @@ def _table(rows):
 
 
 @pytest.mark.parametrize("damage", [
-    None, "truncate_unrequested_name", "remove_class", "change_id", "change_other",
+    None, "truncate_class_name", "remove_class", "change_id", "change_other",
     "change_unrequested_manning", "drop_column", "duplicate_id",
 ])
-def test_native_manning_postconditions_restore_unrequested_damage(tmp_path, monkeypatch, damage):
+@pytest.mark.parametrize("requested_class", ["Water", "Emergent Herbaceous Wetlands"])
+def test_native_manning_postconditions_restore_unrequested_damage(tmp_path, monkeypatch, damage, requested_class):
     sidecar = tmp_path / "LandCover.hdf"
     sidecar.write_bytes(b"original native sidecar")
     backup = tmp_path / "LandCover.backup.hdf"
@@ -43,8 +44,10 @@ def test_native_manning_postconditions_restore_unrequested_damage(tmp_path, monk
         {"ID": 2, "Name": long_name, "ManningsN": 0.12, "Other": 8.0},
     ]
     saved = deepcopy(original)
-    saved[0]["ManningsN"] = 0.06
-    if damage == "truncate_unrequested_name":
+    requested_index = next(index for index, row in enumerate(saved) if row["Name"] == requested_class)
+    unrequested_index = 1 - requested_index
+    saved[requested_index]["ManningsN"] = 0.06
+    if damage == "truncate_class_name":
         saved[1]["Name"] = long_name[:-1]
     elif damage == "remove_class":
         saved.pop()
@@ -53,7 +56,7 @@ def test_native_manning_postconditions_restore_unrequested_damage(tmp_path, monk
     elif damage == "change_other":
         saved[1]["Other"] = 0.0
     elif damage == "change_unrequested_manning":
-        saved[1]["ManningsN"] = 0.06
+        saved[unrequested_index]["ManningsN"] = 0.06
     elif damage == "drop_column":
         for row in saved:
             del row["Other"]
@@ -69,7 +72,7 @@ def test_native_manning_postconditions_restore_unrequested_damage(tmp_path, monk
 
         def TryAssigningNewParamtersUsingTable(self, table, apply):
             assert apply is True
-            assert table.Rows[0]["ManningsN"] == 0.06
+            assert table.Rows[requested_index]["ManningsN"] == 0.06
             sidecar.write_bytes(b"native save")
             backup.write_bytes(b"native generated backup")
             return True
@@ -85,14 +88,19 @@ def test_native_manning_postconditions_restore_unrequested_damage(tmp_path, monk
     monkeypatch.setitem(sys.modules, "RasMapperLib", SimpleNamespace(LandCoverLayer=api))
 
     if damage is None:
-        result = HdfLandCover.set_landcover_mannings_n(sidecar, {"Water": 0.06}, hecras_version="6.6")
+        result = HdfLandCover.set_landcover_mannings_n(sidecar, {requested_class: 0.06}, hecras_version="6.6")
         assert result["changed"] == 1
         assert result["not_requested"] == 1
         assert result["recompute_required"] is True
         assert sidecar.read_bytes() == b"native save"
     else:
-        with pytest.raises(RuntimeError, match="class|parameter"):
-            HdfLandCover.set_landcover_mannings_n(sidecar, {"Water": 0.06}, hecras_version="6.6")
+        expected_error = (
+            "did not persist Manning values"
+            if requested_index == 1 and damage in {"truncate_class_name", "remove_class"}
+            else "class|parameter"
+        )
+        with pytest.raises(RuntimeError, match=expected_error):
+            HdfLandCover.set_landcover_mannings_n(sidecar, {requested_class: 0.06}, hecras_version="6.6")
         assert sidecar.read_bytes() == b"original native sidecar"
         assert backup.read_bytes() == b"original native backup"
     snapshots = list(tmp_path.glob("LandCover.native_parameters.*.backup.hdf"))

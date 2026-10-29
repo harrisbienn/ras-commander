@@ -11,6 +11,7 @@ on:
       - 'ras_commander/fast_hdf.py'
       - 'ras_commander/_fast_hdf_typed.py'
       - 'ras_commander/_native_scope.py'
+      - 'ras_commander/RasProject.py'
       - 'ras_commander/fast_results.py'
       - 'ras_commander/fast_text.py'
       - 'ras_commander/hdf/**'
@@ -22,6 +23,7 @@ on:
       - 'tests/test_hdf_results_mesh_max_depth.py'
       - 'tests/test_tabular_readers_core_install.py'
       - 'tests/test_fast_hdf*.py'
+      - 'tests/test_ras_project.py'
       - 'tests/rust_engine_bridge/**'
       - 'tests/native_engine_provenance.py'
       - '.github/workflows/fast-hdf.yml'
@@ -81,6 +83,8 @@ jobs:
         run: python -m pytest tests/test_fast_hdf.py tests/test_fast_hdf_pmtiles_columnar.py tests/test_hdf_result_view.py tests/test_hdf_results_mesh.py tests/test_hdf_mesh_cell_polygon_diagnostics.py tests/rust_engine_bridge/panic_guard_test.py tests/rust_engine_bridge/in_call_rewrite_test.py -q
       - name: Raster interpolation regression tests
         run: python -m pytest tests/test_hdf_raster_interpolation.py tests/test_hdf_raster_triangulation.py tests/test_hdf_raster_windows.py tests/test_hdf_results_mesh_max_depth.py -q
+      - name: Atomic project staging and native handle lifetime
+        run: python -m pytest tests/test_ras_project.py -q -ra
       - name: Table readers with Python reference backend
         env:
           RAS_COMMANDER_FAST_HDF: python
