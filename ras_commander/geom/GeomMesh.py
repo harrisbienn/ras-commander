@@ -3739,9 +3739,9 @@ class GeomMesh:
         """
         Configure HEC-RAS GDAL runtime for RasMapperLib.
 
-        The default path points GDAL environment variables and DLL search paths
-        at the GDAL runtime bundled with HEC-RAS, then verifies the legacy
-        ``python.exe`` sibling GDAL bridge before RasMapperLib is loaded.
+        The default path verifies the Python GDAL bridges before configuring
+        environment variables and DLL search paths. A bridge to another runtime
+        returns False without retargeting it; use an isolated interpreter.
 
         Returns True if the process runtime was configured successfully.
         """
@@ -3753,17 +3753,13 @@ class GeomMesh:
             hecras_dir = _find_hecras_dir()
 
         try:
-            configure_hecras_gdal_runtime(hecras_dir)
-        except FileNotFoundError as exc:
+            if create_junction:
+                configure_rasmapper_gdal_bridge(hecras_dir, python_dir)
+            else:
+                configure_hecras_gdal_runtime(hecras_dir)
+        except (FileNotFoundError, RuntimeError) as exc:
             logger.error(str(exc))
             return False
-
-        if create_junction:
-            try:
-                configure_rasmapper_gdal_bridge(hecras_dir, python_dir)
-            except (FileNotFoundError, RuntimeError) as exc:
-                logger.error(str(exc))
-                return False
 
         return True
 

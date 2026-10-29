@@ -3,7 +3,7 @@ import importlib
 import logging
 import sys
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CompletedProcess, run as run_subprocess
 
 import pytest
 import rasterio
@@ -46,6 +46,20 @@ def _make_hecras_gdal_tree(tmp_path: Path) -> Path:
     (hecras_dir / "GDAL" / "bin64").mkdir(parents=True)
     (hecras_dir / "GDAL" / "common" / "data").mkdir(parents=True)
     return hecras_dir
+
+
+def _create_test_bridge(link: Path, target: Path) -> None:
+    """Exercise directory identity with a real link, not a lookalike folder."""
+    if os.name == "nt":
+        run_subprocess(
+            ["powershell", "-NoProfile", "-Command",
+             "$ErrorActionPreference='Stop'; New-Item -ItemType Junction "
+             "-Path $env:TEST_GDAL_LINK -Target $env:TEST_GDAL_TARGET | Out-Null"],
+            env=dict(os.environ, TEST_GDAL_LINK=str(link), TEST_GDAL_TARGET=str(target)),
+            check=True, capture_output=True,
+        )
+    else:
+        link.symlink_to(target, target_is_directory=True)
 
 
 def test_configure_hecras_gdal_runtime_uses_bundled_gdal(monkeypatch, tmp_path):
@@ -95,8 +109,7 @@ def test_configure_rasmapper_gdal_bridge_creates_python_sibling(
 
     def fake_run(cmd, **kwargs):
         commands.append(cmd)
-        (python_dir / "GDAL" / "bin64").mkdir(parents=True)
-        (python_dir / "GDAL" / "common" / "data").mkdir(parents=True)
+        _create_test_bridge(python_dir / "GDAL", hecras_dir / "GDAL")
         return CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(_gdal_runtime.subprocess, "run", fake_run)
@@ -167,13 +180,12 @@ def test_configure_rasmapper_gdal_bridge_creates_venv_and_base_bridges(
 
     def fake_run(cmd, **kwargs):
         commands.append(cmd)
-        command_text = cmd[-1]
+        bridge_path = kwargs["env"]["RAS_COMMANDER_GDAL_BRIDGE"]
         for candidate in (venv_scripts, base_python_dir):
-            if str(candidate / "GDAL") in command_text:
-                (candidate / "GDAL" / "bin64").mkdir(parents=True)
-                (candidate / "GDAL" / "common" / "data").mkdir(parents=True)
+            if str(candidate / "GDAL") == bridge_path:
+                _create_test_bridge(candidate / "GDAL", hecras_dir / "GDAL")
                 return CompletedProcess(cmd, 0, "", "")
-        raise AssertionError(f"Unexpected GDAL junction command: {command_text}")
+        raise AssertionError(f"Unexpected GDAL junction path: {bridge_path}")
 
     monkeypatch.setattr(_gdal_runtime.subprocess, "run", fake_run)
 
@@ -196,8 +208,7 @@ def test_geom_mesh_setup_gdal_bridge_creates_python_gdal_by_default(
     monkeypatch.setattr(geom_mesh_module.platform, "system", lambda: "Windows")
 
     def fake_run(cmd, **kwargs):
-        (python_dir / "GDAL" / "bin64").mkdir(parents=True)
-        (python_dir / "GDAL" / "common" / "data").mkdir(parents=True)
+        _create_test_bridge(python_dir / "GDAL", hecras_dir / "GDAL")
         return CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(_gdal_runtime.subprocess, "run", fake_run)

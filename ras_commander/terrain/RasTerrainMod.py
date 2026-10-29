@@ -239,17 +239,13 @@ class RasTerrainMod:
                 ras_path = versioned_path
 
         try:
-            configure_hecras_gdal_runtime(ras_path)
-        except FileNotFoundError as exc:
+            if create_junction:
+                configure_rasmapper_gdal_bridge(ras_path, python_dir)
+            else:
+                configure_hecras_gdal_runtime(ras_path)
+        except (FileNotFoundError, RuntimeError) as exc:
             logger.error(str(exc))
             return False
-
-        if create_junction:
-            try:
-                configure_rasmapper_gdal_bridge(ras_path, python_dir)
-            except (FileNotFoundError, RuntimeError) as exc:
-                logger.error(str(exc))
-                return False
 
         logger.info("Configured HEC-RAS GDAL runtime for HEC-RAS %s", ras_path.name)
         logger.debug("HEC-RAS GDAL runtime path: %s", ras_path / "GDAL")

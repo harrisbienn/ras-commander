@@ -5,6 +5,24 @@ Classes for terrain creation, terrain modification writing, and terrain modifica
 !!! note "Platform Requirements"
     `RasTerrainMod` requires Windows with pythonnet and a HEC-RAS installation (uses RasMapperLib.dll via .NET interop). `RasTerrain.export_rasmapper_terrain()` runs natively on Windows and through a configured Wine runtime on Linux. Other `RasTerrain` and `RasTerrainModWriter` methods retain their documented platform requirements.
 
+### Selecting a native GDAL runtime
+
+The default `RasTerrainMod.setup_gdal_bridge()` and
+`GeomMesh.setup_gdal_bridge()` paths check the Python sibling `GDAL` directory
+before configuring native-library search paths. An existing bridge must reference
+the selected HEC-RAS installation's GDAL tree. A lookalike copied directory,
+bridge to another installation, dangling link or inaccessible target is refused;
+existing paths are preserved. Missing bridges are created without overwrite,
+and matching bridges are reused. Setup methods return `False` on refusal;
+native CLR loading raises an error before loading RASMapper assemblies.
+
+Use a separate interpreter with a matching GDAL bridge when changing native
+installations. A new venv can still share the base interpreter's bridge; both
+locations are checked. Do not retarget a shared bridge beneath other processes.
+The existing `create_junction=False` option only configures search paths and
+does not verify a Python bridge. A bridge check establishes directory identity,
+not binary integrity or compatibility with libraries already loaded by other code.
+
 ## RasTerrain
 
 Terrain HDF creation from rasters using `RasProcess.exe CreateTerrain`.

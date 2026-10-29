@@ -54,7 +54,6 @@ def test_setup_gdal_bridge_info_uses_version_and_debug_keeps_path(monkeypatch, t
     debug_text = _text(caplog, logging.DEBUG)
 
     assert configured == [
-        ("runtime", ras_path),
         ("bridge", ras_path, None),
     ]
     assert "Configured HEC-RAS GDAL runtime for HEC-RAS 6.6" in info_text
