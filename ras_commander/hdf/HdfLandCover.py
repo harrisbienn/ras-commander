@@ -744,6 +744,10 @@ class HdfLandCover:
         supported: HEC-RAS owns the sidecar schema and may maintain additional
         state when the classification table is saved.
 
+        The native table is reloaded after saving. Class IDs, names, parameter
+        columns, and unrequested values must remain unchanged. A failed
+        postcondition restores the original sidecar and native backup.
+
         HEC-RAS 5.x does not expose a native sidecar table writer.  For 5.x,
         use :meth:`GeomLandCover.set_base_mannings_n` or rebuild the native
         layer with :meth:`RasMap.add_landcover_layer`.

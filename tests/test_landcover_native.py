@@ -411,8 +411,20 @@ def test_landcover_parameter_rejection_restores_partial_native_save(
     native_backup = tmp_path / "LandCover.backup.hdf"
     native_backup.write_bytes(b"original native backup")
 
+    class NativeRow(dict):
+        def IsNull(self, column):
+            return self[column] is None
+
+    class NativeColumns(list):
+        @property
+        def Count(self):
+            return len(self)
+
     table = SimpleNamespace(
-        Rows=[{"Name": "Open Water", "ManningsN": 0.04}]
+        Rows=[NativeRow(ID=1, Name="Open Water", ManningsN=0.04)],
+        Columns=NativeColumns(
+            SimpleNamespace(ColumnName=name) for name in ("ID", "Name", "ManningsN")
+        ),
     )
 
     class _Layer:

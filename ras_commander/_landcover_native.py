@@ -880,6 +880,7 @@ def _set_landcover_parameters_native(
         layer.Classification,
         layer.Parameters,
     )
+    before = _native_classification_table_snapshot(layer, LandCoverLayer)
     rows_by_name = {}
     for row in table.Rows:
         name = str(row["Name"]).strip()
@@ -959,6 +960,9 @@ def _set_landcover_parameters_native(
             "RASMapper did not persist Manning values for: "
             + ", ".join(sorted(mismatches))
         )
+
+    after = _native_classification_table_snapshot(saved_layer, LandCoverLayer)
+    _validate_mannings_classifications(before, after, normalized_mapping)
 
     changed_count = sum(detail["value_changed"] for detail in details)
     requested_unchanged_count = sum(
@@ -1085,6 +1089,47 @@ def _same_native_parameter_value(
     if before is None or after is None:
         return before is None and after is None
     return bool(before == after or (math.isnan(before) and math.isnan(after)))
+
+
+def _validate_mannings_classifications(
+    before: Mapping[int, Mapping[str, Any]],
+    after: Mapping[int, Mapping[str, Any]],
+    requested: Mapping[str, float],
+) -> None:
+    """Require a Manning-only edit, preserving every class and other parameter.
+
+    A native save can report success while changing unrequested data. This
+    postcondition runs inside the sidecar transaction so any mismatch restores
+    the original file and native backup.
+    """
+    if set(before) != set(after):
+        raise RuntimeError("Native Manning edit changed land-cover class IDs.")
+    for class_id, previous in before.items():
+        current = after[class_id]
+        name = str(previous["name"])
+        if current["name"] != name:
+            raise RuntimeError(
+                f"Native Manning edit changed land-cover class name for ID {class_id}."
+            )
+        old_parameters = previous["parameters"]
+        new_parameters = current["parameters"]
+        if set(old_parameters) != set(new_parameters):
+            raise RuntimeError(
+                f"Native Manning edit changed parameter columns for class ID {class_id}."
+            )
+        for column, old_value in old_parameters.items():
+            new_value = new_parameters[column]
+            if column == "ManningsN" and name in requested:
+                matches = new_value is not None and bool(np.isclose(
+                    new_value, requested[name], rtol=1.0e-6, atol=1.0e-7,
+                ))
+            else:
+                matches = _same_native_parameter_value(old_value, new_value)
+            if not matches:
+                raise RuntimeError(
+                    f"Native Manning edit changed unexpected parameter {column!r} "
+                    f"for class ID {class_id}."
+                )
 
 
 def _validate_sanitized_classifications(
