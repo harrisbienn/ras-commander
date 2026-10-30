@@ -116,6 +116,19 @@ This file is the canonical local instruction file for `ras_commander/hdf/`.
   code, otherwise the source WKT; never `"ESRI:n"`. New CRS-determining code
   must reuse these helpers rather than reading `Projection` or `.prj` text
   directly.
+- `HdfResultsProducts.inspect_export_crs()` is a read-only preflight for geometry
+  or result HDFs. Export defaults to the same strict project consistency rule.
+  Its explicit `result_geometry` policy requires equivalent projected embedded
+  and RASMapper projection evidence and readable referenced CRSs; terrain
+  disagreement remains in `spatial.crs_resolution`. Only package-internal
+  frames read in native result coordinates receive this CRS in memory. Never
+  override an already conflicting frame CRS, transform source coordinates,
+  change the general resolver, or infer engineering acceptance from this policy.
+- The product footprint recognizes complete HEC-RAS 6.6 geometry containing
+  only auxiliary cross-section property/flow-distribution subgroups and no
+  cross-section result nodes. Record these in `non_domain_geometry_groups`;
+  do not generalize this exception to unknown versions, incomplete geometry,
+  other members or cross-section results without new qualification evidence.
 
 ## Common Entry Points
 

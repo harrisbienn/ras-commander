@@ -11,7 +11,7 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from ..fast_hdf import read_dataset, read_typed
+from ..fast_hdf import read_attr, read_dataset, read_typed
 from .HdfMesh import HdfMesh
 from .HdfResultsMesh import HdfResultsMesh
 
@@ -38,7 +38,53 @@ class _ProductRenderers:
     MAX_RASTER_CELLS = 16_777_216
 
     @staticmethod
-    def response_areas(source: Path, mesh_areas):
+    def auxiliary_xsec_tables_only(hdf, group, inspection: dict[str, Any]) -> bool:
+        """Recognize the qualified complete 6.6 2D auxiliary-table layout.
+
+        Property/flow-distribution tables alone are not spatial cross sections.
+        Any geometry member or cross-section result evidence keeps the normal
+        identity/footprint requirements. Other producer versions remain refused.
+        """
+        if not str(inspection.get("program_version", "")).startswith("HEC-RAS 6.6 "):
+            return False
+        complete = read_attr(hdf["Geometry"], "Complete Geometry", None)
+        if isinstance(complete, (bool, np.bool_, int, np.integer)):
+            complete = complete == 1
+        elif isinstance(complete, (str, bytes)):
+            text = complete.decode("utf-8") if isinstance(complete, bytes) else complete
+            complete = text.strip().casefold() == "true"
+        else:
+            complete = False
+        if not complete or not set(group).issubset({"Property Tables", "Flow Distribution"}):
+            return False
+        if not group or not all(isinstance(child, h5py.Group) for child in group.values()):
+            return False
+        results = hdf.get("Results")
+        if results is None:
+            return False
+        has_xsec_results = results.visititems(
+            lambda name, obj: True if "cross section" in name.casefold() else None
+        )
+        return has_xsec_results is None
+
+    @staticmethod
+    def apply_result_crs(frame, inspection: dict[str, Any]):
+        """Attach authenticated result coordinates only under the explicit policy."""
+        from .HdfUtils import HdfUtils
+
+        policy = inspection.get("crs_resolution", {})
+        if policy.get("policy") != "result_geometry" or not policy.get("export_allowed"):
+            return frame
+        if frame.crs is not None:
+            if not HdfUtils.crs_equivalent(frame.crs.to_wkt(), inspection["crs"]):
+                raise ValueError("Product reader CRS differs from selected result coordinates")
+            return frame
+        # All callers read geometry in this result HDF's native coordinates.
+        # No terrain coordinates or externally transformed frames enter here.
+        return frame.set_crs(inspection["crs"])
+
+    @staticmethod
+    def response_areas(source: Path, mesh_areas, inspection: dict[str, Any] | None = None):
         """Union the coupled domain, refusing silently omitted 1D/storage areas."""
         import geopandas as gpd
         from pyproj import CRS
@@ -48,6 +94,7 @@ class _ProductRenderers:
         from .HdfXsec import HdfXsec
 
         geometries = list(mesh_areas.geometry)
+        non_domain_groups = []
         components = (
             ("Cross Sections", ("River", "Reach"), HdfXsec.get_1d_footprint),
             ("Storage Areas", ("Name",), HdfStruc.get_storage_area_polygons),
@@ -62,6 +109,17 @@ class _ProductRenderers:
                 if group is None or not len(group):
                     continue
                 if "Attributes" not in group:
+                    if (
+                        group_name == "Cross Sections"
+                        and inspection is not None
+                        and _ProductRenderers.auxiliary_xsec_tables_only(hdf, group, inspection)
+                    ):
+                        non_domain_groups.append({
+                            "group": group_name,
+                            "reason": "complete_66_2d_auxiliary_tables_only",
+                            "subgroups": sorted(group),
+                        })
+                        continue
                     raise ValueError(f"Cannot authenticate {group_name} footprint identities")
                 attributes = read_typed(group["Attributes"], slice(None))
                 if not len(attributes):
@@ -74,6 +132,8 @@ class _ProductRenderers:
                 if any(not all(identity) for identity in expected):
                     raise ValueError(f"Empty {group_name} footprint identity")
             frame = reader(source)
+            if inspection is not None:
+                frame = _ProductRenderers.apply_result_crs(frame, inspection)
             if frame.empty or not set(fields).issubset(frame.columns):
                 raise ValueError(f"Cannot reconstruct complete {group_name} footprint")
             identities = [tuple(label(row[field]) for field in fields) for _, row in frame.iterrows()]
@@ -88,9 +148,11 @@ class _ProductRenderers:
         domain = unary_union(geometries)
         if domain.is_empty or not domain.is_valid:
             raise ValueError("Invalid coupled model domain")
-        return gpd.GeoDataFrame(
+        frame = gpd.GeoDataFrame(
             {"mesh_name": ["coupled-model-domain"], "geometry": [domain]}, crs=mesh_areas.crs,
         )
+        frame.attrs["non_domain_geometry_groups"] = non_domain_groups
+        return frame
 
     @staticmethod
     def maximum_velocity_points(source: Path, inspection: dict[str, Any]):
@@ -99,6 +161,7 @@ class _ProductRenderers:
         # Ghost cells outside the perimeter carry no solution; only physical
         # cells (the first ``Cell Count`` entries) are rendered.
         points = HdfMesh.get_mesh_cell_points(source, include_ghost_cells=False)
+        points = _ProductRenderers.apply_result_crs(points, inspection)
         if points.empty or points.crs is None:
             raise ValueError("Result HDF produced no CRS-aware mesh cell points")
 
@@ -237,6 +300,7 @@ class _ProductRenderers:
     @staticmethod
     def mesh_areas(source: Path, inspection: dict[str, Any]):
         areas = HdfMesh.get_mesh_areas(source)
+        areas = _ProductRenderers.apply_result_crs(areas, inspection)
         if areas.empty or areas.crs is None:
             raise ValueError("Result HDF produced no CRS-aware 2D mesh footprint")
         if areas["mesh_name"].duplicated().any():

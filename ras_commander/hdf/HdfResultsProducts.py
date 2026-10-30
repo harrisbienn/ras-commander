@@ -225,6 +225,80 @@ class HdfResultsProducts:
     @staticmethod
     @log_call
     @standardize_input(file_type="plan_hdf")
+    def inspect_export_crs(
+        hdf_path: Union[str, Path],
+        *,
+        crs_policy: str = "strict",
+    ) -> dict[str, Any]:
+        """Inspect product CRS readiness without computing or writing files.
+
+        Args:
+            hdf_path: Existing geometry or result HDF. Geometry HDFs permit
+                this check before compute; this does not check result completion.
+            crs_policy: ``strict`` requires consistent project CRS evidence.
+                ``result_geometry`` requires projected embedded coordinates
+                and an equivalent RASMapper projection, with every referenced
+                CRS readable. Terrain disagreement is retained for review.
+
+        Returns:
+            JSON-serializable policy, selected CRS, readiness, reason and CRS
+            evidence. Evidence records file basenames and CRS-text digests,
+            not whole-file identities. No coordinates are transformed and
+            export readiness does not establish hydraulic acceptance.
+
+        Raises:
+            ValueError: If the policy is unknown.
+            FileNotFoundError: If the HDF does not exist.
+        """
+        from pyproj import CRS
+
+        if crs_policy not in ("strict", "result_geometry"):
+            raise ValueError("crs_policy must be 'strict' or 'result_geometry'")
+        source = RasUtils.safe_resolve(Path(hdf_path))
+        if not source.is_file():
+            raise FileNotFoundError(f"CRS source HDF does not exist: {source}")
+        evidence = HdfUtils.collect_hdf_crs_evidence(source)
+        project = HdfUtils.resolve_crs_evidence(evidence)
+        selected = project
+        allowed = project.status == "resolved"
+        reason = "consistent_project_evidence" if allowed else "project_crs_" + project.status
+        terrain_conflict = False
+        if crs_policy == "result_geometry":
+            primary = [e for e in evidence if e.source in ("hdf_attribute", "rasmap_projection")]
+            selected = HdfUtils.resolve_crs_evidence(primary)
+            allowed = (
+                {e.source for e in primary} == {"hdf_attribute", "rasmap_projection"}
+                and all(e.status == "found" for e in evidence)
+                and selected.status == "resolved"
+                and CRS.from_user_input(selected.crs).is_projected
+            )
+            reason = "matching_result_and_project_projection" if allowed else "result_and_project_crs_not_confirmed"
+            terrain_conflict = allowed and any(
+                e.source == "terrain_hdf" and not HdfUtils.crs_equivalent(e.wkt, selected.crs)
+                for e in evidence
+            )
+        return {
+            "schema": "ras-commander/product-crs-resolution/1.0",
+            "policy": crs_policy,
+            "export_allowed": bool(allowed),
+            "crs": selected.to_crs_string() if allowed else None,
+            "reason": reason,
+            "project_resolution": project.status,
+            "terrain_conflict_retained": bool(terrain_conflict),
+            "coordinates_transformed": False,
+            "engineering_acceptance": "not_evaluated",
+            "evidence": [
+                {"source": e.source, "file_name": e.path.name if e.path else None,
+                 "status": e.status,
+                 "crs": HdfUtils.format_crs(e.wkt) if e.status == "found" else None,
+                 "wkt_sha256": hashlib.sha256(e.wkt.encode("utf-8")).hexdigest() if e.wkt else None}
+                for e in evidence
+            ],
+        }
+
+    @staticmethod
+    @log_call
+    @standardize_input(file_type="plan_hdf")
     def export(
         hdf_path: Union[str, Path],
         output_directory: Union[str, Path],
@@ -233,6 +307,7 @@ class HdfResultsProducts:
         max_dimension: int = 2048,
         nodata: float = -9999.0,
         include_preview: bool = True,
+        crs_policy: str = "strict",
     ) -> dict[str, Any]:
         """Generate a deterministic hydraulic product package.
 
@@ -257,6 +332,11 @@ class HdfResultsProducts:
             nodata: Finite float32 nodata value for all three COGs. Inputs are
                 normalized to the value that will actually be stored.
             include_preview: Generate ``maximum-depth-preview.png``.
+            crs_policy: ``strict`` preserves the default project consistency
+                requirement. ``result_geometry`` uses matching embedded and
+                project coordinates while retaining terrain CRS disagreement
+                in the manifest. See :meth:`inspect_export_crs`. This explicit
+                choice does not transform coordinates or accept the model.
 
         Returns:
             The JSON-serializable manifest also written to the package.
@@ -304,9 +384,15 @@ class HdfResultsProducts:
         if not isinstance(include_preview, bool):
             raise ValueError("include_preview must be True or False")
 
+        crs_resolution = HdfResultsProducts.inspect_export_crs(source, crs_policy=crs_policy)
+        if not crs_resolution["export_allowed"]:
+            raise ValueError(f"Hydraulic product CRS preflight failed: {crs_resolution['reason']}")
         source_hash = _sha256(source)
         source_size = source.stat().st_size
         inspection = HdfResultsProducts.inspect_result(source)
+        if not HdfUtils.crs_equivalent(inspection["crs"], crs_resolution["crs"]):
+            raise ValueError("Embedded result CRS differs from product CRS selection")
+        inspection["crs_resolution"] = crs_resolution
         HdfResultsProducts._require_unchanged_source(
             source,
             expected_size=source_size,
@@ -341,6 +427,7 @@ class HdfResultsProducts:
                 expected_hash=source_hash,
                 checkpoint="after rendering",
             )
+            HdfResultsProducts._require_unchanged_crs(source, crs_resolution)
             HdfResultsProducts._publish_package(stage, output, manifest)
             published = True
             try:
@@ -351,6 +438,7 @@ class HdfResultsProducts:
                     expected_hash=source_hash,
                     checkpoint="after publication",
                 )
+                HdfResultsProducts._require_unchanged_crs(source, crs_resolution)
             except Exception:
                 HdfResultsProducts._cleanup_published_package(
                     stage,
@@ -370,6 +458,12 @@ class HdfResultsProducts:
             source.name,
         )
         return manifest
+
+    @staticmethod
+    def _require_unchanged_crs(source: Path, expected: dict[str, Any]) -> None:
+        current = HdfResultsProducts.inspect_export_crs(source, crs_policy=expected["policy"])
+        if current != expected:
+            raise RuntimeError("CRS evidence changed during hydraulic product export")
 
     @staticmethod
     def _build_products(
@@ -393,7 +487,7 @@ class HdfResultsProducts:
         if CRS.from_user_input(mesh_areas.crs) != expected_crs:
             raise ValueError("2D mesh footprint CRS differs from inspected CRS")
         bbox = tuple(float(value) for value in mesh_areas.total_bounds)
-        response_areas = _ProductRenderers.response_areas(source, mesh_areas)
+        response_areas = _ProductRenderers.response_areas(source, mesh_areas, inspection)
         response_bbox = [float(value) for value in response_areas.total_bounds]
         grid = _ProductRenderers.grid_spec(
             bbox,
@@ -402,6 +496,7 @@ class HdfResultsProducts:
         )
 
         depth = HdfResultsMesh.get_mesh_max_depth(source)
+        depth = _ProductRenderers.apply_result_crs(depth, inspection)
         HdfResultsProducts._validate_product_frame(
             depth,
             value_column="maximum_depth",
@@ -476,6 +571,7 @@ class HdfResultsProducts:
             derivation,
         ) in sequential_rasters.items():
             frame = reader(source)
+            frame = _ProductRenderers.apply_result_crs(frame, inspection)
             HdfResultsProducts._validate_product_frame(
                 frame,
                 value_column=column,
@@ -535,6 +631,7 @@ class HdfResultsProducts:
             source_size=source_size,
             source_hash=source_hash,
         )
+        metadata["spatial"]["non_domain_geometry_groups"] = response_areas.attrs["non_domain_geometry_groups"]
         metadata_path = stage / HdfResultsProducts.FILENAMES["result-metadata"]
         _write_json(metadata_path, metadata)
         assets["result-metadata"] = _ProductRenderers.file_asset(
@@ -615,7 +712,9 @@ class HdfResultsProducts:
             "time": inspection["time"],
             "spatial": {
                 "crs": inspection["crs"],
+                "crs_resolution": inspection["crs_resolution"],
                 "bbox": response_bbox,
+                "non_domain_geometry_groups": response_areas.attrs["non_domain_geometry_groups"],
                 "raster_bbox": list(bbox),
                 "footprint_asset": "result-footprint",
                 "support": "coupled_model_domain",
@@ -723,6 +822,7 @@ class HdfResultsProducts:
             "time": inspection["time"],
             "spatial": {
                 "crs": inspection["crs"],
+                "crs_resolution": inspection["crs_resolution"],
                 "bbox": [float(value) for value in bbox],
                 "mesh_names": inspection["mesh_names"],
                 "meshes": inspection["meshes"],
