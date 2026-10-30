@@ -576,8 +576,11 @@ HDFs.
 - `inspect_result(hdf_path)` - Read an existing result HDF without mutation and
   fail closed on incomplete or conflicting completion evidence, inconsistent
   time axes, missing CRS or units, and mesh/result/topology misalignment
+- `inspect_export_crs(hdf_path, *, crs_policy="strict")` - Read geometry or
+  result CRS evidence before compute or export; report readiness without writing
 - `export(hdf_path, output_directory, *, resolution=None,
-  max_dimension=2048, nodata=-9999.0, include_preview=True)` - Generate a
+  max_dimension=2048, nodata=-9999.0, include_preview=True,
+  crs_policy="strict")` - Generate a
   checksum-pinned hydraulic product package without modifying the producer HDF
 
 Current HEC-RAS results can establish completion with
@@ -590,6 +593,41 @@ The returned inspection identifies whether maximum depth will be read from the
 stored HEC-RAS `Depth` time series or derived in memory from `Water Surface -
 Cells Minimum Elevation`. It also records `hydraulic_qaqc: not_evaluated`:
 mechanical completion and product readiness are not engineering acceptance.
+
+CRS preflight is separate from result inspection: `inspect_result()` checks
+the embedded result CRS, while `inspect_export_crs()` also collects project
+projection and registered terrain evidence. The default `strict` export policy
+refuses conflicting CRS evidence before creating the output directory.
+
+For a separately reviewed workflow that preserves native result coordinates,
+`crs_policy="result_geometry"` requires a projected embedded HDF CRS and an
+equivalent RASMapper projection. Every referenced CRS must be readable. It
+allows a different terrain CRS, records that disagreement, and attaches the
+authenticated result CRS to product geometry in memory. It neither transforms
+coordinates nor changes terrain, source HDFs, RASMapper files, or the ordinary
+`HdfBase`/`HdfProject`/`RasPrj` CRS rules. The policy cannot supply an arbitrary
+replacement CRS. Geometry and result HDF preflights are separate checks; a
+successful geometry preflight does not certify later result completion.
+
+Both the manifest and result metadata include `spatial.crs_resolution` with
+the selected policy, full-project resolution status, retained terrain conflict,
+and each evidence source's file basename, CRS and CRS-text SHA-256. These are
+CRS-text digests, not complete source-file identities. Evidence is reread before
+and after publication; changed evidence prevents a complete published package.
+The flag `coordinates_transformed=false` describes this policy's treatment of
+native product coordinates; the GeoJSON footprint still uses the usual WGS84
+serialization. Neither policy supplies engineering acceptance or permission to
+ignore a datum discrepancy.
+
+The coupled footprint also recognizes one tested HEC-RAS 6.6 layout: a
+`Complete Geometry` HDF whose `Cross Sections` group contains only `Property
+Tables` and/or `Flow Distribution` subgroups and has no cross-section result
+nodes. These auxiliary tables do not supply a spatial 1D domain. The exporter
+records the excluded group and its subgroup names in
+`spatial.non_domain_geometry_groups` in both manifest and result metadata.
+Unknown producer versions, incomplete geometry, other group members, or
+cross-section result evidence still require authenticated cross-section
+identities and a complete footprint. This rule applies under both CRS policies.
 
 ```python
 from ras_commander import HdfResultsProducts
