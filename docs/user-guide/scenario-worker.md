@@ -99,6 +99,38 @@ successful execution as a failure.
 
 ## Repeat and failure behavior
 
+### Explicit product CRS policy (request 1.2)
+
+Request `ras-commander/scenario-worker-request/1.2` requires
+`products.crs_policy`, either `strict` or `result_geometry`. Other product
+options retain their existing defaults. Versions 1.0 and 1.1 remain unchanged
+and reject this new field; the compatibility constant `REQUEST_SCHEMA` remains
+1.1, while `CRS_REQUEST_SCHEMA` names 1.2. The result envelope stays 1.0.
+
+For 1.2, the worker calls `RasScenario.inspect_product_crs()` after workspace
+validation and before `RasScenario.execute()`. The helper resolves the selected
+plan's geometry through project metadata and records its HDF checksum plus
+`HdfResultsProducts.inspect_export_crs()` evidence. Missing or unresolved
+evidence produces `product_crs_preflight_failed`, exit 3, non-retryable, with
+execution `not_started`. The clone and failed result remain available.
+
+`strict` requires consistent project CRS evidence. `result_geometry` requires
+matching projected geometry/project evidence and readable referenced CRSs;
+terrain disagreement remains explicit. The worker passes the same policy to
+product export, which independently checks the actual result HDF and associated
+CRS evidence. Preflight readiness does not certify result completeness, datum
+acceptance or hydraulic accuracy. Neither policy transforms the source model.
+
+Bind this policy and other product options in the orchestrator's result-defining
+specification. A preparation retry involving 1.2 must retain its schema and all
+product options except the new output directory. A changed policy requires a
+new specification; it must not relabel or rewrite an earlier attempt. Versions
+1.0/1.1 retain their existing retry semantics and do not acquire the new geometry
+preflight. This worker does not recover an already-computed failed attempt;
+use the package exporter on the retained HDF in a separate recovery workflow.
+
+### Existing destination and terminal checks
+
 A verified successful result for the identical normalized request is returned
 without rerunning RAS. The worker refuses an existing workspace, product
 directory, conflicting result, or changed completed output. Timeout and failed

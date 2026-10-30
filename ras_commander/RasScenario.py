@@ -1271,6 +1271,53 @@ class RasScenario:
 
     @staticmethod
     @log_call
+    def inspect_product_crs(
+        workspace: RasScenarioWorkspace,
+        *,
+        crs_policy: str = "strict",
+    ) -> Dict[str, Any]:
+        """Check the prepared plan's geometry CRS without executing HEC-RAS.
+
+        Args:
+            workspace: Prepared workspace with an explicit project and plan.
+            crs_policy: Product policy accepted by ``inspect_export_crs``.
+
+        Returns:
+            Geometry HDF identity and the package's CRS readiness evidence.
+            A ready geometry does not certify future result completeness.
+
+        Raises:
+            ValueError: If the selected plan or geometry is ambiguous or missing.
+            FileNotFoundError: If the selected geometry HDF is missing.
+            RuntimeError: If the geometry HDF changes during inspection.
+        """
+        from .hdf.HdfResultsProducts import HdfResultsProducts
+
+        project = init_ras_project(
+            workspace.project_file, ras_object=RasPrj(),
+            load_results_summary=False, hide_intro=True,
+        )
+        plans = project.plan_df[project.plan_df["plan_number"] == workspace.plan_number]
+        if len(plans) != 1:
+            raise ValueError("Product CRS preflight requires one selected plan")
+        selected_plan = RasPlan.get_plan_path(workspace.plan_number, ras_object=project)
+        if selected_plan is None or Path(selected_plan).resolve() != workspace.plan_file.resolve():
+            raise ValueError("Product CRS preflight plan differs from the prepared workspace")
+        geometry = RasPlan.get_geom_path(plans.iloc[0].get("geometry_number"), ras_object=project)
+        if geometry is None:
+            raise ValueError("Selected plan has no resolvable geometry")
+        source = Path(str(geometry) + ".hdf")
+        size, digest = source.stat().st_size, RasScenario._sha256_file(source)
+        report = HdfResultsProducts.inspect_export_crs(source, crs_policy=crs_policy)
+        if source.stat().st_size != size or RasScenario._sha256_file(source) != digest:
+            raise RuntimeError("Geometry HDF changed during product CRS preflight")
+        return {
+            "geometry_hdf": {"path": str(source), "size_bytes": size, "sha256": digest},
+            "crs_resolution": report,
+        }
+
+    @staticmethod
+    @log_call
     def inspect_workspace_evidence(
         workspace: RasScenarioWorkspace,
         boundary_links: Iterable[RasBoundaryLink],

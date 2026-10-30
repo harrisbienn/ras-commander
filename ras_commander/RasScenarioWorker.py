@@ -47,6 +47,7 @@ class RasScenarioWorker:
     """Static namespace for the RAS scenario-worker request/result contract."""
 
     REQUEST_SCHEMA = "ras-commander/scenario-worker-request/1.1"
+    CRS_REQUEST_SCHEMA = "ras-commander/scenario-worker-request/1.2"
     LEGACY_REQUEST_SCHEMA = "ras-commander/scenario-worker-request/1.0"
     RESULT_SCHEMA = "ras-commander/scenario-worker-result/1.0"
 
@@ -161,6 +162,20 @@ class RasScenarioWorker:
                 "retry": retry_evidence,
             }
 
+            if request["schema"] == RasScenarioWorker.CRS_REQUEST_SCHEMA:
+                try:
+                    preparation["product_crs"] = RasScenario.inspect_product_crs(
+                        workspace, crs_policy=request["products"]["crs_policy"],
+                    )
+                    if not preparation["product_crs"]["crs_resolution"]["export_allowed"]:
+                        raise ValueError(preparation["product_crs"]["crs_resolution"]["reason"])
+                except (OSError, ValueError, RuntimeError) as exc:
+                    preparation["status"] = "failed"
+                    raise RasScenarioWorkerError(
+                        f"Hydraulic product CRS preflight failed: {exc}",
+                        classification="product_crs_preflight_failed", exit_code=3,
+                    ) from exc
+
             execution_started = time.perf_counter()
             execution = {"status": "in_progress"}
             try:
@@ -199,6 +214,8 @@ class RasScenarioWorker:
                         max_dimension=product_options["max_dimension"],
                         nodata=product_options["nodata"],
                         include_preview=product_options["include_preview"],
+                        **({"crs_policy": product_options["crs_policy"]}
+                           if "crs_policy" in product_options else {}),
                     )
                 except Exception as exc:
                     raise RasScenarioWorkerError(
@@ -333,7 +350,10 @@ class RasScenarioWorker:
             optional={"retry"},
             label="request",
         )
-        if payload["schema"] not in {RasScenarioWorker.REQUEST_SCHEMA, RasScenarioWorker.LEGACY_REQUEST_SCHEMA}:
+        if payload["schema"] not in {
+            RasScenarioWorker.REQUEST_SCHEMA, RasScenarioWorker.LEGACY_REQUEST_SCHEMA,
+            RasScenarioWorker.CRS_REQUEST_SCHEMA,
+        }:
             raise RasScenarioWorkerError(
                 f"Unsupported RAS worker request schema: {payload['schema']!r}",
                 classification="invalid_request",
@@ -423,7 +443,7 @@ class RasScenarioWorker:
             "forcing_excess.interpolation",
             (
                 {"Nearest", "Bilinear", "preserve-source"}
-                if payload["schema"] == RasScenarioWorker.REQUEST_SCHEMA
+                if payload["schema"] != RasScenarioWorker.LEGACY_REQUEST_SCHEMA
                 else {"Nearest", "Bilinear"}
             ),
         )
@@ -484,9 +504,10 @@ class RasScenarioWorker:
         }
 
         product_config = _object(payload["products"], "products")
+        explicit_crs = payload["schema"] == RasScenarioWorker.CRS_REQUEST_SCHEMA
         _require_keys(
             product_config,
-            required={"directory"},
+            required={"directory", "crs_policy"} if explicit_crs else {"directory"},
             optional={"resolution", "max_dimension", "nodata", "include_preview"},
             label="products",
         )
@@ -554,6 +575,8 @@ class RasScenarioWorker:
                 "max_dimension": max_dimension,
                 "nodata": float(nodata),
                 "include_preview": include_preview,
+                **({"crs_policy": _choice(product_config["crs_policy"], "products.crs_policy",
+                                         {"strict", "result_geometry"})} if explicit_crs else {}),
             },
             "execution": {
                 "ras_executable": _resolved_path(
@@ -724,6 +747,13 @@ class RasScenarioWorker:
         for field in ("scenario", "hydrology", "forcing_excess", "model_window"):
             if prior_request[field] != request[field]:
                 reject(f"Retry changed immutable {field} inputs")
+        if RasScenarioWorker.CRS_REQUEST_SCHEMA in (prior_request["schema"], request["schema"]):
+            if prior_request["schema"] != request["schema"]:
+                reject("Retry changed the versioned CRS contract")
+            prior_products = {key: value for key, value in prior_request["products"].items() if key != "directory"}
+            current_products = {key: value for key, value in request["products"].items() if key != "directory"}
+            if prior_products != current_products:
+                reject("Retry changed immutable product options")
         source_identity_fields = (
             "project",
             "project_file_sha256",
