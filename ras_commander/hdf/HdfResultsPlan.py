@@ -220,6 +220,9 @@ class HdfResultsPlan:
         cumulative inflow minus outflow. Cumulative 2D inflow already includes
         precipitation; never add the separately reported precipitation again.
         Internal exchanges prevent summing area inflows into an external total.
+        Saved Computations/Volume and Volume Error datasets are per-area
+        scalars with shape (time, 1), not cell or face series. Read them against
+        the Base Output time axis without inferring a spatial Location.
 
         Args:
             hdf_path: Plan HDF path or supported plan selector.
@@ -238,7 +241,7 @@ class HdfResultsPlan:
         """
         import math
         from numbers import Real
-        from .HdfResultsMesh import HdfResultsMesh
+        from .HdfBase import HdfBase
 
         base = "Results/Unsteady/Summary/Volume Accounting"
 
@@ -279,7 +282,9 @@ class HdfResultsPlan:
             )
             two_d_path = f"{base}/Volume Accounting 2D"
             areas = []
-            series_available = {}
+            saved_series = {}
+            time_base = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series"
+            times = None
             for name in sorted(source[two_d_path]) if two_d_path in source else []:
                 raw = HdfUtils.convert_hdf5_attrs_to_dict(source[f"{two_d_path}/{name}"].attrs)
                 if raw.get("Vol Accounting in") != units:
@@ -294,31 +299,44 @@ class HdfResultsPlan:
                         "reconstruction_minus_reported": reconstructed - area_error,
                     }
                 )
-                series_base = (
-                    "Results/Unsteady/Output/Output Blocks/Base Output/"
-                    f"Unsteady Time Series/2D Flow Areas/{name}/Computations"
-                )
-                series_available[name] = [
-                    var for var in ("Volume", "Volume Error") if f"{series_base}/{var}" in source
-                ]
-
-        saved_series = {}
-        for name, variables in series_available.items():
-            saved_series[name] = {}
-            for variable in variables:
-                data = HdfResultsMesh.get_mesh_timeseries(
-                    hdf_path, name, f"Computations/{variable}", truncate=False
-                )
-                values = np.asarray(data.values)
-                if values.ndim != 2 or values.shape[1] != 1:
-                    raise ValueError(f"Expected one {variable} value per time for {name}")
-                if not np.isfinite(values).all():
-                    raise ValueError(f"Nonfinite {variable} samples for {name}")
-                saved_series[name][variable] = {
-                    "units": data.attrs.get("units", ""),
-                    "times": [pd.Timestamp(t).isoformat() for t in data.time.values],
-                    "values": values[:, 0].tolist(),
-                }
+                series_base = f"{time_base}/2D Flow Areas/{name}/Computations"
+                saved_series[name] = {}
+                for variable in ("Volume", "Volume Error"):
+                    dataset_path = f"{series_base}/{variable}"
+                    if dataset_path not in source:
+                        continue
+                    dataset = source[dataset_path]
+                    if (not isinstance(dataset, h5py.Dataset)
+                            or dataset.ndim != 2 or dataset.shape[1] != 1):
+                        raise ValueError(f"Expected one {variable} value per time for {name}")
+                    values = dataset[()]
+                    if values.dtype.kind not in "fiu" or not np.isfinite(values).all():
+                        raise ValueError(f"Expected finite numeric {variable} samples for {name}")
+                    if times is None:
+                        time_dataset = source[f"{time_base}/Time"]
+                        if not isinstance(time_dataset, h5py.Dataset):
+                            raise ValueError("Expected a Base Output Time dataset")
+                        raw_times = time_dataset[()]
+                        if (raw_times.ndim != 1 or raw_times.size == 0
+                                or raw_times.dtype.kind not in "fiu"
+                                or not np.isfinite(raw_times).all()
+                                or not np.all(raw_times[1:] > raw_times[:-1])):
+                            raise ValueError("Expected finite, strictly increasing Base Output Time samples")
+                        start = HdfBase.get_simulation_start_time(source)
+                        times = [
+                            pd.Timestamp(t).isoformat()
+                            for t in HdfUtils.convert_timesteps_to_datetimes(raw_times, start)
+                        ]
+                    if len(values) != len(times):
+                        raise ValueError(f"{variable} time rows differ from Base Output Time for {name}")
+                    series_units = dataset.attrs.get("Units", "")
+                    if isinstance(series_units, bytes):
+                        series_units = series_units.decode("utf-8")
+                    saved_series[name][variable] = {
+                        "units": series_units,
+                        "times": times.copy(),
+                        "values": values[:, 0].tolist(),
+                    }
         area_sum = math.fsum(number(area["raw"], "Error") for area in areas) if areas else None
         return {
             "units": units,

@@ -111,7 +111,8 @@ def test_missing_required_area_term_fails(accounting_hdf):
         HdfResultsPlan.get_volume_accounting_diagnostics(accounting_hdf)
 
 
-def test_zero_saved_error_is_not_substituted_for_final_error(accounting_hdf):
+@pytest.fixture
+def computation_hdf(accounting_hdf):
     with h5py.File(accounting_hdf, "a") as source:
         info = source.create_group("Plan Data/Plan Information")
         info.attrs["Simulation Start Time"] = np.bytes_("02JAN3000 00:00:00")
@@ -123,9 +124,61 @@ def test_zero_saved_error_is_not_substituted_for_final_error(accounting_hdf):
             "2D Flow Areas/Basin/Computations/Volume Error", data=np.zeros((3, 1))
         )
         error.attrs["Units"] = np.bytes_("ft^3")
-    result = HdfResultsPlan.get_volume_accounting_diagnostics(accounting_hdf)
+        volume = series.create_dataset(
+            "2D Flow Areas/Basin/Computations/Volume", data=[[0.0], [5.0], [11.0]]
+        )
+        volume.attrs["Units"] = "ft^3"
+    return accounting_hdf
+
+
+@pytest.mark.parametrize("backend", ["python", "auto"])
+def test_zero_saved_error_is_not_substituted_for_final_error(computation_hdf, monkeypatch, backend):
+    monkeypatch.setenv("RAS_COMMANDER_FAST_HDF", backend)
+    before = hashlib.sha256(computation_hdf.read_bytes()).hexdigest()
+    result = HdfResultsPlan.get_volume_accounting_diagnostics(computation_hdf)
     saved = result["saved_computation_series"]["Basin"]["Volume Error"]
     assert saved["times"] == ["3000-01-02T00:00:00", "3000-01-02T12:00:00", "3000-01-03T00:00:00"]
     assert saved["values"] == [0, 0, 0]
     assert saved["units"] == "ft^3"
     assert result["two_d"][0]["raw"]["Error"] == 1
+    volume = result["saved_computation_series"]["Basin"]["Volume"]
+    assert volume == {"times": saved["times"], "units": "ft^3", "values": [0, 5, 11]}
+    assert hashlib.sha256(computation_hdf.read_bytes()).hexdigest() == before
+
+
+SERIES = "Results/Unsteady/Output/Output Blocks/Base Output/Unsteady Time Series"
+
+
+@pytest.mark.parametrize(
+    "values, message",
+    [
+        (np.zeros((3, 2)), "one Volume value per time"),
+        (np.zeros(3), "one Volume value per time"),
+        (np.zeros((2, 1)), "time rows differ"),
+        ([[0], [np.nan], [1]], "finite numeric Volume"),
+        (np.full((3, 1), b"invalid"), "finite numeric Volume"),
+    ],
+)
+def test_rejects_malformed_computation_series(computation_hdf, values, message):
+    with h5py.File(computation_hdf, "a") as source:
+        path = f"{SERIES}/2D Flow Areas/Basin/Computations/Volume"
+        del source[path]
+        source.create_dataset(path, data=values)
+    with pytest.raises(ValueError, match=message):
+        HdfResultsPlan.get_volume_accounting_diagnostics(computation_hdf)
+
+
+@pytest.mark.parametrize("times", [[], [[0], [0.5], [1]], [0, np.inf, 1], [0, 0, 1], [1, 0.5, 0], [b"invalid"]])
+def test_rejects_malformed_computation_time_axis(computation_hdf, times):
+    with h5py.File(computation_hdf, "a") as source:
+        del source[f"{SERIES}/Time"]
+        source.create_dataset(f"{SERIES}/Time", data=times)
+    with pytest.raises(ValueError, match="Base Output Time samples"):
+        HdfResultsPlan.get_volume_accounting_diagnostics(computation_hdf)
+
+
+def test_missing_computation_time_axis_fails(computation_hdf):
+    with h5py.File(computation_hdf, "a") as source:
+        del source[f"{SERIES}/Time"]
+    with pytest.raises(KeyError):
+        HdfResultsPlan.get_volume_accounting_diagnostics(computation_hdf)
