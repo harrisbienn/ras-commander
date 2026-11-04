@@ -435,7 +435,15 @@ The library does not change JVM options or exception handlers automatically.
 | Write time series | Supported |
 | Write gridded precipitation | Supported |
 | Paired data | Not yet supported |
-| General grid reading API | Not yet supported |
+| Read a spatial grid record | Supported via `RasDss.read_grid()` with an exact DSS pathname |
+
+`RasDss.read_grid(dss_file, pathname)` requires pyjnius and the configured HEC
+Monolith runtime. It reads one grid record; wildcard pathnames are rejected.
+The returned dictionary includes a two-dimensional `float32` array, units,
+spatial metadata, and timestamps parsed from the pathname. Row zero is south,
+columns run west to east, and missing values are represented as `numpy.nan`.
+Flip rows before using a north-up raster transform or the native precipitation
+writer. This read operation does not establish lossless grid conversion.
 
 ## Technology Stack
 

@@ -40,4 +40,4 @@ from ras_commander import init_ras_project, RasCmdr
 
 ---
 
-> **Tip**: Have your LLM agent help investigate. It can read the source code, check `AGENTS.md` files for context, and propose fixes following the [style guide](../CONTRIBUTING.md).
+> **Tip**: Have your LLM agent help investigate. It can read the source code, check `AGENTS.md` files for context, and propose fixes following the [style guide](../../CONTRIBUTING.md).
