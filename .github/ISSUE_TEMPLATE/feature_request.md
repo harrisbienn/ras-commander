@@ -46,4 +46,4 @@ result = NewFeature.do_something(plan_number="01", ras_object=ras)
 
 ---
 
-> **Tip**: Consider prototyping with your LLM agent. Clone the repo, have your agent read the [style guide](../CONTRIBUTING.md) and `AGENTS.md` files, and submit a PR with a working implementation. We welcome LLM-assisted contributions.
+> **Tip**: Consider prototyping with your LLM agent. Clone the repo, have your agent read the [style guide](../../CONTRIBUTING.md) and `AGENTS.md` files, and submit a PR with a working implementation. We welcome LLM-assisted contributions.

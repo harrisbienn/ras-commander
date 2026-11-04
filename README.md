@@ -161,7 +161,7 @@ Legacy Version Support (NEW in v0.81.0)
 - Version migration validation and comparison
 - Open-operate-close pattern prevents conflicts with modern workflows
 - Seamless integration with ras-commander project management
-- See `examples/17_legacy_1d_automation_with_hecrascontroller_and_rascontrol.ipynb` for complete usage
+- See `examples/121_legacy_hecrascontroller_and_rascontrol.ipynb` for complete usage
 
 HDF Data Access & Analysis
 - 2D mesh results processing (depths, velocities, WSE)
