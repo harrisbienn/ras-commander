@@ -207,6 +207,7 @@ def _plan_inventory(*records, complete=True):
     )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows same-file alias matching")
 def test_plan_match_accepts_windows_same_file_aliases(tmp_path):
     project = tmp_path / "Fox.prj"
     plan = tmp_path / "Fox.p01"
@@ -372,14 +373,23 @@ def test_plan_matcher_ignores_unrelated_unmatchable_engine():
     assert result.query_errors == ()
 
 
-def test_plan_matcher_fails_closed_for_unmatchable_engine_with_plan_marker():
+def test_plan_matcher_fails_closed_for_unmatchable_engine_with_plan_marker(tmp_path):
     process = _record(
         10,
         "RasUnsteadySediment.exe",
         ["RasUnsteadySediment.exe", "b01"],
+        cwd=str(tmp_path),
     )
 
-    result = _plan_inventory(process)
+    # Marker binding compares the process cwd with the project's real parent.
+    # A Windows string wrapped in POSIX Path has no Windows parent directory.
+    result = match_plan_processes(
+        RasProcessInventory(observed_at=1.0, complete=True, processes=(process,)),
+        plan_number="01",
+        project_path=tmp_path / "Fox.prj",
+        plan_path=tmp_path / "Fox.p01",
+        tmp_hdf_path=tmp_path / "Fox.p01.tmp.hdf",
+    )
 
     assert result.matched == ()
     assert result.complete is False
