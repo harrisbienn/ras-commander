@@ -10,11 +10,7 @@ import shutil
 import stat
 import tempfile
 import uuid
-from concurrent.futures import (
-    ThreadPoolExecutor,
-    TimeoutError as FutureTimeoutError,
-)
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Iterable, Mapping, Optional, Union
@@ -139,6 +135,7 @@ class RasRunArtifact:
     output_end: Optional[str]
     time_window_matches: bool
     hdf_inspection_error: Optional[str]
+    execution_details: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Return a JSON-serializable run artifact."""
@@ -1483,7 +1480,28 @@ class RasScenario:
         timeout: int = 3600,
         num_cores: Optional[int] = None,
     ) -> RasRunArtifact:
-        """Execute a prepared scenario through RasCmdr and record its result."""
+        """Execute through RasCmdr's native deadline and retain shutdown evidence.
+
+        ``timeout`` bounds engine execution, including asynchronous solvers.
+        Preparation and result finalization are outside that deadline. The call
+        returns after package-owned cancellation/finalization, without leaving
+        a scenario executor thread able to launch or mutate the same workspace.
+        Failed runs without confirmed solver quiescence must not be retried.
+
+        Args:
+            workspace: Prepared scenario clone and its expected result window.
+            ras_exe_path: HEC-RAS executable selected for this clone.
+            timeout: Positive execution budget in seconds; defaults to 3600.
+            num_cores: Optional core count passed to ``RasCmdr.compute_plan``.
+
+        Returns:
+            RasRunArtifact: Execution and HDF completion evidence, including
+            cancellation details. Hydraulic acceptance remains a separate review.
+
+        Raises:
+            ValueError: If the timeout or prepared project configuration is invalid.
+            OSError: If project initialization or result-file inspection fails.
+        """
         if timeout <= 0:
             raise ValueError("timeout must be positive")
         project = init_ras_project(
@@ -1494,34 +1512,29 @@ class RasScenario:
             hide_intro=True,
         )
         started = datetime.now(timezone.utc)
-        executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="ras-scenario",
-        )
-        future = executor.submit(
-            RasCmdr.compute_plan,
+        result = RasCmdr.compute_plan(
             workspace.plan_number,
             ras_object=project,
             num_cores=num_cores,
             verify=True,
+            max_runtime=timeout,
         )
-        try:
-            result = future.result(timeout=timeout)
-        except FutureTimeoutError as exc:
-            cancelled = RasCmdr.cancel_plan(
-                workspace.plan_number,
-                ras_object=project,
-            )
-            raise TimeoutError(
-                f"RAS plan {workspace.plan_number} exceeded "
-                f"{timeout} seconds; cancellation requested={cancelled}"
-            ) from exc
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+        execution_details = dict(getattr(result, "execution_details", {}) or {})
         finished = datetime.now(timezone.utc)
         result_exists = workspace.result_hdf.is_file()
         result_size = workspace.result_hdf.stat().st_size if result_exists else 0
-        hdf_check = RasScenario._inspect_result_hdf(workspace)
+        if not result and execution_details.get("solver_quiescence_confirmed") is not True:
+            # A failed launcher may leave a solver writing this file. Preserve
+            # its evidence without opening the HDF or exporting partial data.
+            hdf_check = {
+                "completed_successfully": False,
+                "time_window_matches": False,
+                "output_start": None,
+                "output_end": None,
+                "error": "Result HDF inspection withheld: solver quiescence is unconfirmed",
+            }
+        else:
+            hdf_check = RasScenario._inspect_result_hdf(workspace)
         status = (
             "succeeded"
             if (
@@ -1548,6 +1561,7 @@ class RasScenario:
             output_end=hdf_check["output_end"],
             time_window_matches=hdf_check["time_window_matches"],
             hdf_inspection_error=hdf_check["error"],
+            execution_details=execution_details,
         )
 
     @staticmethod

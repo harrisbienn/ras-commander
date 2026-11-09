@@ -2,7 +2,6 @@
 
 import importlib
 import stat
-import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -11,6 +10,7 @@ import numpy as np
 import pytest
 
 from ras_commander import (
+    ComputeResult,
     RasBoundaryLink,
     RasScenario,
     RasScenarioWorkspace,
@@ -405,7 +405,8 @@ def test_prepare_workspace_preserves_linked_asset_sibling_layout(tmp_path):
     assert (terrain / "terrain.hdf").read_bytes() == b"terrain"
 
 
-def test_execute_cancels_plan_after_timeout(monkeypatch, tmp_path):
+@pytest.mark.parametrize("quiescent", [True, False, None])
+def test_execute_uses_native_deadline_and_retains_quiescence(monkeypatch, tmp_path, quiescent):
     project = tmp_path / "project"
     project.mkdir()
     workspace = RasScenarioWorkspace(
@@ -423,57 +424,35 @@ def test_execute_cancels_plan_after_timeout(monkeypatch, tmp_path):
         boundary_mapping_ids=("mapping",),
     )
     project_object = object()
-    released = threading.Event()
     calls = {}
     scenario_module = importlib.import_module("ras_commander.RasScenario")
-
-    monkeypatch.setattr(
-        scenario_module,
-        "init_ras_project",
-        lambda *args, **kwargs: project_object,
-    )
+    monkeypatch.setattr(scenario_module, "init_ras_project", lambda *args, **kwargs: project_object)
+    details = {
+        "runtime_timed_out": True,
+        "solver_quiescence_confirmed": quiescent,
+        "cancellation_details": {"quiescence_confirmed": quiescent},
+    }
 
     def compute_plan(plan_number, **kwargs):
         calls["compute"] = (plan_number, kwargs)
-        released.wait(timeout=1)
-        return False
+        return ComputeResult(success=False, execution_details=details)
 
-    def cancel_plan(plan_number, **kwargs):
-        calls["cancel"] = (plan_number, kwargs)
-        released.set()
-        return True
+    def inspect_hdf(_workspace):
+        calls["inspected"] = True
+        return {"completed_successfully": False, "time_window_matches": False,
+                "output_start": None, "output_end": None, "error": "missing"}
 
-    monkeypatch.setattr(
-        scenario_module.RasCmdr,
-        "compute_plan",
-        compute_plan,
-    )
-    monkeypatch.setattr(
-        scenario_module.RasCmdr,
-        "cancel_plan",
-        cancel_plan,
-    )
-
-    with pytest.raises(TimeoutError, match="cancellation requested=True"):
-        RasScenario.execute(
-            workspace,
-            ras_exe_path=RAS_EXE,
-            timeout=0.01,
-            num_cores=4,
-        )
-
+    monkeypatch.setattr(scenario_module.RasCmdr, "compute_plan", compute_plan)
+    monkeypatch.setattr(RasScenario, "_inspect_result_hdf", inspect_hdf)
+    artifact = RasScenario.execute(workspace, ras_exe_path=RAS_EXE, timeout=60, num_cores=4)
+    assert artifact.status == "failed"
+    assert artifact.execution_details == details
     assert calls["compute"] == (
-        "02",
-        {
-            "ras_object": project_object,
-            "num_cores": 4,
-            "verify": True,
-        },
+        "02", {"ras_object": project_object, "num_cores": 4, "verify": True, "max_runtime": 60}
     )
-    assert calls["cancel"] == (
-        "02",
-        {"ras_object": project_object},
-    )
+    assert calls.get("inspected", False) is (quiescent is True)
+    assert artifact.to_dict()["execution_details"]["solver_quiescence_confirmed"] is quiescent
+
 
 
 def test_execute_requires_hdf_completion_and_matching_time_axis(

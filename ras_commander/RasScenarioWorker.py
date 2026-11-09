@@ -266,6 +266,22 @@ class RasScenarioWorker:
             return 0
         except Exception as exc:
             failure = RasScenarioWorker._classify_exception(exc)
+            if execution.get("status") == "in_progress":
+                # An exception outside a completed execution artifact does not
+                # prove that native descendants released their files.
+                execution = {
+                    "status": "failed",
+                    "execution_details": {
+                        "solver_quiescence_confirmed": None,
+                        "failure_type": type(exc).__name__,
+                        "failure_detail": str(exc),
+                    },
+                }
+                failure.retryable = False
+                warnings.append(
+                    "Execution quiescence is unconfirmed; automated retry is blocked. "
+                    "Inspect/cancel the exact plan through RasCmdr and retain the failed attempt."
+                )
             result = RasScenarioWorker._result_payload(
                 request=request,
                 request_sha256=request_sha256,
@@ -787,7 +803,10 @@ class RasScenarioWorker:
 
     @staticmethod
     def _artifact_failure(artifact: RasRunArtifact) -> RasScenarioWorkerError:
-        if not artifact.result_exists:
+        if artifact.execution_details.get("runtime_timed_out") is True:
+            classification = "timeout"
+            message = "HEC-RAS exceeded its execution deadline"
+        elif not artifact.result_exists:
             classification = "missing_hdf"
             message = "HEC-RAS result HDF is missing"
         elif artifact.result_size_bytes <= 0:
@@ -807,11 +826,17 @@ class RasScenarioWorker:
             message = "HEC-RAS execution artifact failed validation"
         if artifact.hdf_inspection_error:
             message += f": {artifact.hdf_inspection_error}"
+        quiescent = artifact.execution_details.get("solver_quiescence_confirmed") is True
+        if not quiescent:
+            message += (
+                "; automated retry blocked because solver quiescence is unconfirmed. "
+                "Inspect/cancel the exact plan through RasCmdr and retain the failed attempt"
+            )
         return RasScenarioWorkerError(
             message,
             classification=classification,
             exit_code=4,
-            retryable=True,
+            retryable=quiescent,
         )
 
     @staticmethod
@@ -872,7 +897,7 @@ class RasScenarioWorker:
             return exc
         if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
             return RasScenarioWorkerError(
-                str(exc), classification="timeout", exit_code=4, retryable=True
+                str(exc), classification="timeout", exit_code=4, retryable=False
             )
         if isinstance(exc, FileExistsError):
             if "linked asset cache" in str(exc).casefold():
