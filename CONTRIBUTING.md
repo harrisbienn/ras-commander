@@ -227,6 +227,49 @@ This project follows the [LLM Forward](https://clbengineering.com/llm-forward) p
 *ras-commander is maintained by [CLB Engineering Corporation](https://clbengineering.com/). Licensed under MIT.*
 
 
+## Scenario and product contract CI
+
+`Scenario and product contracts` runs on every pull request and main push with
+Python 3.12 on Linux and Windows. Each platform tests `RAS_COMMANDER_FAST_HDF=h5py`
+and `RAS_COMMANDER_FAST_HDF=auto`. The auto job requires an importable native HDF
+extension; installation or compatibility failure fails the job. Auto mode retains
+the library's normal h5py fallback for unsupported reads, so this is coverage of
+the deployed selection behavior, not proof that every fixture used native code.
+
+The workflow builds and installs a wheel, verifies schema resources and the
+installed `ras-scenario-worker --help` entry point, then runs the portable suites.
+Use a clean Python environment and the dependency installation commands in
+`.github/workflows/scenario-contracts.yml`. Set `CI=1` before building to avoid
+maintainer knowledge-base generation. Set `RAS_COMMANDER_FAST_HDF` to each mode,
+then repeat these commands:
+
+```bash
+python -I .github/scripts/check_worker_wheel.py
+python -I -m pytest --strict-markers -ra tests/test_ras_scenario.py tests/test_scenario_worker.py tests/test_scenario_worker_crs.py tests/test_hdf_results_products.py tests/test_hdf_results_products_crs.py tests/test_hdf_results_products_export.py tests/test_hdf_results_products_inspection.py tests/test_rascmdr_compute_plan_control_flow.py tests/test_rascmdr_async_process_inventory.py tests/test_process_inspection.py tests/test_process_inspection_event_writers.py tests/test_scenario_quiescence.py -m "not integration and not real_ras and not transport and not slow"
+python -m pip check
+```
+
+These tests use temporary file-format fixtures, controlled process inventories,
+and Python subprocesses. They cover worker failure records, CRS decisions,
+hydraulic product export/inspection, and solver-quiescence decisions without
+executing HEC-RAS or downloading models. Five workspace-preparation tests require
+an installed HEC-RAS path and report a skip on hosted runners. Windows path and
+process-lifetime cases run on Windows and report platform skips on Linux. The
+three explicitly marked integration cases (one real scenario execution and two
+existing-HDF checks) remain excluded. Installed-engine interruption and
+engineering qualification require separate retained evidence.
+
+The four stable check names are `Scenario contracts (ubuntu-latest, h5py)`,
+`Scenario contracts (ubuntu-latest, auto)`,
+`Scenario contracts (windows-latest, h5py)`, and
+`Scenario contracts (windows-latest, auto)`. Administrators must make these checks
+required through repository controls; workflow YAML alone does not enforce a
+merge gate. The jobs use commit-pinned Actions, read-only tokens, nonpersistent
+checkout credentials, and no deployment secrets. They do not publish packages.
+Required-check enforcement and package-release controls remain tracked in #35
+and FloodForecast #96; this workflow does not establish either administrative
+acceptance or installed-engine qualification.
+
 ## Documentation CI and fallback deployment
 
 `Validate Documentation` runs on every PR and main push, including source,
