@@ -184,6 +184,7 @@ examples/.old/
 
 # Temporary test scripts (task-specific)
 check_*.py
+!/.github/scripts/check_worker_wheel.py
 !ras_commander/check/check_*.py
 fix_*.py
 run_*.py

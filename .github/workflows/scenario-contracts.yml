@@ -1,0 +1,67 @@
+name: Scenario and product contracts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scenario-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    name: Scenario contracts (${{ matrix.os }}, ${{ matrix.backend }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        backend: [h5py, auto]
+    env:
+      CI: '1'
+      RAS_COMMANDER_FAST_HDF: ${{ matrix.backend }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pip==26.2.1
+      - name: Build the package wheel without deployment
+        run: python -m pip wheel --no-deps --wheel-dir dist .
+      - name: Install the wheel and deliberate product dependencies
+        run: >-
+          python -m pip install --only-binary rasterio,scipy,ras-commander-fast-hdf
+          dist/*.whl pytest==9.1.1 psutil pyproj geopandas "shapely>=2.0"
+          rasterio scipy xarray "pyarrow>=16" jsonschema matplotlib
+      - name: Check installed worker entry point and schema resources
+        run: python -I .github/scripts/check_worker_wheel.py
+      - name: Require the installed native HDF backend for auto coverage
+        if: matrix.backend == 'auto'
+        run: >-
+          python -I -c "import importlib.metadata as m; from ras_commander import fast_hdf;
+          assert fast_hdf.available(), 'Native HDF extension must be available';
+          print('ras-commander-fast-hdf', m.version('ras-commander-fast-hdf'))"
+      - name: Run offline scenario, hydraulic product, and process contracts
+        run: >-
+          python -I -m pytest --strict-markers -ra
+          tests/test_ras_scenario.py tests/test_scenario_worker.py
+          tests/test_scenario_worker_crs.py tests/test_hdf_results_products.py
+          tests/test_hdf_results_products_crs.py tests/test_hdf_results_products_export.py
+          tests/test_hdf_results_products_inspection.py
+          tests/test_rascmdr_compute_plan_control_flow.py
+          tests/test_rascmdr_async_process_inventory.py tests/test_process_inspection.py
+          tests/test_process_inspection_event_writers.py tests/test_scenario_quiescence.py
+          -m "not integration and not real_ras and not transport and not slow"
+      - run: python -m pip check
+      - run: python -m pip freeze --all
