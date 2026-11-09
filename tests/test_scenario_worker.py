@@ -465,9 +465,9 @@ def test_worker_writes_failure_result_for_timeout(tmp_path, monkeypatch):
     assert RasScenarioWorker.run(request_path, result_path) == 4
     result = json.loads(result_path.read_text(encoding="utf-8"))
     assert result["error"]["classification"] == "timeout"
-    assert result["error"]["retryable"] is True
+    assert result["error"]["retryable"] is False
     assert result["preparation"]["status"] == "passed"
-    assert result["execution"]["status"] == "in_progress"
+    assert result["execution"]["status"] == "failed"
     assert Path(request["workspace"]).is_dir()
 
 
@@ -477,6 +477,15 @@ def test_worker_writes_failure_result_for_timeout(tmp_path, monkeypatch):
         ({"result_exists": False, "result_size_bytes": 0}, "missing_hdf"),
         ({"hdf_completed_successfully": False}, "incomplete_hdf"),
         ({"time_window_matches": False}, "mismatched_result_time"),
+        ({"compute_returned_successfully": False, "execution_details": {
+            "runtime_timed_out": True, "solver_quiescence_confirmed": True,
+        }}, "timeout"),
+        ({"compute_returned_successfully": False, "execution_details": {
+            "runtime_timed_out": True, "solver_quiescence_confirmed": False,
+        }}, "timeout"),
+        ({"compute_returned_successfully": False, "execution_details": {
+            "runtime_timed_out": True, "solver_quiescence_confirmed": None,
+        }}, "timeout"),
     ],
 )
 def test_worker_classifies_failed_execution_artifacts(
@@ -513,6 +522,9 @@ def test_worker_classifies_failed_execution_artifacts(
     assert RasScenarioWorker.run(request_path, result_path) == 4
     result = json.loads(result_path.read_text(encoding="utf-8"))
     assert result["error"]["classification"] == classification
+    assert result["error"]["retryable"] is (
+        changes.get("execution_details", {}).get("solver_quiescence_confirmed") is True
+    )
     assert result["products"] is None
 
 

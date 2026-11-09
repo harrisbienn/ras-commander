@@ -137,6 +137,29 @@ directory, conflicting result, or changed completed output. Timeout and failed
 attempt workspaces are retained for diagnosis and GUI review, and failure
 results are written atomically when possible.
 
+The execution timeout is passed to `RasCmdr.compute_plan(max_runtime=...)`.
+It covers engine execution and asynchronous solver completion; preparation,
+cancellation and result finalization can take additional time. Scenario execution
+waits for that package-owned cleanup and retains its `execution_details` in the
+result. There is no detached scenario executor thread after a timeout.
+
+A failed execution is retryable only when
+`execution.execution_details.solver_quiescence_confirmed` is exactly `true`.
+The cancellation record distinguishes stopped identities, surviving processes
+and inspection uncertainty. A timeout exception without this evidence is
+non-retryable. When quiescence is unconfirmed, the scenario also withholds HDF
+inspection and product export. Preserve the failed workspace; use
+`RasCmdr.inspect_plan_processes()` and `RasCmdr.cancel_plan_exact()` with the
+failed clone's initialized project context to inspect or stop only that plan.
+Retain the resulting evidence before an operator authorizes a fresh attempt.
+
+Abrupt worker/coordinator termination is outside this in-process cleanup path.
+The calling supervisor must contain owned descendants and fence retries after
+interruption. Portable tests use harmless Python descendants and synthetic
+process metadata; installed-engine interruption still requires qualification
+on disposable model clones. Process quiescence does not establish hydraulic
+acceptance.
+
 ## Shared linked-asset cache and preparation retry
 
 Large immutable linked directories such as `Terrain`, `Land Cover`, and
