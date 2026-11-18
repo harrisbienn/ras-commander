@@ -1,11 +1,16 @@
+import io
+import json
 import logging
 import types
+from typing import ClassVar
 
-import pytest
+from test_monolith_integrity import Response, identity, seed
+from test_monolith_integrity import (
+    runtime as runtime,  # noqa: PLC0414 - pytest fixture re-export
+)
 
 from ras_commander.dss import _hec_monolith
 from ras_commander.dss._hec_monolith import HecMonolithDownloader
-
 
 LOGGER_NAME = "ras_commander.dss._hec_monolith"
 
@@ -14,7 +19,8 @@ def test_install_is_quiet_by_default(monkeypatch, caplog, capsys, tmp_path):
     downloader = HecMonolithDownloader(cache_dir=tmp_path)
     calls = []
 
-    monkeypatch.setattr(downloader, "is_installed", lambda: False)
+    states = iter((False, True))
+    monkeypatch.setattr(downloader, "is_installed", lambda: next(states))
     monkeypatch.setattr(downloader, "download_jars", lambda: calls.append("jars"))
     monkeypatch.setattr(
         downloader,
@@ -39,9 +45,7 @@ def test_install_is_quiet_by_default(monkeypatch, caplog, capsys, tmp_path):
     assert "HEC Monolith installation complete" in debug_messages
 
 
-def test_install_already_installed_is_debug_only(
-    monkeypatch, caplog, capsys, tmp_path
-):
+def test_install_already_installed_is_debug_only(monkeypatch, caplog, capsys, tmp_path):
     downloader = HecMonolithDownloader(cache_dir=tmp_path)
     monkeypatch.setattr(downloader, "is_installed", lambda: True)
     caplog.set_level(logging.DEBUG, logger=LOGGER_NAME)
@@ -59,12 +63,11 @@ def test_install_already_installed_is_debug_only(
     assert "HEC Monolith already installed" in debug_messages
 
 
-def test_download_file_cached_is_debug_only(
-    monkeypatch, caplog, capsys, tmp_path
-):
-    downloader = HecMonolithDownloader(cache_dir=tmp_path)
-    cached = tmp_path / "jar" / "hec-monolith.jar"
-    cached.write_bytes(b"cached")
+def test_download_file_cached_is_debug_only(monkeypatch, caplog, capsys, runtime):
+    downloader, _, payloads = runtime
+    seed(downloader, payloads, ["jar/fixture-1.jar"])
+    cached = downloader.jar_dir / "fixture-1.jar"
+    url = downloader._download_sources()["jar/fixture-1.jar"]
 
     def fail_request(*_args, **_kwargs):
         raise AssertionError("download_file should not request cached files")
@@ -72,7 +75,7 @@ def test_download_file_cached_is_debug_only(
     monkeypatch.setattr(_hec_monolith.requests, "get", fail_request)
     caplog.set_level(logging.DEBUG, logger=LOGGER_NAME)
 
-    result = downloader.download_file("https://example.invalid/file.jar", cached)
+    result = downloader.download_file(url, cached)
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -83,25 +86,28 @@ def test_download_file_cached_is_debug_only(
         for record in caplog.records
         if record.name == LOGGER_NAME and record.levelno == logging.DEBUG
     ]
-    assert "Using cached HEC Monolith file: hec-monolith.jar" in debug_messages
+    assert "Using cached HEC Monolith file: fixture-1.jar" in debug_messages
 
 
-def test_download_file_disables_progress_for_non_tty(
-    monkeypatch, capsys, tmp_path
-):
+def test_download_file_disables_progress_for_non_tty(monkeypatch, capsys, runtime):
     tqdm_calls = []
     updates = []
 
-    class FakeResponse:
-        headers = {"content-length": "4"}
+    class FakeResponse(Response):
+        headers: ClassVar[dict[str, str]] = {"content-length": "4"}
 
         def raise_for_status(self):
             pass
 
-        def iter_content(self, chunk_size):
-            assert chunk_size == 8192
-            yield b"ab"
-            yield b"cd"
+        def __init__(self):
+            self.raw = self
+            self.chunks = iter((b"ab", b"cd", b""))
+
+        def read1(self, size):
+            return next(self.chunks)
+
+        def close(self):
+            pass
 
     class FakeTqdm:
         def __init__(self, **kwargs):
@@ -119,7 +125,7 @@ def test_download_file_disables_progress_for_non_tty(
     monkeypatch.setattr(
         _hec_monolith.requests,
         "get",
-        lambda url, stream: FakeResponse(),
+        lambda url, **kwargs: FakeResponse(),
     )
     monkeypatch.setattr(_hec_monolith, "tqdm", FakeTqdm)
     monkeypatch.setattr(
@@ -128,10 +134,14 @@ def test_download_file_disables_progress_for_non_tty(
         types.SimpleNamespace(isatty=lambda: False),
     )
 
-    downloader = HecMonolithDownloader(cache_dir=tmp_path)
-    dest = tmp_path / "jar" / "download.bin"
+    downloader, trust, _ = runtime
+    downloader.allow_downloads = True
+    name = "jar/fixture-1.jar"
+    trust["artifacts"][name] = trust["downloads"][name] = identity(b"abcd")
+    downloader.trust_manifest.write_text(json.dumps(trust))
+    dest = downloader.jar_dir / "fixture-1.jar"
 
-    result = downloader.download_file("https://example.invalid/download.bin", dest)
+    result = downloader.download_file(downloader._download_sources()[name], dest)
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -151,18 +161,17 @@ def test_download_file_disables_progress_for_non_tty(
     ]
 
 
-def test_download_file_can_explicitly_show_progress(monkeypatch, tmp_path):
+def test_download_file_can_explicitly_show_progress(monkeypatch, runtime):
     tqdm_calls = []
 
-    class FakeResponse:
-        headers = {"content-length": "1"}
+    class FakeResponse(Response):
+        headers: ClassVar[dict[str, str]] = {"content-length": "1"}
 
         def raise_for_status(self):
             pass
 
-        def iter_content(self, chunk_size):
-            assert chunk_size == 8192
-            yield b"x"
+        def __init__(self):
+            self.raw = io.BytesIO(b"x")
 
     class FakeTqdm:
         def __init__(self, **kwargs):
@@ -180,15 +189,20 @@ def test_download_file_can_explicitly_show_progress(monkeypatch, tmp_path):
     monkeypatch.setattr(
         _hec_monolith.requests,
         "get",
-        lambda url, stream: FakeResponse(),
+        lambda url, **kwargs: FakeResponse(),
     )
     monkeypatch.setattr(_hec_monolith, "tqdm", FakeTqdm)
 
-    downloader = HecMonolithDownloader(cache_dir=tmp_path, show_progress=True)
+    downloader, trust, _ = runtime
+    downloader.allow_downloads = True
+    downloader.show_progress = True
+    name = "jar/fixture-1.jar"
+    trust["artifacts"][name] = trust["downloads"][name] = identity(b"x")
+    downloader.trust_manifest.write_text(json.dumps(trust))
 
     downloader.download_file(
-        "https://example.invalid/download.bin",
-        tmp_path / "jar" / "download.bin",
+        downloader._download_sources()[name],
+        downloader.jar_dir / "fixture-1.jar",
     )
 
     assert tqdm_calls[0]["disable"] is False

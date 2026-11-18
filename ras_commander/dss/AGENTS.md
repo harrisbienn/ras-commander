@@ -35,7 +35,9 @@ This file is the canonical local instruction file for `ras_commander/dss/`.
 ## Dependency Rules
 
 - `pyjnius` and Java are optional runtime prerequisites and should fail with clear installation guidance when missing.
-- Keep the monolith download flow lazy and on-demand.
+- Keep monolith setup lazy. Require an independently approved trust manifest;
+  downloads are disabled unless explicitly enabled by the RAS-owned policy.
+  See `docs/user-guide/dss-operations.md` for the sealed-cache contract.
 
 ## Common API Surface
 
