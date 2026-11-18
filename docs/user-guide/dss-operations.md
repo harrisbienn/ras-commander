@@ -118,7 +118,7 @@ engine/version as part of the project workflow.
 The `RasDss` class reads HEC-DSS time series data using HEC's Monolith Java libraries:
 
 - Supports DSS Version 6 and Version 7 files
-- Auto-downloads required libraries (~17 MB) on first use
+- Verifies an approved cache; network acquisition is disabled by default
 - Lazy loading - no overhead unless DSS methods are called
 - Tested with 84 DSS files totaling 6.64 GB
 
@@ -140,6 +140,70 @@ or starting a conversion process. The conversion helper explicitly closes its
 source and destination handles without closing unrelated DSS files.
 
 ## Java bridge requirements
+
+### Approved runtime cache
+
+The Java bridge uses policy `ras-commander/dss-runtime-trust/1.0.0`.
+Configure its runtime before the first DSS call:
+
+| Setting | Meaning |
+| --- | --- |
+| `RAS_DSS_CACHE_DIR` | Optional cache root; defaults to `~/.ras-commander/dss` |
+| `RAS_DSS_TRUST_MANIFEST` | Required path to an independently approved JSON manifest outside the writable cache |
+| `RAS_DSS_ALLOW_DOWNLOADS` | Downloads are off by default; only the exact value `1` enables acquisition |
+
+HMS settings do not enable or configure this RAS-owned path. Missing trust,
+corrupt files and unexpected executable cache members fail before Java loading.
+An incomplete offline cache fails with provisioning guidance and no network call.
+
+The manifest has exactly `format_version` (integer `1`), `platform` (`Windows`,
+`Linux` or `Darwin`), `artifacts`, and `downloads`. Both mappings use portable,
+case-unique paths under `jar/` or `lib/`; each entry contains exactly a lowercase
+64-character `sha256` and positive integer `size_bytes`. `artifacts` lists every
+selected versioned JAR and all required native members. `downloads` lists those
+same JAR identities and the selected native ZIP identity. The seven JAR versions
+and platform archive are selected by `HecMonolithDownloader.COMMON_JARS` and
+`NATIVE_LIBS`; extra JAR versions are not admitted. The principal native library
+must be `lib/javaHeclib.dll`, `lib/libjavaHeclib.so` or
+`lib/libjavaHeclib.dylib`, according to the selected platform.
+
+Obtain approved digests and sizes through the runtime's independent acquisition
+and qualification process. The package supplies no approved production manifest.
+Hashing whatever happens to be in a writable cache does not establish trust.
+Administrators must protect the manifest, cache and selected Java/Python runtime
+against unauthorized writers. Manifest location checks do not prove those access
+controls, and this policy does not qualify the Java installation or model results.
+
+The internal downloader preserves its cache/progress arguments and accepts
+keyword-only `trust_manifest` and `allow_downloads` overrides. `allow_downloads`
+accepts only a Boolean or `None`; `None` uses the environment policy. Its
+`TRUST_POLICY` identifier and `get_info()["trust_policy"]` let integrating workers
+refuse older implementations that do not enforce the policy.
+
+Provision a complete cache before normal operation. Explicit acquisition uses
+verified TLS, fixed selected source URLs, no redirects, a 5-second connection
+timeout and 1-second socket read timeout. Each transfer enforces the approved
+byte count and a cooperative 300-second deadline, checked around every read and
+before publication. DNS and an OS call already in progress still require an
+outer process deadline. The manifest is limited to 1 MiB and 256 entries per
+mapping; each mapping has a 1 GiB aggregate byte budget. Native archives have a
+256-member limit and permit only approved member names, sizes and digests.
+
+Downloads and extracted members use unique sibling staging files, flush their
+complete verified bytes, and publish with a same-filesystem hard link. Identical
+concurrent publication is reusable; conflicting files remain unchanged, including
+with `force=True`. The filesystem must support this operation; remote-store
+semantics require separate qualification. A process crash may leave an ignored
+`.download-*` or `.extract-*` stage. It cannot make that stage a classpath member.
+Remove abandoned stages only with all cache writers stopped. Earlier malformed
+final files require explicit operator quarantine or a separately provisioned cache.
+
+RAS Commander replaces ambient JVM classpath entries with the selected verified
+JAR paths; pyjnius adds its own required bridge resources. An already-running JVM
+that was not configured by `RasDss` is refused. Start a fresh process and configure
+the approved cache before importing Java classes. Repeated owned calls recheck
+cache integrity; do not replace runtime files or their approval manifest in an
+active Java process. Native read/write compatibility remains a separate check.
 
 ```bash
 # Install pyjnius (Java bridge)
@@ -305,7 +369,7 @@ except RuntimeError as e:
 
 ## Performance Notes
 
-1. **First use**: Library downloads HEC Monolith (~17 MB)
+1. **First use**: Library verifies the configured approved HEC Monolith cache
 2. **Large files**: Successfully tested up to 1.3 GB DSS files
 3. **Memory**: Large time series may require chunked reading
 4. **Caching**: Catalog is cached per file during session

@@ -32,6 +32,7 @@ def test_ensure_monolith_uses_concise_log_instead_of_stdout(
     class FakeDownloader:
         def __init__(self):
             self.install_called = False
+            self.allow_downloads = True
             instances.append(self)
 
         def is_installed(self):
@@ -49,7 +50,7 @@ def test_ensure_monolith_uses_concise_log_instead_of_stdout(
     assert instances[0].install_called
     assert capsys.readouterr().out == ""
     assert any(
-        "Installing HEC Monolith libraries for DSS operations" in record.getMessage()
+        "Installing approved HEC Monolith libraries for DSS operations" in record.getMessage()
         for record in caplog.records
     )
 
@@ -62,7 +63,7 @@ def test_configure_jvm_success_is_debug_only(monkeypatch, caplog, capsys, tmp_pa
 
     fake_jnius_config = types.SimpleNamespace(
         vm_running=False,
-        add_classpath=add_classpath,
+        set_classpath=add_classpath,
     )
     monkeypatch.setitem(sys.modules, "jnius_config", fake_jnius_config)
 

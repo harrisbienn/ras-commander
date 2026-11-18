@@ -43,7 +43,7 @@ jobs:
         run: >-
           python -m pip install --only-binary rasterio,scipy,ras-commander-fast-hdf
           dist/*.whl pytest==9.1.1 psutil pyproj geopandas "shapely>=2.0"
-          rasterio scipy xarray "pyarrow>=16" jsonschema matplotlib
+          rasterio scipy xarray "pyarrow>=16" jsonschema matplotlib requests tqdm
       - name: Check installed worker entry point and schema resources
         run: python -I .github/scripts/check_worker_wheel.py
       - name: Require the installed native HDF backend for auto coverage
@@ -62,6 +62,8 @@ jobs:
           tests/test_rascmdr_compute_plan_control_flow.py
           tests/test_rascmdr_async_process_inventory.py tests/test_process_inspection.py
           tests/test_process_inspection_event_writers.py tests/test_scenario_quiescence.py
+          tests/test_monolith_integrity.py tests/test_hec_monolith_logging.py
+          tests/test_ras_dss_logging.py tests/test_rasdss_java_discovery.py
           -m "not integration and not real_ras and not transport and not slow"
       - run: python -m pip check
       - run: python -m pip freeze --all

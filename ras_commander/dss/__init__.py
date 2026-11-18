@@ -9,15 +9,17 @@ Lazy Loading Behavior:
     - `import ras_commander` - DSS not loaded (fast startup)
     - `from ras_commander import RasDss` - DSS subpackage loaded
     - `RasDss.get_catalog(...)` - pyjnius/Java loaded on first call
-    - HEC Monolith libraries downloaded automatically on first use (~20 MB)
+    - HEC Monolith cache verified on use; downloads require explicit opt-in
 
 Dependencies:
     Required at runtime (lazy loaded):
         - pyjnius: pip install pyjnius
         - Java JRE/JDK 8+: Must be installed and JAVA_HOME set
 
-    Auto-downloaded:
-        - HEC Monolith libraries (~20 MB, cached in ~/.ras-commander/dss/)
+    Independently approved runtime:
+        - HEC Monolith JARs and native libraries in RAS_DSS_CACHE_DIR
+        - RAS_DSS_TRUST_MANIFEST outside the writable cache
+        - RAS_DSS_ALLOW_DOWNLOADS=1 only for explicit verified acquisition
 
 Usage:
     from ras_commander import RasDss

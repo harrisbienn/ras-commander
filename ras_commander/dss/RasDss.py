@@ -5,12 +5,12 @@ Summary:
     Provides static methods for interacting with HEC-DSS files (versions 6 and 7),
     enabling reading of time series, extracting catalogs, extracting boundary time
     series, and fetching file metadata, all using HEC Monolith libraries accessed
-    via pyjnius. JVM setup and dependency downloads are handled automatically at
-    runtime.
+    via pyjnius. JVM setup uses an independently approved runtime cache;
+    verified dependency acquisition requires explicit opt-in.
 
 Functions:
     _ensure_monolith():
-        Ensures HEC Monolith Java libraries are installed (downloads if needed).
+        Verifies HEC Monolith Java libraries before optional explicit acquisition.
     _configure_jvm():
         Configures the JVM and sets classpath/library paths for pyjnius.
     get_catalog(dss_file):
@@ -79,7 +79,7 @@ class RasDss:
     """
     Static class for DSS file operations.
 
-    Uses HEC Monolith libraries (auto-downloaded on first use).
+    Uses HEC Monolith libraries from an independently approved runtime cache.
     Supports both DSS V6 and V7 formats.
 
     All heavy dependencies (pyjnius, Java) are lazy-loaded on first use.
@@ -172,32 +172,35 @@ class RasDss:
 
     @staticmethod
     def _ensure_monolith():
-        """Ensure HEC Monolith is downloaded and available."""
-        if RasDss._monolith is not None:
-            return RasDss._monolith
-
+        """Authenticate the complete cache before loading; acquisition is opt-in."""
         # Lazy import from same subpackage
         from ._hec_monolith import HecMonolithDownloader
 
-        RasDss._monolith = HecMonolithDownloader()
+        monolith = RasDss._monolith or HecMonolithDownloader()
 
-        if not RasDss._monolith.is_installed():
+        if not monolith.is_installed():
+            if not monolith.allow_downloads:
+                raise RuntimeError(
+                    "Verified DSS runtime is incomplete and downloads are disabled. "
+                    "Provision the approved RAS_DSS_CACHE_DIR before use; explicit acquisition "
+                    "requires RAS_DSS_ALLOW_DOWNLOADS=1 and RAS_DSS_TRUST_MANIFEST."
+                )
             logger.info(
-                "Installing HEC Monolith libraries for DSS operations "
-                "(one-time download, ~20 MB)"
+                "Installing approved HEC Monolith libraries for DSS operations"
             )
-            RasDss._monolith.install()
+            monolith.install()
 
-        return RasDss._monolith
+        RasDss._monolith = monolith
+        return monolith
 
     @staticmethod
     def _configure_jvm():
         """Configure JVM classpath for pyjnius (must be done before first import)."""
+        # Validate again even after setup; a cached Python object is not evidence
+        # that retained executable bytes still match the approved manifest.
+        monolith = RasDss._ensure_monolith()
         if RasDss._jvm_configured:
             return
-
-        # Ensure monolith is installed
-        monolith = RasDss._ensure_monolith()
 
         # Lazy import pyjnius config
         try:
@@ -210,10 +213,12 @@ class RasDss:
 
         # Check if JVM already started using jnius_config (does NOT start the JVM)
         # IMPORTANT: Never import from jnius here - that would start the JVM with
-        # an empty classpath before we can call jnius_config.add_classpath()
+        # an empty classpath before we can call jnius_config.set_classpath()
         if getattr(jnius_config, 'vm_running', False):
-            RasDss._jvm_configured = True
-            return
+            raise RuntimeError(
+                "A JVM is already running outside RasDss runtime admission. "
+                "Use a fresh process and configure the approved DSS cache before importing Java classes."
+            )
 
         # Get classpath and library path
         classpath = monolith.get_classpath()
@@ -238,7 +243,9 @@ class RasDss:
             logger.debug("Found Java runtime: %s", java_home)
 
         # Set classpath (must be done before first import from jnius)
-        jnius_config.add_classpath(*classpath)
+        # Replace ambient/caller classpath entries instead of appending trusted
+        # JARs to an unverified search path. Pyjnius adds its own bridge resources.
+        jnius_config.set_classpath(*classpath)
 
         # Set library path for native libraries
         if 'LD_LIBRARY_PATH' in os.environ:

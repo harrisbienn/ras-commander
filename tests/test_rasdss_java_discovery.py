@@ -164,7 +164,7 @@ def configuration_without_java(monkeypatch):
     import sys
     import types
     monolith = types.SimpleNamespace(get_classpath=lambda: ["bridge.jar"], get_library_path=lambda: "native")
-    config = types.SimpleNamespace(vm_running=False, add_classpath=lambda *args: None)
+    config = types.SimpleNamespace(vm_running=False, set_classpath=lambda *args: None)
     monkeypatch.setattr(RasDss, "_ensure_monolith", lambda: monolith)
     monkeypatch.setattr(RasDss, "_jvm_configured", False)
     monkeypatch.setitem(sys.modules, "jnius_config", config)
