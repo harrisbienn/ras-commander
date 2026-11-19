@@ -1,0 +1,6 @@
+Geom Title=Synthetic geometry
+Program Version=6.60
+River Reach=River           ,Reach
+Type RM Length L Ch R = 1 ,1000,0,0,0
+IC Point Name=ReferencePoint
+IC Point X and Y=0,0

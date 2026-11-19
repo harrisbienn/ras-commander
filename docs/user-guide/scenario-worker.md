@@ -99,6 +99,116 @@ successful execution as a failure.
 
 ## Repeat and failure behavior
 
+### Provisional forecast initialization (request 1.3)
+
+Request `ras-commander/scenario-worker-request/1.3`, named by
+`RasScenarioWorker.FORECAST_REQUEST_SCHEMA`, adds an explicit initialization
+binding to the 1.2 CRS contract. Existing request 1.0/1.1/1.2 and result 1.0
+schemas remain unchanged. The result's existing preparation object carries
+`forecast_initialization` evidence; no historical result is relabeled.
+
+The first supported method preserves source-declared static IC values in a
+run clone. It requires these initialization fields:
+
+| Field | Required value or identity |
+| --- | --- |
+| `method` | `static` |
+| `disposition` | `provisional-static` |
+| `reference_policy` | `clear-in-clone` |
+| `anchor_time` | UTC instant ending in `Z`, equal to model-window start |
+| `predecessor` | `null`; no prior forecast state is reused |
+| `package_sha256` | Independently selected RAS model package digest |
+| `model_manifest_sha256` | Pinned source model manifest digest |
+| `plan_sha256`, `geometry_sha256`, `unsteady_sha256` | Actual selected source files |
+| `engine_sha256` | Actual selected executable bytes |
+| `hydrology_sha256`, `forcing_sha256` | Exact request DSS input digests |
+
+Request 1.3 also requires `source_model.package_sha256`,
+`model_window.time_zone="UTC"` and the 1.2 `products.crs_policy`.
+Native model-window strings remain timezone-free but now represent UTC and
+must be minute-aligned, matching the precision of native plan text. The anchor
+declares applicability for this run; it does not establish an observed state
+at that instant.
+
+The pinned model manifest must have
+`contract_type="floodforecast/model-inventory/2.0.0"`, `stage="ras"` and
+`content_summary.content_tree_sha256` equal to the selected RAS package digest.
+The worker matches this declaration and independently hashes the selected
+project, linked plan/geometry/unsteady files, engine and forcing. The
+orchestrator remains responsible for authenticating the complete package tree.
+A manifest declaration is not evidence that the worker verified every asset.
+Source verification alone does not establish clone-preparation readiness.
+Current full preparation requires source text already normalized to native
+CRLF line endings: some existing writers preserve source endings while others
+emit CRLF. An LF source can therefore fail the unchanged newline gate during
+cloning. Use an authenticated normalized source successor; this initialization
+API does not silently normalize or rewrite the canonical source.
+
+Source admission requires one explicit `Use Restart=0` or `False` selector,
+unambiguous controls and completely parsed finite IC records. Duplicate or
+unknown controls, malformed records and contradictory native unit declarations
+refuse admission. Named IC elevations must match exactly one IC point in the
+selected geometry. No point, flow or elevation is assigned or converted.
+Missing scientific units/datum remain unreviewed for this unchanged-state
+method; the clone must preserve the source's known or unknown native units.
+
+Some delivered sources retain populated restart and prior-results references
+alongside static values. The worker does not infer that those references are
+inactive. The explicit `clear-in-clone` policy uses
+`RasUnsteady.set_initial_flow_method(..., "initial_flow_distribution")` to
+select static mode and remove those references only in the authenticated run
+clone. It records the source controls and requested transformation and checks
+the exact physical IC-record fingerprint afterward. Source files remain
+unchanged. Active restart, prior-results initialization and provider-derived
+values are unsupported in this version. The native interpretation of the
+original inherited references remains unqualified. HEC documents static,
+restart and prior-results methods separately in its
+[6.6 initial-conditions manual](https://www.hec.usace.army.mil/confluence/rasdocs/r2dum/6.6/boundary-and-initial-conditions-for-2d-flow-areas/initial-conditions).
+
+Two APIs support orchestration without compute:
+
+```python
+from ras_commander import RasScenarioWorker
+
+# Authenticate only; creates no clone and changes no files.
+source = RasScenarioWorker.verify_forecast_initialization("request.json")
+assert source["status"] == "source-verified"
+
+# `workspace` is the isolated result of RasScenario.prepare_workspace().
+prepared = RasScenarioWorker.prepare_forecast_initialization("request.json", workspace)
+assert prepared["status"] == "clone-prepared"
+
+# Recheck a prepared clone without changing it.
+verified = RasScenarioWorker.verify_forecast_initialization(
+    "request.json", workspace=workspace,
+)
+```
+
+Preparation refuses canonical-source overlap and paths outside the requested
+clone. It retains CurrentPlan, window, boundary, newline and CRS gates, preserves
+other plan settings, and sets the requested cores through `RasPlan` before
+recording plan hashes. Reapplying the execution core setting leaves those bytes
+stable. A second preparation call refuses changed source controls; use the
+read-only verifier on an already prepared clone.
+
+Evidence is labeled `unreviewed-source-declaration` with
+`forecast_eligible=false`, whether source-verified or clone-prepared. Execution
+success cannot promote that state. Completed-result reuse reauthenticates
+inputs, the clone and the retained initialization evidence, including JSON
+types, before returning success. A preparation retry must preserve initialization,
+package, execution and CRS settings. Initialization failures return
+`forecast_initialization_invalid`, exit 3, with execution not started;
+malformed request bindings return `invalid_request`, exit 2.
+
+Portable tests use synthetic native text and real clone preparation, with
+execution/export replaced. Installed-engine qualification, native restart
+layout support, observed/calibrated state and physical forecast validation
+remain separate follow-up work.
+Native qualification must also establish that execution retains the prepared
+project/plan/unsteady text hashes used by completed-result reuse. Any legitimate
+engine rewrite needs a separately reviewed normalization contract; this version
+keeps exact retained-file checks and does not assume post-execution stability.
+
 ### Explicit product CRS policy (request 1.2)
 
 Request `ras-commander/scenario-worker-request/1.2` requires
