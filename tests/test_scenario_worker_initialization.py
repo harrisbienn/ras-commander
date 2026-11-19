@@ -22,9 +22,11 @@ def _forecast_request(tmp_path):
     request, request_path, result_path = _request(tmp_path)
     source = Path(request["source_model"]["project"]).parent
     for path in FIXTURE.glob("Model.*"):
-        # Existing clone writers use the platform newline convention. Retain
-        # one convention across the synthetic source and its prepared clone.
-        (source / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        # Native RAS writers emit CRLF even on Linux. Use the same explicit
+        # convention for the source project, including untouched geometry.
+        (source / path.name).write_text(
+            path.read_text(encoding="utf-8"), encoding="utf-8", newline="\r\n",
+        )
     manifest = Path(request["source_model"]["model_manifest"])
     manifest.write_text(json.dumps({
         "stage": "ras", "contract_type": "floodforecast/model-inventory/2.0.0",
@@ -269,8 +271,18 @@ def test_clone_unit_change_never_executes(tmp_path, monkeypatch, replacement):
     assert calls["execute"] == 0
 
 
-def test_real_preparation_preserves_static_source_without_engine(tmp_path, monkeypatch):
+@pytest.mark.parametrize("newline", ["\r\n", "\n"], ids=["native-crlf", "lf-refused"])
+def test_real_preparation_preserves_static_source_without_engine(tmp_path, monkeypatch, newline):
     request, path, result = _forecast_request(tmp_path)
+    source = Path(request["source_model"]["project"]).parent
+    if newline == "\n":
+        for filename in ("Model.prj", "Model.p01", "Model.g01", "Model.u01"):
+            native_file = source / filename
+            native_file.write_bytes(native_file.read_bytes().replace(b"\r\n", b"\n"))
+        request["source_model"]["project_file_sha256"] = _sha256(source / "Model.prj")
+        for field, suffix in (("plan", ".p01"), ("geometry", ".g01"), ("unsteady", ".u01")):
+            request["initialization"][field + "_sha256"] = _sha256(source / ("Model" + suffix))
+        _save(request, path)
     original_prepare = RasScenario.prepare_workspace
     original_validate = RasScenario.validate_workspace
     original_inspect = RasScenario.inspect_workspace_evidence
@@ -278,11 +290,18 @@ def test_real_preparation_preserves_static_source_without_engine(tmp_path, monke
     monkeypatch.setattr(RasScenario, "prepare_workspace", original_prepare)
     monkeypatch.setattr(RasScenario, "validate_workspace", original_validate)
     monkeypatch.setattr(RasScenario, "inspect_workspace_evidence", original_inspect)
-    source = Path(request["source_model"]["project"]).parent
     before = {p.name: p.read_bytes() for p in source.iterdir()}
-    assert RasScenarioWorker.run(path, result) == 0
-    assert calls["execute"] == 1
+    exit_code = RasScenarioWorker.run(path, result)
     assert {p.name: p.read_bytes() for p in source.iterdir()} == before
+    if newline == "\n":
+        # Some preparation writers retain LF and others emit CRLF. The existing
+        # gate must refuse that combination instead of accepting a partial edit.
+        assert exit_code == 4
+        assert calls["execute"] == 0
+        assert "one_newline_convention" in json.loads(result.read_text())["error"]["message"]
+        return
+    assert exit_code == 0
+    assert calls["execute"] == 1
     evidence = json.loads(result.read_text())["preparation"]
     assert all(evidence["checks"].values())
     initialization = evidence["forecast_initialization"]

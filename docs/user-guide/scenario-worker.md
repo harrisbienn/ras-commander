@@ -137,6 +137,12 @@ The worker matches this declaration and independently hashes the selected
 project, linked plan/geometry/unsteady files, engine and forcing. The
 orchestrator remains responsible for authenticating the complete package tree.
 A manifest declaration is not evidence that the worker verified every asset.
+Source verification alone does not establish clone-preparation readiness.
+Current full preparation requires source text already normalized to native
+CRLF line endings: some existing writers preserve source endings while others
+emit CRLF. An LF source can therefore fail the unchanged newline gate during
+cloning. Use an authenticated normalized source successor; this initialization
+API does not silently normalize or rewrite the canonical source.
 
 Source admission requires one explicit `Use Restart=0` or `False` selector,
 unambiguous controls and completely parsed finite IC records. Duplicate or
