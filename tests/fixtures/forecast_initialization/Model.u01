@@ -1,0 +1,16 @@
+Flow Title=Static baseline
+Program Version=6.60
+Use Restart= 0
+Restart Filename=Model.p03.01JAN2020 0000.rst
+Prior WS Filename=Model.p03.hdf
+Prior WS Profile=01JAN2020 00:00:00
+IC Point Elev=ReferencePoint,10.25,
+Initial RRR Elev=River,Reach,1000,9.5
+Boundary Location=River           ,Reach           ,1000    ,        ,                ,                ,                ,                                ,
+Boundary Name=Tributary
+Interval=1HOUR
+Flow Hydrograph= 0
+DSS File=baseline.dss
+DSS Path=//TRIBUTARY/FLOW/DATE/1HOUR/RUN:BASE/
+Use DSS=True
+Met Point Raster Parameters=,,,,

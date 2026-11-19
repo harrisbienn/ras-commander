@@ -56,6 +56,7 @@ jobs:
         run: >-
           python -I -m pytest --strict-markers -ra
           tests/test_ras_scenario.py tests/test_scenario_worker.py
+          tests/test_scenario_worker_initialization.py
           tests/test_scenario_worker_crs.py tests/test_hdf_results_products.py
           tests/test_hdf_results_products_crs.py tests/test_hdf_results_products_export.py
           tests/test_hdf_results_products_inspection.py

@@ -18,7 +18,9 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Union
 from .Decorators import log_call
 from .hdf.HdfResultsProducts import HdfResultsProducts
 from .LoggingConfig import get_logger
-from .RasScenario import RasBoundaryLink, RasRunArtifact, RasScenario
+from .RasScenario import RasBoundaryLink, RasRunArtifact, RasScenario, RasScenarioWorkspace
+from .RasUnsteady import RasUnsteady
+from ._forecast_initialization import _validate_binding, _verify_source, _verify_clone, _set_clone_cores
 
 logger = get_logger(__name__)
 
@@ -48,8 +50,131 @@ class RasScenarioWorker:
 
     REQUEST_SCHEMA = "ras-commander/scenario-worker-request/1.1"
     CRS_REQUEST_SCHEMA = "ras-commander/scenario-worker-request/1.2"
+    FORECAST_REQUEST_SCHEMA = "ras-commander/scenario-worker-request/1.3"
     LEGACY_REQUEST_SCHEMA = "ras-commander/scenario-worker-request/1.0"
     RESULT_SCHEMA = "ras-commander/scenario-worker-result/1.0"
+
+    @staticmethod
+    @log_call
+    def prepare_forecast_initialization(
+        request_path: Union[str, Path],
+        workspace: RasScenarioWorkspace,
+    ) -> Dict[str, Any]:
+        """Select static initialization in an authenticated run clone, without compute.
+
+        The request must explicitly authorize ``reference_policy=clear-in-clone``.
+        The existing unsteady-file setter clears restart/prior-results references
+        and selects static mode. Physical IC records remain byte-for-byte equal
+        to the authenticated source. Source files and numerical values are never
+        changed. Returns ``clone-prepared`` evidence; invalid identity, source
+        overlap, altered state, workspace or CRS raises RasScenarioWorkerError.
+
+        Args:
+            request_path: Retained worker request 1.3, as a string or Path.
+            workspace: Isolated clone returned by RasScenario.prepare_workspace.
+
+        Returns:
+            Initialization evidence with status ``clone-prepared`` and
+            provisional, forecast-ineligible state disposition.
+
+        Raises:
+            RasScenarioWorkerError: Invalid request, source overlap, mismatched
+                identities, altered state, or workspace/CRS validation failure.
+        """
+        request = RasScenarioWorker._validate_request(
+            RasScenarioWorker._load_request(Path(request_path).resolve())
+        )
+        if request["schema"] != RasScenarioWorker.FORECAST_REQUEST_SCHEMA:
+            _invalid("Forecast initialization preparation requires request 1.3")
+        return RasScenarioWorker._prepare_forecast_initialization(request, workspace)
+
+    @staticmethod
+    def _prepare_forecast_initialization(
+        request: Mapping[str, Any], workspace: RasScenarioWorkspace,
+    ) -> Dict[str, Any]:
+        RasScenarioWorker._verify_input_identities(request)
+        try:
+            source = _verify_source(request)
+            _verify_clone(request, workspace, source, require_static=False)
+            # This owner operation removes inherited references atomically and
+            # preserves IC records. It is applied only after clone authentication.
+            RasUnsteady.set_initial_flow_method(workspace.unsteady_file, "initial_flow_distribution")
+            _set_clone_cores(request, workspace)
+            return RasScenarioWorker._forecast_evidence(request, workspace)
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+            raise RasScenarioWorkerError(
+                f"Forecast initialization preparation failed: {exc}",
+                classification="forecast_initialization_invalid", exit_code=3,
+            ) from exc
+
+    @staticmethod
+    @log_call
+    def verify_forecast_initialization(
+        request_path: Union[str, Path],
+        *,
+        workspace: Optional[RasScenarioWorkspace] = None,
+    ) -> Dict[str, Any]:
+        """Authenticate request 1.3 initialization without starting an engine.
+
+        Args:
+            request_path: Retained worker request with independently selected
+                model, engine, forcing and initialization identities.
+            workspace: Optional prepared clone to check for exact preservation.
+                Its CurrentPlan, window, newline, boundary and CRS gates also run.
+
+        Returns:
+            Source initialization evidence, and clone evidence when supplied.
+            Static state remains provisional and forecast-ineligible. Package
+            verification covers the pinned inventory declaration and selected
+            text files, not the complete package tree.
+
+        Raises:
+            RasScenarioWorkerError: Invalid request or incompatible identities,
+                state, clone, or CRS. This method does not prepare or write files.
+        """
+        request = RasScenarioWorker._validate_request(
+            RasScenarioWorker._load_request(Path(request_path).resolve())
+        )
+        if request["schema"] != RasScenarioWorker.FORECAST_REQUEST_SCHEMA:
+            _invalid("Forecast initialization verification requires request 1.3")
+        RasScenarioWorker._verify_input_identities(request)
+        return RasScenarioWorker._forecast_evidence(request, workspace)
+
+    @staticmethod
+    def _forecast_evidence(
+        request: Mapping[str, Any], workspace: Optional[RasScenarioWorkspace] = None,
+    ) -> Dict[str, Any]:
+        try:
+            evidence = _verify_source(request)
+            if workspace is not None:
+                if (workspace.project_folder.resolve() != Path(request["workspace"])
+                        or workspace.simulation_start != request["model_window"]["start"]
+                        or workspace.simulation_end != request["model_window"]["end"]):
+                    raise ValueError("Prepared workspace location/window differs from the request")
+                links = tuple(RasBoundaryLink.from_mapping(value) for value in request["boundary_links"])
+                RasScenario.validate_workspace(workspace, links)
+                crs = RasScenario.inspect_product_crs(workspace, crs_policy=request["products"]["crs_policy"])
+                if not crs["crs_resolution"]["export_allowed"]:
+                    raise ValueError(crs["crs_resolution"]["reason"])
+                evidence["clone"] = _verify_clone(request, workspace, evidence)
+                evidence["status"] = "clone-prepared"
+                evidence["transformation"] = {
+                    "reference_policy": "clear-in-clone",
+                    "operation": "RasUnsteady.set_initial_flow_method(initial_flow_distribution)",
+                    "physical_ic_records": "preserved-exactly",
+                }
+                _verify_file_sha256(workspace.hydrology_file, request["hydrology"]["sha256"],
+                                    "prepared hydrology DSS", "forecast_initialization_invalid")
+                if workspace.forcing_excess_file is None:
+                    raise ValueError("Forecast clone has no forcing-excess DSS")
+                _verify_file_sha256(workspace.forcing_excess_file, request["forcing_excess"]["sha256"],
+                                    "prepared forcing DSS", "forecast_initialization_invalid")
+            return evidence
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+            raise RasScenarioWorkerError(
+                f"Forecast initialization verification failed: {exc}",
+                classification="forecast_initialization_invalid", exit_code=3,
+            ) from exc
 
     @staticmethod
     @log_call
@@ -79,11 +204,14 @@ class RasScenarioWorker:
             request_sha256 = _json_sha256(retained_request)
             request = RasScenarioWorker._validate_request(retained_request)
             if result_file.exists():
-                RasScenarioWorker._verify_completed_result(
+                existing_result = RasScenarioWorker._verify_completed_result(
                     result_file,
                     request_sha256=request_sha256,
                     specification_sha256=request["scenario"]["specification_sha256"],
                 )
+                if request["schema"] == RasScenarioWorker.FORECAST_REQUEST_SCHEMA:
+                    RasScenarioWorker._verify_input_identities(request)
+                    RasScenarioWorker._verify_forecast_reuse(request, existing_result)
                 logger.info(
                     "Verified existing RAS worker result for request %s",
                     request_sha256,
@@ -113,6 +241,8 @@ class RasScenarioWorker:
                 )
 
             RasScenarioWorker._verify_input_identities(request)
+            if request["schema"] == RasScenarioWorker.FORECAST_REQUEST_SCHEMA:
+                RasScenarioWorker._forecast_evidence(request)
             links = tuple(
                 RasBoundaryLink.from_mapping(value)
                 for value in request["boundary_links"]
@@ -162,7 +292,7 @@ class RasScenarioWorker:
                 "retry": retry_evidence,
             }
 
-            if request["schema"] == RasScenarioWorker.CRS_REQUEST_SCHEMA:
+            if request["schema"] in {RasScenarioWorker.CRS_REQUEST_SCHEMA, RasScenarioWorker.FORECAST_REQUEST_SCHEMA}:
                 try:
                     preparation["product_crs"] = RasScenario.inspect_product_crs(
                         workspace, crs_policy=request["products"]["crs_policy"],
@@ -175,6 +305,12 @@ class RasScenarioWorker:
                         f"Hydraulic product CRS preflight failed: {exc}",
                         classification="product_crs_preflight_failed", exit_code=3,
                     ) from exc
+
+            if request["schema"] == RasScenarioWorker.FORECAST_REQUEST_SCHEMA:
+                # Reauthenticate source and engine after cloning as well as the
+                # exact retained state before entering the execution boundary.
+                RasScenarioWorker._verify_input_identities(request)
+                preparation["forecast_initialization"] = RasScenarioWorker._prepare_forecast_initialization(request, workspace)
 
             execution_started = time.perf_counter()
             execution = {"status": "in_progress"}
@@ -349,6 +485,7 @@ class RasScenarioWorker:
 
     @staticmethod
     def _validate_request(payload: Mapping[str, Any]) -> Dict[str, Any]:
+        forecast = payload.get("schema") == RasScenarioWorker.FORECAST_REQUEST_SCHEMA
         _require_keys(
             payload,
             required={
@@ -362,13 +499,14 @@ class RasScenarioWorker:
                 "workspace",
                 "products",
                 "execution",
-            },
+            } | ({"initialization"} if forecast else set()),
             optional={"retry"},
             label="request",
         )
         if payload["schema"] not in {
             RasScenarioWorker.REQUEST_SCHEMA, RasScenarioWorker.LEGACY_REQUEST_SCHEMA,
             RasScenarioWorker.CRS_REQUEST_SCHEMA,
+            RasScenarioWorker.FORECAST_REQUEST_SCHEMA,
         }:
             raise RasScenarioWorkerError(
                 f"Unsupported RAS worker request schema: {payload['schema']!r}",
@@ -402,7 +540,7 @@ class RasScenarioWorker:
                 "template_plan",
                 "model_manifest",
                 "model_manifest_sha256",
-            },
+            } | ({"package_sha256"} if forecast else set()),
             optional={"linked_asset_directories", "linked_asset_mode"},
             label="source_model",
         )
@@ -435,6 +573,8 @@ class RasScenarioWorker:
                 {"copy", "shared-cache"},
             ),
         }
+        if forecast:
+            normalized_source["package_sha256"] = _sha256_string(source["package_sha256"], "source_model.package_sha256")
 
         hydrology = _identity_input(
             payload["hydrology"],
@@ -509,6 +649,8 @@ class RasScenarioWorker:
         )
         start = _parse_model_time(window["start"])
         end = _parse_model_time(window["end"])
+        if forecast and any(value.second or value.microsecond for value in (start, end)):
+            _invalid("Forecast model-window timestamps must be minute-aligned for native plan text")
         if end <= start:
             _invalid("model_window.end must be later than model_window.start")
         normalized_window = {
@@ -520,7 +662,7 @@ class RasScenarioWorker:
         }
 
         product_config = _object(payload["products"], "products")
-        explicit_crs = payload["schema"] == RasScenarioWorker.CRS_REQUEST_SCHEMA
+        explicit_crs = payload["schema"] in {RasScenarioWorker.CRS_REQUEST_SCHEMA, RasScenarioWorker.FORECAST_REQUEST_SCHEMA}
         _require_keys(
             product_config,
             required={"directory", "crs_policy"} if explicit_crs else {"directory"},
@@ -606,6 +748,11 @@ class RasScenarioWorker:
         }
         if retry is not None:
             normalized_request["retry"] = retry
+        if forecast:
+            try:
+                normalized_request["initialization"] = _validate_binding(payload["initialization"], normalized_request)
+            except (ValueError, TypeError) as exc:
+                _invalid(str(exc))
         return normalized_request
 
     @staticmethod
@@ -763,13 +910,23 @@ class RasScenarioWorker:
         for field in ("scenario", "hydrology", "forcing_excess", "model_window"):
             if prior_request[field] != request[field]:
                 reject(f"Retry changed immutable {field} inputs")
-        if RasScenarioWorker.CRS_REQUEST_SCHEMA in (prior_request["schema"], request["schema"]):
+        if any(schema in {RasScenarioWorker.CRS_REQUEST_SCHEMA, RasScenarioWorker.FORECAST_REQUEST_SCHEMA}
+               for schema in (prior_request["schema"], request["schema"])):
             if prior_request["schema"] != request["schema"]:
                 reject("Retry changed the versioned CRS contract")
             prior_products = {key: value for key, value in prior_request["products"].items() if key != "directory"}
             current_products = {key: value for key, value in request["products"].items() if key != "directory"}
             if prior_products != current_products:
                 reject("Retry changed immutable product options")
+        if request["schema"] == RasScenarioWorker.FORECAST_REQUEST_SCHEMA:
+            if prior_result.get("request", {}).get("schema") != request["schema"]:
+                reject("Prior result does not identify the forecast request schema")
+            if prior_request["initialization"] != request["initialization"]:
+                reject("Retry changed immutable forecast initialization")
+            if prior_request["source_model"]["package_sha256"] != request["source_model"]["package_sha256"]:
+                reject("Retry changed immutable package identity")
+            if prior_request["execution"] != request["execution"]:
+                reject("Retry changed immutable forecast execution inputs")
         source_identity_fields = (
             "project",
             "project_file_sha256",
@@ -890,6 +1047,29 @@ class RasScenarioWorker:
                     exit_code=3,
                 )
         return result
+
+    @staticmethod
+    def _verify_forecast_reuse(request: Mapping[str, Any], result: Mapping[str, Any]) -> None:
+        """Reauthenticate source, prepared state and evidence on completed reuse."""
+        try:
+            preparation = result["preparation"]
+            fields = dict(preparation["workspace"])
+            for key in (
+                "source_project", "project_folder", "project_file", "plan_file",
+                "unsteady_file", "hydrology_source", "hydrology_file", "result_hdf",
+                "forcing_excess_source", "forcing_excess_file",
+            ):
+                if fields.get(key) is not None:
+                    fields[key] = Path(fields[key])
+            workspace = RasScenarioWorkspace(**fields)
+            actual = RasScenarioWorker._forecast_evidence(request, workspace)
+            if _json_sha256(actual) != _json_sha256(preparation.get("forecast_initialization")):
+                raise ValueError("Retained forecast initialization evidence differs from current inputs")
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as exc:
+            raise RasScenarioWorkerError(
+                f"Existing forecast initialization cannot be reused: {exc}",
+                classification="existing_result_conflict", exit_code=3,
+            ) from exc
 
     @staticmethod
     def _classify_exception(exc: Exception) -> RasScenarioWorkerError:

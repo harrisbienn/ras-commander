@@ -23,6 +23,7 @@ def main() -> None:
     contracts = importlib.resources.files("ras_commander").joinpath("contracts")
     required = {
         "scenario-worker-request-v1.2.schema.json",
+        "scenario-worker-request-v1.3.schema.json",
         "scenario-worker-result-v1.0.schema.json",
     }
     schemas = {
