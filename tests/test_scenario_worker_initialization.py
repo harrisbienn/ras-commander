@@ -310,6 +310,49 @@ def test_real_preparation_preserves_static_source_without_engine(tmp_path, monke
     assert initialization["clone"]["initialization"]["controls"]["Prior WS Filename"] is None
 
 
+@pytest.mark.parametrize("mutation", ["mapping", "mapping_type", "inactive_type", "flow_type", "receipt"])
+def test_real_preparation_reuses_completed_workspace_and_refuses_changed_evidence(
+    tmp_path, monkeypatch, mutation,
+):
+    request, path, result = _forecast_request(tmp_path)
+    source = Path(request["source_model"]["project"]).parent
+    before = {p.name: p.read_bytes() for p in source.iterdir()}
+    original_prepare = RasScenario.prepare_workspace
+    original_validate = RasScenario.validate_workspace
+    original_inspect = RasScenario.inspect_workspace_evidence
+    calls = _install_pipeline(monkeypatch, request)
+    monkeypatch.setattr(RasScenario, "prepare_workspace", original_prepare)
+    monkeypatch.setattr(RasScenario, "validate_workspace", original_validate)
+    monkeypatch.setattr(RasScenario, "inspect_workspace_evidence", original_inspect)
+
+    assert RasScenarioWorker.run(path, result) == 0
+    completed = result.read_bytes()
+    assert RasScenarioWorker.run(path, result) == 0
+    assert result.read_bytes() == completed
+    assert calls["execute"] == calls["export"] == 1
+    assert {p.name: p.read_bytes() for p in source.iterdir()} == before
+
+    retained = json.loads(completed)
+    workspace = retained["preparation"]["workspace"]
+    if mutation == "mapping":
+        workspace["boundary_mapping_ids"] = ["different-boundary"]
+    elif mutation == "receipt":
+        retained["preparation"]["forecast_initialization"]["forecast_eligible"] = 0
+    else:
+        field = {
+            "mapping_type": "boundary_mapping_ids",
+            "inactive_type": "inactive_inherited_boundaries",
+            "flow_type": "boundary_flow_preparation",
+        }[mutation]
+        workspace[field] = {}
+    result.write_text(json.dumps(retained), encoding="utf-8")
+    changed = result.read_bytes()
+    assert RasScenarioWorker.run(path, result) == 3
+    assert result.read_bytes() == changed
+    assert calls["execute"] == calls["export"] == 1
+    assert {p.name: p.read_bytes() for p in source.iterdir()} == before
+
+
 def test_request_schema_is_packaged_and_legacy_rejects_new_fields(tmp_path):
     request, _, _ = _forecast_request(tmp_path)
     contracts = Path(importlib.import_module("ras_commander").__file__).parent / "contracts"
