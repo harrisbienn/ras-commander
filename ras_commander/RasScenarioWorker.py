@@ -1061,6 +1061,15 @@ class RasScenarioWorker:
             ):
                 if fields.get(key) is not None:
                     fields[key] = Path(fields[key])
+            # JSON arrays must regain the workspace's tuple types before validation.
+            for key in (
+                "boundary_mapping_ids", "inactive_inherited_boundaries",
+                "boundary_flow_preparation",
+            ):
+                if key in fields:
+                    if not isinstance(fields[key], list):
+                        raise ValueError(f"Retained workspace {key} must be a JSON array")
+                    fields[key] = tuple(fields[key])
             workspace = RasScenarioWorkspace(**fields)
             actual = RasScenarioWorker._forecast_evidence(request, workspace)
             if _json_sha256(actual) != _json_sha256(preparation.get("forecast_initialization")):
